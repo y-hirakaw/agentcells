@@ -126,8 +126,9 @@ pub(crate) mod fake {
                 command.to_string(),
                 Output {
                     success,
+                    code: Some(if success { 0 } else { 1 }),
                     stdout: stdout.to_string(),
-                    ..Output::default()
+                    stderr: String::new(),
                 },
             );
             self
@@ -141,6 +142,7 @@ pub(crate) mod fake {
         pub fn with_fallback(mut self, success: bool) -> Self {
             self.fallback = Some(Output {
                 success,
+                code: Some(if success { 0 } else { 1 }),
                 ..Output::default()
             });
             self
