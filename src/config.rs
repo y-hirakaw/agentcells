@@ -29,6 +29,11 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # test = "npm test"
 # build = "npm run build"
 #
+# [product.sandbox]                  # AIが動かすコマンドに開ける場所。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない
+# read = ["~/.npm", "~/.nvm"]        # ホームの下で読ませる場所（ツールチェーンやキャッシュ）。開けた場所の秘密は読まれうる
+# network = ["registry.npmjs.org"]   # 通信してよい先（*.example.com も書ける）
+# read_placed = []                   # files/ から置いたファイルのうち、ビルドに読ませるもの（リポジトリからの相対パス）
+#
 # cell: どのラベルが付いたIssue/PRを拾い、どのプロンプトで動くか
 #
 # [[cell]]
@@ -90,6 +95,27 @@ pub struct Product {
     /// AIが `agentcells cell run <名前>` で実行できるコマンド。AIは、ここに書いたもの以外は実行できない
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
+    /// AIが動かすコマンド（ビルドやテストを含む）に、読ませる場所と通信させる先
+    #[serde(default)]
+    pub sandbox: Sandbox,
+}
+
+/// AIが動かすコマンドは、sandboxの中で動く。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない。
+/// ここに書いた分だけ開ける（開けた場所の秘密が読まれても防げないので、書くのは使う人の責任）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sandbox {
+    /// ホームの下で読ませる場所（ツールチェーンやキャッシュなど）。`~/` で始めるか、絶対パスで書く。
+    /// 読み込んだあとは絶対パスになっている
+    #[serde(default)]
+    pub read: Vec<PathBuf>,
+    /// worktreeに置いたファイルのうち、ビルドやテストに読ませるもの（リポジトリからの相対パス）。
+    /// 読ませると、AIが書き換えたビルドを通して中身を取り出せるので、要るものだけにする
+    #[serde(default)]
+    pub read_placed: Vec<PathBuf>,
+    /// 通信してよい先（`registry.npmjs.org` や `*.gradle.org` のようなドメイン）
+    #[serde(default)]
+    pub network: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -209,6 +235,14 @@ impl Config {
         if let Some(app) = &mut config.github_app {
             app.private_key = base.join(&app.private_key);
         }
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        for product in &mut config.products {
+            for path in &mut product.sandbox.read {
+                if let (Ok(rest), Some(user_home)) = (path.strip_prefix("~"), &user_home) {
+                    *path = user_home.join(rest);
+                }
+            }
+        }
         Ok(config)
     }
 
@@ -276,6 +310,32 @@ impl Config {
                 }
                 if command.trim().is_empty() {
                     problems.push(format!("product「{}」のコマンド「{name}」が空です", p.name));
+                }
+            }
+            for path in &p.sandbox.read {
+                if !path.is_absolute() || has_parent_dir(path) {
+                    problems.push(format!(
+                        "product「{}」の sandbox.read の {} は、`~/` で始めるか絶対パスで書いてください（`..` は使えません）",
+                        p.name,
+                        path.display()
+                    ));
+                }
+            }
+            for path in &p.sandbox.read_placed {
+                if path.as_os_str().is_empty() || path.is_absolute() || has_parent_dir(path) {
+                    problems.push(format!(
+                        "product「{}」の sandbox.read_placed の「{}」は、リポジトリからの相対パスで書いてください（`..` は使えません）",
+                        p.name,
+                        path.display()
+                    ));
+                }
+            }
+            for domain in &p.sandbox.network {
+                if !is_valid_domain(domain) {
+                    problems.push(format!(
+                        "product「{}」の sandbox.network の「{domain}」はドメインではありません（例: registry.npmjs.org、*.gradle.org）",
+                        p.name
+                    ));
                 }
             }
             for name in &p.cells {
@@ -407,6 +467,25 @@ fn is_valid_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn has_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// `example.com` か `*.example.com`。ポートやスキームは書けない。
+fn is_valid_domain(domain: &str) -> bool {
+    let host = domain.strip_prefix("*.").unwrap_or(domain);
+    host.contains('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
 }
 
 #[cfg(test)]
@@ -690,6 +769,43 @@ timeout_minutes = 10
         let message = problems_of(&bad);
         assert!(message.contains("「Run_Tests」に使えない文字"), "{message}");
         assert!(message.contains("が空です"), "{message}");
+    }
+
+    #[test]
+    fn products_can_open_the_sandbox() {
+        let text = VALID.replace(
+            "cells = [\"triage\", \"review\"]",
+            "cells = [\"triage\", \"review\"]\n\n[product.sandbox]\nread = [\"~/.cargo\", \"/opt/sdk\"]\nread_placed = [\"app/google-services.json\"]\nnetwork = [\"registry.npmjs.org\", \"*.gradle.org\"]",
+        );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(&text, dir.path()).unwrap();
+        let sandbox = &config.products[0].sandbox;
+        let user_home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            sandbox.read,
+            vec![user_home.join(".cargo"), PathBuf::from("/opt/sdk")]
+        );
+        assert_eq!(
+            sandbox.read_placed,
+            vec![PathBuf::from("app/google-services.json")]
+        );
+        assert_eq!(sandbox.network, vec!["registry.npmjs.org", "*.gradle.org"]);
+
+        let bad = text
+            .replace("\"/opt/sdk\"", "\"opt/sdk\", \"~/../etc\"")
+            .replace("app/google-services.json", "../key.jks")
+            .replace("\"*.gradle.org\"", "\"https://gradle.org\", \"localhost\"");
+        let message = problems_of(&bad);
+        assert!(message.contains("sandbox.read の opt/sdk"), "{message}");
+        assert!(message.contains("sandbox.read の /"), "{message}");
+        assert!(message.contains("「../key.jks」"), "{message}");
+        assert!(message.contains("「https://gradle.org」"), "{message}");
+        assert!(message.contains("「localhost」"), "{message}");
+
+        // 書かなければ、何も開けない
+        let config = Config::parse(VALID, dir.path()).unwrap();
+        assert!(config.products[0].sandbox.read.is_empty());
+        assert!(config.products[0].sandbox.network.is_empty());
     }
 
     #[test]

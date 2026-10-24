@@ -1,0 +1,7 @@
+# betterleaksの設定。既定の決まりに、このリポジトリの例外を足す。
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "テストのためだけに作った、どこにも登録していない鍵（testdata/README.md）"
+paths = ['''^testdata/github-app-test-key\.pem$''']

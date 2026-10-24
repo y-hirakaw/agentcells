@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::config::Config;
+use crate::config::{Config, Product};
 use crate::error::{Error, Result};
+use crate::github::ISOLATED_GIT_ENV;
 use crate::home::Home;
 
 /// AIにIssue/PRのラベルや状態を変えさせないためのdeny。ラベルの付け替えはCLIだけがする。
@@ -41,7 +42,8 @@ pub const DENY_GH: &[&str] = &[
 /// `>`、`;`、`&&`、`$(...)` で別の操作を付け足すことを止める（2.1.310で確かめた）。
 pub const ALLOW_BASH: &str = "Bash(agentcells cell:*)";
 
-/// 使う人のホームの下で、秘密がよく置かれる場所。AIが動かすコマンド（sandboxの中）に読ませない。
+/// 使う人のホームの下で、秘密がよく置かれる場所。ホーム全体を読ませないうえで、
+/// productの `sandbox.read` に、これらを含む場所（`~/.config` など）が書かれても読ませない。
 const SECRET_PLACES: &[&str] = &[
     ".ssh",
     ".aws",
@@ -74,6 +76,8 @@ pub struct RunPaths<'a> {
     pub context: &'a Path,
     /// worktreeに置いた秘密のファイル（絶対パス）
     pub placed: &'a [PathBuf],
+    /// sandboxの中で動かすプログラム（agentcellsとbetterleaks）。ホームの下にあっても動かせるようにする
+    pub programs: &'a [PathBuf],
 }
 
 /// 1回の実行で渡す設定を作る。2つの守りを重ねる。
@@ -81,57 +85,80 @@ pub struct RunPaths<'a> {
 /// Claude Codeのツールの権限:
 /// - 読む（Read）のは、worktreeの中だけ
 /// - ファイルの作成と更新（Edit、Write）は、worktreeの中だけ。`.git` と置いた秘密のファイルは除く
-/// - Bashは `agentcells cell` だけ
+/// - Bashは `agentcells cell` だけ。WebFetchは使わせない
 ///
 /// sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
 /// - 書けるのは、作業するcloneと、その `.git` の実体（仕事ごとの使い捨て）だけ。元のリポジトリには書けない
-/// - `~/.agentcells`（App の秘密鍵、`files/`、`config.toml`、ほかの仕事のclone）、ghの設定、
-///   秘密がよく置かれる場所は読ませない。ただし今の仕事のclone、共有しているオブジェクト、今の仕事のファイルは読める
+/// - 使う人のホームの下は読ませない。読めるのは、今の仕事のclone、共有しているオブジェクト、今の仕事のファイル、
+///   動かすプログラム、productの `sandbox.read` に書いた場所だけ
+/// - `~/.agentcells`（App の秘密鍵、`files/`、`config.toml`、ほかの仕事のclone）、ghの設定、秘密がよく置かれる場所、
+///   置いた秘密のファイル（`sandbox.read_placed` に書いたものを除く）は、上で開けた場所の中にあっても読ませない
+///   （sandboxは、より細かく書いた決まりを優先する。2.1.310で確かめた）
+/// - 外への通信は、productの `sandbox.network` に書いた先だけ。ほかの先は、聞かずに止める（`strictAllowlist`）
 /// - sandboxの外でコマンドを動かすことは許さない
 ///
 /// 信頼していないディレクトリではprojectの設定のallowが無視されるので、cellに要るallowもここで渡す。
-pub fn runtime_settings(home: &Home, config: &Config, run: &RunPaths) -> Result<serde_json::Value> {
+pub fn runtime_settings(
+    home: &Home,
+    config: &Config,
+    product: &Product,
+    run: &RunPaths,
+) -> Result<serde_json::Value> {
+    let problems = sandbox_problems(home, config);
+    if !problems.is_empty() {
+        return Err(Error::new(problems.join("\n"))
+            .with_hint("config.toml の [product.sandbox] を直してください"));
+    }
     let worktree = run.worktree;
     let mut allow = vec![ALLOW_BASH.to_string()];
-    for tool in ["Read", "Edit", "Write"] {
+    // Edit の決まりは、Write を含むファイルを書き換えるツールすべてに効く（Write の決まりは使われない。2.1.310で確かめた）
+    for tool in ["Read", "Edit"] {
         rule(&mut allow, tool, worktree, "/**")?;
     }
 
     let mut deny: Vec<String> = DENY_GH.iter().map(|s| s.to_string()).collect();
+    // 外へ送れる道になるので、sandboxを通らないWebFetchは使わせない
+    deny.push("WebFetch".to_string());
     // .git（linked worktreeではリポジトリを指すファイル）を書き換えさせない
-    for tool in ["Edit", "Write"] {
-        rule(&mut deny, tool, &worktree.join(".git"), "")?;
-        rule(&mut deny, tool, &worktree.join(".git"), "/**")?;
-    }
+    rule(&mut deny, "Edit", &worktree.join(".git"), "")?;
+    rule(&mut deny, "Edit", &worktree.join(".git"), "/**")?;
     for path in run.placed {
-        for tool in ["Read", "Edit", "Write"] {
-            rule(&mut deny, tool, path, "")?;
+        rule(&mut deny, "Edit", path, "")?;
+        // Readのdenyはsandboxの読めない場所にも足される（2.1.310で確かめた）ので、
+        // ビルドに読ませるファイルは、AIのReadからも読める（ビルドを通せば読めるのと同じ）
+        if !reads_placed(product, worktree, path) {
+            rule(&mut deny, "Read", path, "")?;
         }
     }
 
-    let mut deny_read = forms(home.root())?;
-    if let Some(app) = &config.github_app {
-        deny_read.extend(forms(&app.private_key)?);
-    }
-    if let Some(dir) = gh_config_dir(|key| std::env::var_os(key)) {
-        deny_read.extend(forms(&dir)?);
-    }
-    if let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from)
-        && user_home.is_absolute()
-    {
-        for place in SECRET_PLACES {
-            deny_read.extend(forms(&user_home.join(place))?);
-        }
+    let mut deny_read = forms(&user_home()?)?;
+    for place in protected_places(home, config)? {
+        deny_read.extend(forms(&place)?);
     }
     for path in run.placed {
-        deny_read.extend(forms(path)?);
+        if !reads_placed(product, worktree, path) {
+            deny_read.extend(forms(path)?);
+        }
     }
     let mut allow_read = forms(worktree)?;
     allow_read.extend(forms(run.git_dir)?);
     allow_read.extend(forms(run.shared_objects)?);
     allow_read.extend(forms(run.context)?);
+    for program in run.programs {
+        allow_read.extend(forms(program)?);
+    }
+    for path in &product.sandbox.read {
+        allow_read.extend(forms(path)?);
+    }
+
+    // sandboxの中では ~/.gitconfig が読めず、gitが止まる。使う人とシステムのgitの設定は読ませない
+    let env: serde_json::Map<String, serde_json::Value> = ISOLATED_GIT_ENV
+        .iter()
+        .map(|(k, v)| (k.to_string(), json!(v)))
+        .collect();
 
     Ok(json!({
+        "env": env,
         "permissions": { "allow": allow, "deny": deny },
         "sandbox": {
             "enabled": true,
@@ -140,9 +167,94 @@ pub fn runtime_settings(home: &Home, config: &Config, run: &RunPaths) -> Result<
                 "allowWrite": forms(run.git_dir)?,
                 "denyRead": dedup(deny_read),
                 "allowRead": dedup(allow_read),
+            },
+            "network": {
+                "allowedDomains": product.sandbox.network,
+                "strictAllowlist": true,
             }
         }
     }))
+}
+
+/// productの `sandbox.read` の問題。読ませない場所の中を開けると、sandboxはそちらを優先して読ませてしまうので断る。
+pub fn sandbox_problems(home: &Home, config: &Config) -> Vec<String> {
+    let places = match protected_places(home, config) {
+        Ok(places) => places,
+        Err(e) => return vec![e.message],
+    };
+    let mut problems = Vec::new();
+    for product in &config.products {
+        for path in &product.sandbox.read {
+            let Ok(written) = path_forms(path) else {
+                continue;
+            };
+            let place = places.iter().find(|place| {
+                let Ok(place_forms) = path_forms(place) else {
+                    return false;
+                };
+                written
+                    .iter()
+                    .any(|p| place_forms.iter().any(|q| starts_with_ignore_case(p, q)))
+            });
+            if let Some(place) = place {
+                problems.push(format!(
+                    "product「{}」の sandbox.read の {} は、読ませない場所（{}）の中なので書けません",
+                    product.name,
+                    path.display(),
+                    place.display()
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// 開けた場所の中にあっても読ませない場所。
+fn protected_places(home: &Home, config: &Config) -> Result<Vec<PathBuf>> {
+    let mut places = vec![home.root().to_path_buf()];
+    if let Some(app) = &config.github_app {
+        places.push(app.private_key.clone());
+    }
+    if let Some(dir) = gh_config_dir(|key| std::env::var_os(key)) {
+        places.push(dir);
+    }
+    let user_home = user_home()?;
+    for place in SECRET_PLACES {
+        places.push(user_home.join(place));
+    }
+    Ok(places)
+}
+
+fn user_home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| {
+            Error::new("ホームディレクトリがわかりません")
+                .with_hint("環境変数 HOME を設定してください")
+        })
+}
+
+/// 置いたファイルを、productの `sandbox.read_placed` でビルドに読ませるか。
+/// 大文字・小文字を区別しないファイルシステムがあるので、大文字・小文字を問わず比べる。
+fn reads_placed(product: &Product, worktree: &Path, placed: &Path) -> bool {
+    let Ok(relative) = placed.strip_prefix(worktree) else {
+        return false;
+    };
+    let relative = relative.to_string_lossy().to_lowercase();
+    product
+        .sandbox
+        .read_placed
+        .iter()
+        .any(|p| p.to_string_lossy().to_lowercase() == relative)
+}
+
+/// `path` が `base` か、その中か。大文字・小文字は問わない（macOSの標準のファイルシステムでは同じ場所を指す）。
+fn starts_with_ignore_case(path: &Path, base: &Path) -> bool {
+    let path = path.to_string_lossy().to_lowercase();
+    let base = base.to_string_lossy().to_lowercase();
+    let base = base.trim_end_matches('/');
+    path == base || path.starts_with(&format!("{base}/"))
 }
 
 fn dedup(mut v: Vec<String>) -> Vec<String> {
@@ -214,21 +326,43 @@ fn resolve(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GithubApp;
+    use crate::config::{GithubApp, Sandbox};
+    use crate::home::RepoName;
 
     fn home() -> Home {
         Home::new(PathBuf::from("/home/me/.agentcells"))
     }
 
-    fn settings_of(config: &Config, placed: &[PathBuf]) -> serde_json::Value {
+    fn product(sandbox: Sandbox) -> Product {
+        Product {
+            name: "app".to_string(),
+            issues: RepoName::parse("octo/app").unwrap(),
+            repos: vec![RepoName::parse("octo/app").unwrap()],
+            cells: vec!["triage".to_string()],
+            commands: Default::default(),
+            sandbox,
+        }
+    }
+
+    fn settings_with(config: &Config, product: &Product, placed: &[PathBuf]) -> serde_json::Value {
+        let programs = [PathBuf::from("/home/me/.agentcells/bin/agentcells")];
         let run = RunPaths {
             worktree: Path::new("/w/octo/app/12"),
             git_dir: Path::new("/home/me/.agentcells/gitdirs/octo/app/12"),
             shared_objects: Path::new("/home/me/.agentcells/repos/octo/app/.git/objects"),
             context: Path::new("/home/me/.agentcells/runs/1/context.json"),
             placed,
+            programs: &programs,
         };
-        runtime_settings(&home(), config, &run).unwrap()
+        runtime_settings(&home(), config, product, &run).unwrap()
+    }
+
+    fn settings_of(config: &Config, placed: &[PathBuf]) -> serde_json::Value {
+        settings_with(config, &product(Sandbox::default()), placed)
+    }
+
+    fn user_home() -> PathBuf {
+        super::user_home().unwrap()
     }
 
     fn strings(v: &serde_json::Value) -> Vec<String> {
@@ -256,7 +390,6 @@ mod tests {
                 "Bash(agentcells cell:*)",
                 "Read(//w/octo/app/12/**)",
                 "Edit(//w/octo/app/12/**)",
-                "Write(//w/octo/app/12/**)",
             ]
         );
         let deny = deny_of(
@@ -265,10 +398,9 @@ mod tests {
         );
         for rule in [
             "Edit(//w/octo/app/12/.git)",
-            "Write(//w/octo/app/12/.git/**)",
+            "Edit(//w/octo/app/12/.git/**)",
             "Read(//w/octo/app/12/key.jks)",
             "Edit(//w/octo/app/12/key.jks)",
-            "Write(//w/octo/app/12/key.jks)",
         ] {
             assert!(deny.contains(&rule.to_string()), "{rule} should be denied");
         }
@@ -373,8 +505,10 @@ mod tests {
             shared_objects: &link,
             context: &link,
             placed: &[],
+            programs: &[],
         };
-        let settings = runtime_settings(&home, &config, &run).unwrap();
+        let settings =
+            runtime_settings(&home, &config, &product(Sandbox::default()), &run).unwrap();
         let deny_read = strings(&settings["sandbox"]["filesystem"]["denyRead"]);
 
         let resolved = real.canonicalize().unwrap();
@@ -424,7 +558,113 @@ mod tests {
             shared_objects: Path::new("/r/.git/objects"),
             context: Path::new("/c.json"),
             placed: &placed,
+            programs: &[],
         };
-        assert!(runtime_settings(&home(), &Config::default(), &run).is_err());
+        assert!(
+            runtime_settings(
+                &home(),
+                &Config::default(),
+                &product(Sandbox::default()),
+                &run
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sandbox_hides_the_user_home_and_opens_only_listed_places() {
+        let product = product(Sandbox {
+            read: vec![PathBuf::from("/opt/sdk"), user_home().join(".cargo")],
+            read_placed: vec![],
+            network: vec!["registry.npmjs.org".to_string()],
+        });
+        let settings = settings_with(&Config::default(), &product, &[]);
+        let fs = &settings["sandbox"]["filesystem"];
+        let deny_read = strings(&fs["denyRead"]);
+        let user_home = user_home().display().to_string();
+        assert!(deny_read.contains(&user_home), "{deny_read:?}");
+        // 開けた場所の中でも、秘密がよく置かれる場所は読ませない
+        assert!(
+            deny_read.contains(&format!("{user_home}/.ssh")),
+            "{deny_read:?}"
+        );
+        let allow_read = strings(&fs["allowRead"]);
+        for path in [
+            "/opt/sdk".to_string(),
+            format!("{user_home}/.cargo"),
+            "/home/me/.agentcells/bin/agentcells".to_string(),
+        ] {
+            assert!(allow_read.contains(&path), "{path}: {allow_read:?}");
+        }
+        let network = &settings["sandbox"]["network"];
+        assert_eq!(
+            strings(&network["allowedDomains"]),
+            vec!["registry.npmjs.org"]
+        );
+        // 書いていない先へは、聞かずに止める
+        assert_eq!(network["strictAllowlist"], true);
+        // sandboxの中では ~/.gitconfig が読めないので、gitに使う人の設定を読ませない
+        assert_eq!(settings["env"]["GIT_CONFIG_GLOBAL"], "/dev/null");
+
+        // 書かなければ、どこへも通信できない
+        let settings = settings_of(&Config::default(), &[]);
+        assert!(strings(&settings["sandbox"]["network"]["allowedDomains"]).is_empty());
+        assert!(deny_of(&Config::default(), &[]).contains(&"WebFetch".to_string()));
+    }
+
+    #[test]
+    fn read_placed_files_are_open_to_builds_and_the_read_tool_but_not_to_edits() {
+        let product = product(Sandbox {
+            read_placed: vec![PathBuf::from("App/Google-Services.json")],
+            ..Sandbox::default()
+        });
+        let placed = [
+            PathBuf::from("/w/octo/app/12/app/google-services.json"),
+            PathBuf::from("/w/octo/app/12/key.jks"),
+        ];
+        let settings = settings_with(&Config::default(), &product, &placed);
+        let deny_read = strings(&settings["sandbox"]["filesystem"]["denyRead"]);
+        assert!(!deny_read.contains(&"/w/octo/app/12/app/google-services.json".to_string()));
+        assert!(deny_read.contains(&"/w/octo/app/12/key.jks".to_string()));
+        // Readのdenyはsandboxにも効くので、ビルドに読ませるファイルはReadでも読める。書き換えはさせない
+        let deny = strings(&settings["permissions"]["deny"]);
+        assert!(!deny.contains(&"Read(//w/octo/app/12/app/google-services.json)".to_string()));
+        assert!(deny.contains(&"Edit(//w/octo/app/12/app/google-services.json)".to_string()));
+        assert!(deny.contains(&"Read(//w/octo/app/12/key.jks)".to_string()));
+    }
+
+    #[test]
+    fn sandbox_read_cannot_reopen_protected_places() {
+        let config = |read: Vec<PathBuf>| Config {
+            products: vec![product(Sandbox {
+                read,
+                ..Sandbox::default()
+            })],
+            ..Config::default()
+        };
+        for bad in [
+            PathBuf::from("/home/me/.agentcells/files"),
+            PathBuf::from("/HOME/me/.agentcells"),
+            user_home().join(".ssh/config"),
+            user_home().join(".AWS"),
+        ] {
+            let problems = sandbox_problems(&home(), &config(vec![bad.clone()]));
+            assert_eq!(problems.len(), 1, "{bad:?}: {problems:?}");
+            assert!(problems[0].contains("読ませない場所"), "{problems:?}");
+        }
+        // 読ませない場所を含む、広い場所は書ける（中の読ませない場所は、より細かい決まりで止まる）
+        let wide = config(vec![user_home().join(".config"), user_home()]);
+        assert!(sandbox_problems(&home(), &wide).is_empty());
+
+        let bad = config(vec![user_home().join(".ssh")]);
+        let run = RunPaths {
+            worktree: Path::new("/w"),
+            git_dir: Path::new("/g"),
+            shared_objects: Path::new("/r/.git/objects"),
+            context: Path::new("/c.json"),
+            placed: &[],
+            programs: &[],
+        };
+        assert!(runtime_settings(&home(), &bad, &bad.products[0], &run).is_err());
     }
 }

@@ -107,8 +107,9 @@ cellの定義（拾う条件、プロンプト、止まる条件、往復の上�
 
 ## あとでやること
 
-- コミットの前に [betterleaks](https://github.com/betterleaks/betterleaks) で秘密が入っていないかを調べ、見つかったらコミットを止める。このリポジトリの開発と、cellの `agentcells cell commit` の両方で使う
-- ビルドとテストを sandbox（Claude Codeの sandbox やコンテナ）の中で動かす。AIが書き換えたビルドの設定やテストを実行すると、間接的に任意のコードを動かせてしまうため
+- betterleaksが秘密でないものを見つけたとき（誤検知）に、人間が見逃してよいと決める方法。今はコミットできず、人間に回る
+- sandboxで止めた通信の先を、AIの報告に任せず、CLIがClaude Codeの出力（`<sandbox_violations>`）から拾って、人間へのコメントに足すとよい設定を書く
+- Claude Desktopのルーティン（A）で、sandboxの設定（読ませる場所、通信してよい先）をどう渡すか。`--settings` を渡せないので、ユーザー設定か作業フォルダの設定に書くことになる（実機で確かめる）
 
 ## 決まっていないこと
 

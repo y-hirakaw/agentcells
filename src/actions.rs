@@ -36,6 +36,9 @@ pub struct Context {
     pub placed_blobs: Vec<String>,
     /// コミットの作者。使う人のgitの設定は読まないので、ここで渡す
     pub identity: Identity,
+    /// 秘密を探すbetterleaks（絶対パス）。`tick` がsandboxの外で探して渡す。
+    /// AIは環境変数を変えて呼べないが、PATHで探すと別のものを動かされうるので、場所を決めておく
+    pub scanner: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +300,7 @@ fn git_in(worktree: &Path, args: &[String]) -> Result<std::process::ExitStatus> 
         .arg(worktree)
         .args(args)
         .env("GIT_PAGER", "cat")
+        .envs(ISOLATED_GIT_ENV.iter().copied())
         .status()
         .map_err(|e| Error::new(format!("gitを動かせません: {e}")))
 }
@@ -367,6 +371,7 @@ pub fn commit(context: &Context, message: &str) -> Result<String> {
             leaked.join(", ")
         )));
     }
+    scan_secrets(context)?;
     let mut args: Vec<String> = vec![
         "-c".to_string(),
         format!("user.name={}", context.identity.name),
@@ -383,6 +388,164 @@ pub fn commit(context: &Context, message: &str) -> Result<String> {
     Ok(git_output(wt, &["rev-parse", "--short", "HEAD"])?
         .trim()
         .to_string())
+}
+
+/// betterleaksの設定を選ぶ環境変数。worktreeの設定と同じく、AIに書き換えられうるので使わせない。
+const SCANNER_CONFIG_ENV: &[&str] = &[
+    "BETTERLEAKS_CONFIG",
+    "GITLEAKS_CONFIG",
+    "BETTERLEAKS_CONFIG_TOML",
+    "GITLEAKS_CONFIG_TOML",
+];
+
+#[derive(Deserialize)]
+struct Finding {
+    #[serde(rename = "RuleID")]
+    rule: String,
+    #[serde(rename = "StartLine")]
+    line: usize,
+}
+
+/// コミットに足す行を、betterleaksで調べる。秘密らしいものがあれば断る（入れたものはステージに残す）。
+///
+/// betterleaksは、調べる場所の `.betterleaks.toml` や `.betterleaksignore`、行の `betterleaks:allow` で
+/// 見逃すものを決められる。どれもAIが書けるので、既定の決まりだけで調べる:
+/// - 足した行だけを標準入力で渡し、AIが書けない `/` で動かす（設定と無視のファイルを読ませない）
+/// - 設定を選ぶ環境変数を消し、`betterleaks:allow` を無視させる
+fn scan_secrets(context: &Context) -> Result<()> {
+    let diff = git_output(
+        &context.worktree,
+        &[
+            "diff",
+            "--cached",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--text",
+            "--no-renames",
+            "--unified=0",
+        ],
+    )?;
+    let lines = added_lines(&diff);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let input: String = lines.iter().map(|l| format!("{}\n", l.text)).collect();
+
+    let mut command = Command::new(&context.scanner);
+    command
+        .args([
+            "stdin",
+            "--no-banner",
+            "--no-color",
+            "--redact",
+            "--ignore-gitleaks-allow",
+            // 標準のre2は、ホームの下（~/Library/Caches）にキャッシュを作ろうとし、sandboxの中では落ちる
+            "--regex-engine",
+            "stdlib",
+            "--gitleaks-ignore-path",
+            "/",
+            "--report-format",
+            "json",
+            "--report-path",
+            "-",
+            "--exit-code",
+            "1",
+        ])
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for key in SCANNER_CONFIG_ENV {
+        command.env_remove(key);
+    }
+    let unavailable = |e: std::io::Error| {
+        Error::new(format!(
+            "秘密を探すbetterleaks（{}）を動かせません: {e}",
+            context.scanner.display()
+        ))
+        .with_hint("コミットできません。人間に回してください（needs-human）")
+    };
+    let mut child = command.spawn().map_err(unavailable)?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    // 書き終わる前に読み始めないと、出力が多いときに互いを待って止まる
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        stdin.write_all(input.as_bytes())
+    });
+    let out = child.wait_with_output().map_err(unavailable)?;
+    // betterleaksが入力を読み切らずに終わることがあるので、書けなかったことは問わない
+    let _ = writer.join();
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => {
+            let findings: Vec<Finding> = serde_json::from_slice(&out.stdout).map_err(|e| {
+                Error::new(format!("betterleaksの結果を読めません: {e}"))
+                    .with_hint("コミットできません。人間に回してください（needs-human）")
+            })?;
+            let list: Vec<String> = findings
+                .iter()
+                .map(|f| match lines.get(f.line.wrapping_sub(1)) {
+                    Some(l) => format!("  - {}:{}（{}）", l.path, l.line, f.rule),
+                    None => format!("  - 場所不明（{}）", f.rule),
+                })
+                .collect();
+            Err(Error::new(format!(
+                "コミットに秘密らしいものが入っているので、コミットしませんでした:\n{}",
+                list.join("\n")
+            ))
+            .with_hint(
+                "秘密を消してから、もう一度コミットしてください。秘密でないなら、人間に回してください（needs-human）",
+            ))
+        }
+        _ => Err(Error::new(format!(
+            "betterleaksが失敗しました: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+        .with_hint("コミットできません。人間に回してください（needs-human）")),
+    }
+}
+
+/// 足した1行。
+struct AddedLine {
+    path: String,
+    /// 新しいファイルでの行番号
+    line: usize,
+    text: String,
+}
+
+/// `git diff --unified=0` から、足した行を取り出す。
+fn added_lines(diff: &str) -> Vec<AddedLine> {
+    let mut lines = Vec::new();
+    let mut path = String::new();
+    let mut next = 0;
+    // ファイルの見出し（`diff --git` から最初の `@@` まで）の中だけで `+++ ` を名前として読む。
+    // 足した行が `++ ` で始まると `+++ ` に見えるので、見出しの外では行として扱う
+    let mut in_header = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_header = true;
+        } else if in_header && let Some(name) = line.strip_prefix("+++ ") {
+            path = name.strip_prefix("b/").unwrap_or(name).to_string();
+        } else if let Some(hunk) = line.strip_prefix("@@ ") {
+            in_header = false;
+            // "@@ -a,b +c,d @@"
+            next = hunk
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix('+'))
+                .and_then(|range| range.split(',').next())
+                .and_then(|start| start.parse().ok())
+                .unwrap_or(0);
+        } else if !in_header && let Some(text) = line.strip_prefix('+') {
+            lines.push(AddedLine {
+                path: path.clone(),
+                line: next,
+                text: text.to_string(),
+            });
+            next += 1;
+        }
+    }
+    lines
 }
 
 /// コミットに入る（消すもの以外の）ファイルの、新しい中身のハッシュとパス。
@@ -468,6 +631,7 @@ mod tests {
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", "base"]);
         std::fs::write(dir.path().join("outside.txt"), "keep").unwrap();
+        let scanner = fake_scanner(dir.path());
         let context = Context {
             worktree: work,
             commands: [(
@@ -482,8 +646,28 @@ mod tests {
                 name: "t".to_string(),
                 email: "t@example.com".to_string(),
             },
+            scanner,
         };
         (dir, context)
+    }
+
+    /// 偽のbetterleaks。「FAKE-SECRET」を含む行を見つけたことにし、動いた場所と引数を書き残す。
+    fn fake_scanner(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-betterleaks");
+        let script = format!(
+            r#"#!/bin/sh
+pwd > '{dir}/scanner-cwd'
+echo "$@" > '{dir}/scanner-args'
+n=$(grep -n FAKE-SECRET | head -1 | cut -d: -f1)
+if [ -n "$n" ]; then echo "[{{\"RuleID\":\"fake\",\"StartLine\":$n}}]"; exit 1; fi
+echo "[]"
+"#,
+            dir = dir.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
     }
 
     #[test]
@@ -690,5 +874,104 @@ mod tests {
         ctx.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(serde_json::from_str::<Context>(&text).unwrap(), ctx);
+    }
+
+    #[test]
+    fn commit_refuses_secrets_found_by_the_scanner() {
+        let (dir, ctx) = setup();
+        let wt = ctx.worktree.clone();
+        std::fs::write(wt.join("a.txt"), "a\nok\nFAKE-SECRET\n").unwrap();
+        let err = commit(&ctx, "leak").unwrap_err();
+        assert!(err.message.contains("a.txt:3（fake）"), "{}", err.message);
+        assert_eq!(git(&wt, &["log", "-1", "--format=%s"]), "base");
+        // AIが設定や無視のファイルを置けない場所で、allowのコメントを無視させて動かす
+        let cwd = std::fs::read_to_string(dir.path().join("scanner-cwd")).unwrap();
+        assert_eq!(cwd.trim(), "/");
+        let args = std::fs::read_to_string(dir.path().join("scanner-args")).unwrap();
+        assert!(args.contains("--ignore-gitleaks-allow"), "{args}");
+        assert!(args.contains("--gitleaks-ignore-path /"), "{args}");
+
+        std::fs::write(wt.join("a.txt"), "a\nok\n").unwrap();
+        commit(&ctx, "fine").unwrap();
+    }
+
+    #[test]
+    fn commit_refuses_when_the_scanner_cannot_run() {
+        let (dir, mut ctx) = setup();
+        ctx.scanner = dir.path().join("missing-betterleaks");
+        std::fs::write(ctx.worktree.join("b.txt"), "b").unwrap();
+        let err = commit(&ctx, "Add b").unwrap_err();
+        assert!(err.message.contains("betterleaks"), "{}", err.message);
+        assert!(err.hint.unwrap().contains("needs-human"));
+    }
+
+    #[test]
+    fn added_lines_track_paths_and_line_numbers() {
+        let diff = "diff --git a/x.txt b/x.txt\n\
+index 1..2 100644\n\
+--- a/x.txt\n\
++++ b/x.txt\n\
+@@ -0,0 +1,2 @@\n\
++one\n\
++++ not a header\n\
+@@ -5 +7 @@\n\
+-old\n\
++seven\n\
+diff --git a/y.txt b/y.txt\n\
+--- a/y.txt\n\
++++ /dev/null\n\
+@@ -1 +0,0 @@\n\
+-gone\n";
+        let lines: Vec<(String, usize, String)> = added_lines(diff)
+            .into_iter()
+            .map(|l| (l.path, l.line, l.text))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("x.txt".to_string(), 1, "one".to_string()),
+                // 足した行が「++ 」で始まっても、名前と取り違えずに調べる
+                ("x.txt".to_string(), 2, "++ not a header".to_string()),
+                ("x.txt".to_string(), 7, "seven".to_string()),
+            ]
+        );
+    }
+
+    /// 本物のbetterleaksで、worktreeに置いた設定や allow のコメントで見逃させられないことを確かめる。
+    /// betterleaksが入っていなければ確かめない。
+    #[test]
+    fn real_betterleaks_ignores_settings_in_the_worktree() {
+        let Some(scanner) = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("betterleaks"))
+                .find(|p| p.is_file())
+        }) else {
+            eprintln!("betterleaksがないので確かめません");
+            return;
+        };
+        let (_dir, mut ctx) = setup();
+        ctx.scanner = scanner;
+        let wt = ctx.worktree.clone();
+        std::fs::write(
+            wt.join(".betterleaks.toml"),
+            "[extend]\nuseDefault = false\n",
+        )
+        .unwrap();
+        std::fs::write(wt.join(".gitleaks.toml"), "[extend]\nuseDefault = false\n").unwrap();
+        std::fs::write(wt.join(".betterleaksignore"), "*\n").unwrap();
+        // テストのたびに作る、本物らしいトークン（ソースに秘密らしい文字列を置かない）
+        let body: String = (0..36)
+            .map(|i| {
+                let n = (std::process::id() as usize * 31 + i * 7919) % 62;
+                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[n] as char
+            })
+            .collect();
+        std::fs::write(
+            wt.join("config.txt"),
+            format!("token = \"ghp_{body}\" # betterleaks:allow gitleaks:allow\n"),
+        )
+        .unwrap();
+        let err = commit(&ctx, "leak").unwrap_err();
+        assert!(err.message.contains("config.txt:1"), "{}", err.message);
     }
 }

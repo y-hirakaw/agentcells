@@ -1,0 +1,8 @@
+#!/bin/sh
+# コミットしようとしている変更に秘密が入っていたら止める。
+# 使うには: git config core.hooksPath .githooks
+if ! command -v betterleaks >/dev/null 2>&1; then
+  echo "betterleaksがありません。brew install betterleaks で入れてください" >&2
+  exit 1
+fi
+exec betterleaks git --pre-commit --staged --no-banner --redact .

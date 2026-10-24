@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::github;
 use crate::home::Home;
 use crate::probe::Probe;
+use crate::settings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -62,6 +63,7 @@ pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Chec
     let claude_found = claude.status == Status::Ok;
     checks.push(claude);
     checks.push(check_claude_auth(probe, claude_found));
+    checks.push(check_betterleaks(probe));
     checks.push(check_home(home));
     checks.push(check_path(home, path_env));
     let (config_check, config) = check_config(home);
@@ -125,6 +127,18 @@ fn check_claude(probe: &dyn Probe) -> Check {
             "claude",
             "Claude Codeが見つかりません",
             "https://claude.com/claude-code の手順で入れてください",
+        ),
+    }
+}
+
+/// AIのコミットに秘密が入っていないかを、betterleaksで調べる。ないと、AIはコミットできない。
+fn check_betterleaks(probe: &dyn Probe) -> Check {
+    match probe.run("betterleaks", &["version"]) {
+        Some(out) if out.success => Check::ok("betterleaks", first_line(&out.stdout)),
+        _ => Check::fail(
+            "betterleaks",
+            "betterleaksが見つかりません。AIのコミットに秘密が入っていないかを調べるのに使います（ないとコミットできません）",
+            "Homebrewなら `brew install betterleaks`（ほかの環境は https://github.com/betterleaks/betterleaks ）",
         ),
     }
 }
@@ -235,6 +249,15 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
             return (check, Config::load_unchecked(&path));
         }
     };
+    let problems = settings::sandbox_problems(home, &config);
+    if !problems.is_empty() {
+        let check = Check::fail(
+            NAME,
+            problems.join("\n"),
+            "[product.sandbox] の read から、その場所を外してください",
+        );
+        return (check, Some(config));
+    }
     let check = match &config {
         config if config.products.is_empty() => Check::warn(
             NAME,
@@ -390,6 +413,7 @@ mod tests {
             .with("gh --version", true, "gh version 2.87.2\n")
             .with("gh auth status", true, "")
             .with("claude --version", true, "2.1.310 (Claude Code)\n")
+            .with("betterleaks version", true, "1.9.0\n")
             .with(
                 "claude auth status",
                 true,
@@ -755,5 +779,28 @@ private_key = "github-app.pem"
         let check = find(&run(&home, Some(&path), &healthy()), "PATH").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("export PATH="));
+    }
+
+    #[test]
+    fn missing_betterleaks_fails_with_install_hint() {
+        let check = check_betterleaks(&FakeProbe::default().with_fallback(false));
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.fix.unwrap().contains("brew install betterleaks"));
+    }
+
+    #[test]
+    fn sandbox_reads_into_protected_places_fail_the_config_check() {
+        let (_dir, home, path) = setup_home();
+        let text = CONFIG.replace(
+            "cells = [\"triage\"]",
+            &format!(
+                "cells = [\"triage\"]\n\n[product.sandbox]\nread = [\"{}\"]",
+                home.root().join("files").display()
+            ),
+        );
+        std::fs::write(home.config_path(), format!("{text}{GITHUB_APP}")).unwrap();
+        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("読ませない場所"), "{}", check.detail);
     }
 }

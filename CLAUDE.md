@@ -28,6 +28,10 @@
 - must か should を直したら、再レビューを頼む。再レビューは最大2回まで。2回目のあとも must か should が残ったら、ユーザーに伝える
 - レビューの結果と、直したこと・直さなかったこと（理由も）をユーザーに報告する
 
+## 秘密
+
+- コミットの前に、betterleaksで秘密が入っていないかを調べる。`git config core.hooksPath .githooks` でフックを有効にしておく（betterleaksは `brew install betterleaks`）
+
 ## 確かめること
 
 pushする前に、次がすべて通ること。

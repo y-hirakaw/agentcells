@@ -182,9 +182,9 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 | 種類 | 扱い |
 | --- | --- |
 | 読む | Readを、その仕事のworktreeの中だけに許す。Claude Codeは `git status` のような読むだけのコマンドを自分で許す |
-| ファイルの作成と更新 | Edit・Writeを、その仕事のworktreeの中だけに許す（`.git` と置いた秘密のファイルを除く）。編集のたびにCLIを通すと、AIが実装しにくくなるため |
+| ファイルの作成と更新 | Edit・Writeを、その仕事のworktreeの中だけに許す（`.git` と置いた秘密のファイルを除く）。編集のたびにCLIを通すと、AIが実装しにくくなるため。決まりは `Edit(...)` で書く（Writeにも効く。`Write(...)` の決まりは使われない） |
 | ファイルの削除と移動 | `agentcells cell rm` / `agentcells cell mv`。CLIがworktreeの中か（シンボリックリンクの先を含めて）を確かめ、`.git`（大文字・小文字を問わない）と置いた秘密のファイルは断る |
-| コミット | `agentcells cell commit -m`。置いた秘密のファイルと同じ中身（blobのハッシュ）のファイルが入っていたら断る（名前を変えたり写したりしても止める）。hooksとfsmonitorは動かさず、使う人とシステムのgitの設定は読まない。作者は今の仕事のファイルで渡す |
+| コミット | `agentcells cell commit -m`。置いた秘密のファイルと同じ中身（blobのハッシュ）のファイルが入っていたら断る（名前を変えたり写したりしても止める）。足した行をbetterleaksで調べ、秘密らしいものがあれば断る（下の「秘密を探す」）。hooksとfsmonitorは動かさず、使う人とシステムのgitの設定は読まない。作者は今の仕事のファイルで渡す |
 | gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output`、`--ext-diff`、`--no-index` は断る |
 | ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
 
@@ -195,8 +195,13 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
 
 - 書けるのは、作業場所と、その `.git` の実体（`gitdirs/` の下の、その仕事の分）だけ。`repos/` の元のリポジトリには書けない
-- `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は読ませない。今の仕事の作業場所と `.git` の実体、共有している元のリポジトリのオブジェクト、今の仕事のファイルだけは読める
-- それ以外の場所は読める（ビルドに要るツールチェーンなどのため）
+- 使う人のホームの下は、読ませない。読めるのは、今の仕事の作業場所と `.git` の実体、共有している元のリポジトリのオブジェクト、今の仕事のファイル、sandboxで動かすプログラム（agentcellsとbetterleaks）、productの `[product.sandbox]` の `read` に書いた場所だけ。ホームの外（`/usr`、`/opt/homebrew` など）は読める
+  - 「読ませない場所」を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまう。読ませる場所を並べる形にし、足りなければビルドが失敗して人間に回るので、何を足せばよいかがわかる。開けた場所の秘密は読まれうるので、何を開けるかは使う人が決める
+- `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は、`read` で広い場所（`~` や `~/.config`）を開けても読ませない。sandboxは、より細かく書いた決まりを優先するため。これらの中を `read` に書くと、`doctor` と実行の前に断る（細かく書くと、開ける側が優先されてしまうため）
+- 置いた秘密のファイルは、読ませない。`[product.sandbox]` の `read_placed` に書いたもの（リポジトリからの相対パス）だけ、ビルドやテストに読ませる。ReadのdenyはClaude Codeがsandboxにも足すので、`read_placed` のファイルはAIのReadからも読める。ビルドに読ませれば、AIが書き換えたビルドを通して中身を取り出せるのと同じなので、分けない
+- 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない
+- 止めた通信の先は、Claude Codeがコマンドの結果に `deny network-outbound <ホスト>:<ポート>` として書き足し、AIに見える。AIは、止まった先と、足すとよい設定を書いて人間に回す（プロンプトで指示する）
+- sandboxの中では `~/.gitconfig` が読めず、gitが止まるので、使う人とシステムのgitの設定を読ませない環境変数（`GIT_CONFIG_GLOBAL=/dev/null` など）を設定の `env` で渡す
 - sandboxの外でコマンドを動かすことは許さない（`allowUnsandboxedCommands: false`）
 - sandboxの中からも、その仕事の `.git` の実体には書ける（`.git/config` やhooksを含む）。仕事ごとの使い捨てなので、ほかの仕事や元のリポジトリには効かない。AIが終わったあとにCLIがその作業場所で動かすgitは、使う人とシステムの設定を読まず、hooksとfsmonitorを止めて動かす。pushは、その場で作ったbareリポジトリから行う
 - linked worktreeにしない理由: コミットのために元のリポジトリの `.git` を書けるようにする必要があり、そこを書き換えられると、ほかの仕事や、CLIがsandboxの外で動かすgit（次の仕事の作業場所づくりなど）で任意のコードが動くため
@@ -207,9 +212,20 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
 - sandboxの中の `agentcells cell run` から、worktreeの外への書き込み、`~/.agentcells` の中、`~/.ssh` の読み取りは止まり、それ以外の場所は読める
 - sandboxは、作業ディレクトリの直下の `.git` には、`allowWrite` に入れても書かせない。`--separate-git-dir` で外に置いた `.git` の実体を `allowWrite` に入れると、コミットできる。元のリポジトリの `.git/config` には書けず、オブジェクトだけ読める
 - 置いた秘密のファイルは、大文字・小文字を変えた名前でも、Readが止まる
-- 一時ディレクトリ（`/tmp`）は、sandboxでも書き込める。worktreeを一時ディレクトリに置かない
+- sandboxの中では `TMPDIR` が `/tmp/claude-<uid>` になり、そこには書ける。`/tmp` そのものには書けない。worktreeを一時ディレクトリに置かない
 - `permissions.blockReadsOutsideWorkingDirectories` は、`agentcells cell` が今の仕事のファイルを読めなくなり、ホームの下のツールチェーンも読めなくなるので使わない
 - sandboxは `GIT_CONFIG_*` の環境変数で `safe.directory` などを足す。作者の名前は足さない
+
+本物の `claude -p`（2.1.310、haiku）で確かめたこと（2026-10-25、読ませる場所を並べる形にしたとき）:
+
+- `denyRead` にホームを入れ、`allowRead` に作業場所やツールチェーンを入れると、そこだけ読める。`allowRead` に `~` を入れても、`denyRead` の `~/.agentcells` は読めない。`denyRead` の `~/.agentcells` の中でも、`allowRead` に入れたファイル（`~/.agentcells/bin/agentcells`）は動かせる。より細かく書いたほうが勝つ
+- 作業場所の中の、置いた秘密のファイル（`denyRead`）は、`allowRead` の作業場所の中でも読めない。大文字・小文字を変えた名前でも読めない
+- `Read(...)` のdenyは、sandboxの `denyRead` にも足される
+- `Write(...)` の決まりは使われず、Claude Codeが警告を出す。`Edit(...)` の決まりがWriteにも効く
+- `network.strictAllowlist: true` で、`allowedDomains` にない先への通信は、聞かずに止まる（curlには `403`、`X-Proxy-Error: blocked-by-allowlist` が返る）。止めた先は、Claude Codeがコマンドの結果に `<sandbox_violations>deny network-outbound example.com:443 ...</sandbox_violations>` として書き足す。`allowedDomains` にある先には通信できる
+- `~/.gitconfig` が読めないと、`git init` などが止まる（ファイルがないときと違い、エラーになる）。`GIT_CONFIG_GLOBAL=/dev/null` を設定の `env` で渡すと動く。`~/.config/git/ignore` が読めないという警告は残る
+- betterleaksは、標準の正規表現のエンジン（re2）だと `~/Library/Caches` にキャッシュを作ろうとして落ちる。`--regex-engine stdlib` なら動く
+- 読ませる場所に `~/.cargo` と `~/.rustup` を書くと、このリポジトリの `cargo test --offline` がsandboxの中で通る
 
 Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 
@@ -220,6 +236,31 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - `Bash(gh label:*)` や `Bash(gh api:*)` のdenyは、allowに同じものがあっても効いた（`gh repo view` のような許したコマンドは動く）
 - `--json-schema` の `enum` にない値は、AIに強く指示しても返せなかった。そのときは結果の `structured_output` が null になる
 - `--setting-sources project,local` でグローバル設定のhooksが止まるかは、まだ確かめていない
+
+### sandboxに開ける場所
+
+productごとに、AIが動かすコマンド（ビルドやテストを含む）に開ける場所を `[product.sandbox]` に書く。書かなければ、ホームの下は今の仕事の場所しか読めず、外へは通信できない。
+
+```toml
+[product.sandbox]
+read = ["~/.gradle", "~/Library/Android/sdk"]          # ホームの下で読ませる場所（`~/` で始めるか絶対パス）
+network = ["services.gradle.org", "dl.google.com"]    # 通信してよい先（*.example.com も書ける）
+read_placed = ["app/google-services.json"]            # files/ から置いたファイルのうち、ビルドに読ませるもの
+```
+
+- 開けた場所の秘密は、AIが書き換えたビルドを通して読まれうる。何を開けるかは使う人が決める
+- `read` に、読ませない場所（`~/.agentcells`、ghの設定、`~/.ssh` など）の中を書くと、`doctor` と実行の前に断る
+- 設定にコマンドを書いても、置いた秘密のファイルは守れない。コマンドが固定でも、そのコマンドが動かすビルドの設定（`build.gradle` など）はAIが書き換えられるため。リリース用のkeystoreのような強い秘密は、cellに渡さない（デバッグ用の鍵でビルドし、署名はCIでする）
+
+### 秘密を探す
+
+`agentcells cell commit` は、コミットに足す行を [betterleaks](https://github.com/betterleaks/betterleaks) で調べ、秘密らしいものがあればコミットせずに、ファイルと行と種類を出す。base64などで包んだものも、betterleaksが開いて調べる。
+
+- betterleaksは、調べる場所の `.betterleaks.toml`・`.gitleaks.toml`・`.betterleaksignore` と、行の `betterleaks:allow` のコメントで見逃すものを決められる。どれもAIが書けるので、既定の決まりだけで調べる。足した行を標準入力で渡し、AIが書けない `/` で動かし、設定を選ぶ環境変数を消し、`--ignore-gitleaks-allow` を付ける
+- betterleaksの場所は、`tick` がsandboxの外で探して今の仕事のファイルに書く。PATHで探すと、別のものを動かされうるため
+- betterleaksが動かないときや、結果が読めないときは、コミットしない（人間に回す）
+- `doctor` は、betterleaksがあるかを確かめる
+- このリポジトリの開発でも使う。`.githooks/pre-commit` で、コミットする変更を調べる（`git config core.hooksPath .githooks` で有効にする）。CIでも、履歴の全部を調べる。テストのための鍵（`testdata/github-app-test-key.pem`）は `.betterleaks.toml` で外す
 
 ## GitHubへの書き込み
 
@@ -270,7 +311,7 @@ keystore（Android）やapplication.yml（Spring Boot）のように、gitignore
 - `files/<owner>/<repo>/` の下に、worktreeに置くのと同じパスでファイルを置いておく
 - 置く前に `git check-ignore` で、そのパスがgitignoreされているか確かめる。されていなければ置かずに知らせる（秘密のファイルをコミットさせない）
 - シンボリックリンクではなくコピーで置き、権限は600にする（元のファイルを書き換えさせない）
-- 置いたファイルは、`--settings` で渡す設定に `Read(//絶対パス)` のdenyを足して読めなくする。ビルドツールは読めるが、AIは中身を読まないので、プロンプトや実行の記録に入らない。worktreeに設定ファイルを書かないので、それをコミットしてしまう心配もない（Aのルーティンでの渡し方は未定）
+- 置いたファイルは、`--settings` で渡す設定に `Read(//絶対パス)` と `Edit(//絶対パス)` のdenyと、sandboxの `denyRead` を足して、AIにもビルドにも読ませない。ビルドに要るもの（`google-services.json` など）は、`[product.sandbox]` の `read_placed` に書いたときだけ読ませる（AIのReadからも読める。「AIに許すこと」を参照）。worktreeに設定ファイルを書かないので、それをコミットしてしまう心配もない（Aのルーティンでの渡し方は未定）
 - `doctor` で、登録しているリポジトリに必要なファイルがそろっているかを確かめ、足りなければ置き場所を案内する
 - あとで、リポジトリごとの準備コマンド（`npm ci` など）も足せるようにしておく
 

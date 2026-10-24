@@ -14,11 +14,19 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
   - 読むこと（Read）と、ファイルの作成と更新（Edit・Write）は、その仕事のworktreeの中だけに許す。それ以外の削除・移動・コミット・ビルドやテストは `agentcells cell` を通す。Issueに仕込まれた指示に従ってしまっても、できることを限るため
   - Bashは `agentcells cell` だけを許す。`git diff --output` のように、読むコマンドでもファイルに書けるものがあるため
 - **Claude Codeのsandbox**
-  - AIが動かすコマンド（ビルドやテストを含む）を、sandboxの中で動かす。書けるのはworktreeとgitの共通のディレクトリだけで、`~/.agentcells`（Appの秘密鍵など）や `~/.ssh` などは読めない。sandboxの外では動かせない。ビルドやテストは、AIが書き換えたコードを動かすため
+  - AIが動かすコマンド（ビルドやテストを含む）を、sandboxの中で動かす。ビルドやテストは、AIが書き換えたコードを動かすため。sandboxの外では動かせない
+  - 書けるのは、仕事ごとの作業場所（`git clone --shared --separate-git-dir` で作る）と、その `.git` の実体だけ。元のリポジトリの `.git/config` やhooksを書き換えて、CLIがsandboxの外で動かすgitに任意のコードを動かさせないため
+  - 使う人のホームの下は読ませず、productの `[product.sandbox]` の `read` に書いた場所だけを開ける。読ませない場所を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまうため。`~/.agentcells`、ghの設定、`~/.ssh` などは、広く開けても読ませない
+  - 外への通信は、`[product.sandbox]` の `network` に書いた先だけにし、ほかは聞かずに止める。WebFetchも使わせない。読めた秘密を、コミットを通さずに外へ送らせないため。止めた先はAIに見えるので、AIは足すとよい設定を書いて人間に回す
+  - 置いた秘密のファイル（keystoreなど）は、ビルドにも読ませない。`read_placed` に書いたものだけ読ませる。読ませると、AIが書き換えたビルドを通して取り出せるため、要るものだけを明示する
+- **コミットの前に秘密を探す**（[betterleaks](https://github.com/betterleaks/betterleaks)）
+  - `agentcells cell commit` は、足した行をbetterleaksで調べ、秘密らしいものがあればコミットしない。worktreeに置かれた設定や `betterleaks:allow` のコメントでは見逃させない。置いた秘密のファイルの中身を、包み直して（base64など）コミットされることも防ぐため
+  - `doctor` は、betterleaksがあるかを確かめる
+  - このリポジトリの開発でも、pre-commitのフック（`.githooks/`）とCIで調べる
 - **`agentcells cell`**（cellとして動くAIが使う）
   - `git`（status/diff/log/show/blame。ファイルに書くオプションや `--no-index` は断る）、`rm`、`mv`（worktreeの外、シンボリックリンクの先、`.git`、置いた秘密のファイルは断る）、`commit`（置いた秘密のファイルと同じ中身のものは断り、hooksとfsmonitorは動かさず、使う人のgitの設定は読まない）、`run`（設定に書いたコマンドだけ）
-- **`[product.commands]`**
-  - AIが `agentcells cell run <名前>` で実行できるコマンドを、productごとに書く
+- **`[product.commands]` と `[product.sandbox]`**
+  - AIが `agentcells cell run <名前>` で実行できるコマンドと、sandboxに開ける場所（`read`、`network`、`read_placed`）を、productごとに書く
 - **`agentcells tick --dry-run`**
   - 仕事（cellのラベルが付いていて、処理中でも人間待ちでもないIssue/PR）を探して、次に動かすものを表示する。ロックで、tickを同時に2つ動かさない
 
