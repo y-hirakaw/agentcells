@@ -105,6 +105,16 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
   - 差分の外の行にはGitHubが行コメントを付けられないので、そうした指摘はレビュー本文にまとめて書く
   - 自分のPRには「変更を要求」も「承認」もできないので、レビューの種類はCOMMENTにする
 
+## tick
+
+`agentcells tick` を定期実行で呼ぶ。今は `--dry-run` で、仕事を探して表示するところまで。
+
+- 仕事は、cellのラベルが付いていて、`ac:working` も `ac:needs-human` も付いていない、開いているIssue/PR。Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す
+- productとcellを設定の順に見て、同じcellの中では番号の小さい順に並べる。1回のtickでは1件ずつ動かす（予定）
+- 一覧を読むときも、リポジトリごとの読み取り用のトークンと空のghの設定を使う
+- `~/.agentcells/tick.lock` をロックして、tickを同時に2つ動かさない。ほかのtickが動いていれば、何もせずに終わる
+- `claude -p` は、標準入力を3秒待って警告を出すので、プロンプトは標準入力で渡す（予定）
+
 ## 状態の持ち方
 
 - 状態はGitHubのIssue・PRのラベルとコメントで持つ（専用のデータベースは持たない）
@@ -161,6 +171,25 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 - このリポジトリの `.claude/` は、agentcellsを開発するエージェントのための設定。cellとして動くエージェントの設定とは分ける
 - B（`claude -p`）は、worktreeの中で `--settings` にagentcellsの設定を渡し、`--setting-sources project,local` でグローバル設定を外して起動する。作業するリポジトリ自身の設定とCLAUDE.mdの上に、agentcellsの設定を重ねる形になる
 - A（ルーティン）は、作業フォルダを `~/.agentcells` にする。そこの `.claude/settings.json` とCLAUDE.mdが効く
+
+### AIに許すこと
+
+読むことは自由にし、作成・追加・更新・削除は決まった道だけにする。
+
+| 種類 | 扱い |
+| --- | --- |
+| 読む | Read・Glob・Grepを許す。Claude Codeは `git status` のような読むだけのコマンドを自分で許す |
+| ファイルの作成と更新 | Edit・Writeを、その仕事のworktreeの中だけに許す（`.git` と置いた秘密のファイルを除く）。編集のたびにCLIを通すと、AIが実装しにくくなるため |
+| ファイルの削除と移動 | `agentcells cell rm` / `agentcells cell mv`。CLIがworktreeの中か（シンボリックリンクの先を含めて）を確かめる |
+| コミット | `agentcells cell commit -m`。置いた秘密のファイルが入っていたら断る。hooksは動かさない |
+| gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output` のようにファイルに書くオプションや、外のコマンドを動かすオプションは断る |
+| ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
+
+- Bashは `Bash(agentcells cell:*)` だけを許す。`ls` や `git diff` でも、オプションでファイルに書けるものがあるため
+- Claude Codeは、許したコマンドに `>`、`;`、`&&`、`$(...)` で別の操作を付け足すことを止める（作業ディレクトリの中に向けても止まることを、2.1.310で確かめた）
+- `agentcells cell` は、`tick` が書いた「今の仕事」のファイル（worktree、使えるコマンド、置いた秘密のファイル）を、環境変数 `AGENTCELLS_CONTEXT` で受け取る。AIは環境変数を変えて呼べない（`AGENTCELLS_CONTEXT=... agentcells cell` は `agentcells cell` で始まらないので許されない）
+- 本物の `claude -p` で、worktreeの外へのWrite、`rm`、`.git` の書き換えが止まり、`agentcells cell` の各コマンドが動くことを確かめた（2026-10-24）
+- ビルドやテストを実行すると、AIが書き換えたビルドの設定やテストも動く。間接的には任意のコードを動かせるので、閉じ込めるには sandbox が要る（concept.md）
 
 Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 

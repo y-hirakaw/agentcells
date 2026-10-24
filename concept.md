@@ -105,6 +105,11 @@ cellの定義（拾う条件、プロンプト、止まる条件、往復の上�
 3. inspectorで止まった場所を見えるようにする
 4. 動かした結果を記事にする（作ってから書く）
 
+## あとでやること
+
+- コミットの前に [betterleaks](https://github.com/betterleaks/betterleaks) で秘密が入っていないかを調べ、見つかったらコミットを止める。このリポジトリの開発と、cellの `agentcells cell commit` の両方で使う
+- ビルドとテストを sandbox（Claude Codeの sandbox やコンテナ）の中で動かす。AIが書き換えたビルドの設定やテストを実行すると、間接的に任意のコードを動かせてしまうため
+
 ## 決まっていないこと
 
 - review → implement の差し戻しで、AIがrebaseやamendで履歴を書き換えたときのpush。失敗させて人間に回すか、前にpushしたコミットを指定して `--force-with-lease` で上書きするか

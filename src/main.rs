@@ -3,15 +3,18 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use agentcells::actions;
 use agentcells::config::{Config, Target};
 use agentcells::doctor::{self, Status};
 use agentcells::error::{Error, Result};
 use agentcells::files;
+use agentcells::github::{self, Purpose};
 use agentcells::home::{Home, RepoName};
 use agentcells::labels;
 use agentcells::probe::SystemProbe;
 use agentcells::prompt;
 use agentcells::setup;
+use agentcells::tick;
 
 #[derive(Parser)]
 #[command(version, about = "Issueを作ると、AIエージェントのcellが仕事を進める")]
@@ -41,6 +44,41 @@ enum Commands {
         #[command(subcommand)]
         command: PromptCommands,
     },
+    /// 仕事を探して、cellを動かす（定期実行で呼ぶ）
+    Tick {
+        /// 動かさずに、見つかった仕事と、次に動かすものだけを表示する
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// cellとして動くAIが使うコマンド（agentcellsがAIを起動したときだけ使える）
+    Cell {
+        #[command(subcommand)]
+        command: CellCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CellCommands {
+    /// gitを読む（status / diff / log / show / blame）
+    Git {
+        subcommand: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// worktreeの中のファイルやディレクトリを消す
+    Rm {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// worktreeの中で、ファイルやディレクトリを動かす
+    Mv { from: PathBuf, to: PathBuf },
+    /// worktreeの変更をすべてコミットする（置いた秘密のファイルはコミットしない）
+    Commit {
+        #[arg(short, long)]
+        message: String,
+    },
+    /// 設定（product.commands）に書いたコマンドを実行する
+    Run { name: String },
 }
 
 #[derive(Subcommand)]
@@ -147,6 +185,34 @@ fn run(command: Commands) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Cell { command } => run_cell(command),
+        Commands::Tick { dry_run } => {
+            let Some(_lock) = tick::lock(&home)? else {
+                println!("ほかのtickが動いているので、何もしません");
+                return Ok(ExitCode::SUCCESS);
+            };
+            let config = Config::load(&home.config_path())?;
+            let credentials_for =
+                |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
+            let work = tick::find(&config, &SystemProbe, &credentials_for)?;
+            if work.is_empty() {
+                println!("仕事はありません");
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!("仕事: {}件", work.len());
+            for w in &work {
+                println!("  {}", w.describe());
+            }
+            println!("\n次に動かすもの: {}", work[0].describe());
+            if !dry_run {
+                return Err(
+                    Error::new("cellを動かす部分は、まだ作っていません").with_hint(
+                        "今は `agentcells tick --dry-run` で、見つかる仕事を確かめられます",
+                    ),
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Prompt {
             command: PromptCommands::Show { cell, issue, pr },
         } => {
@@ -159,6 +225,35 @@ fn run(command: Commands) -> Result<ExitCode> {
             print!("{}", prompt::show(&config, &SystemProbe, &cell, target)?);
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+fn run_cell(command: CellCommands) -> Result<ExitCode> {
+    let context = actions::Context::load_from_env()?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::new(format!("今のディレクトリが分かりません: {e}")))?;
+    let code = |code: i32| ExitCode::from(u8::try_from(code).unwrap_or(1));
+    match command {
+        CellCommands::Git { subcommand, args } => {
+            Ok(code(actions::git_read(&context, &subcommand, &args)?))
+        }
+        CellCommands::Rm { paths } => {
+            for removed in actions::remove(&context, &cwd, &paths)? {
+                println!("消しました: {}", removed.display());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        CellCommands::Mv { from, to } => {
+            actions::rename(&context, &cwd, &from, &to)?;
+            println!("動かしました: {} → {}", from.display(), to.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        CellCommands::Commit { message } => {
+            let sha = actions::commit(&context, &message)?;
+            println!("コミットしました: {sha}");
+            Ok(ExitCode::SUCCESS)
+        }
+        CellCommands::Run { name } => Ok(code(actions::run(&context, &name)?)),
     }
 }
 

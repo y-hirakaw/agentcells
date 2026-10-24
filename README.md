@@ -44,6 +44,7 @@ cd agentcells
 | `agentcells setup` | 作業データの置き場所と、設定ファイルの雛形（`config.toml`）を用意する（何度実行してもよい） |
 | `agentcells labels sync [--dry-run]` | 設定ファイルのproductとcellに必要な `ac:` ラベルのうち、足りないものをGitHubに作る |
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
+| `agentcells tick --dry-run` | 仕事（cellのラベルが付いたIssue/PR）を探して、次に動かすものを表示する（cellを動かす部分は作成中） |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |
 
 設定ファイル `~/.agentcells/config.toml` には、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [docs/design.md](docs/design.md) と、雛形のコメントを見てください。標準のcell（triage、implement、review）は、プロンプトを書かなくても [prompts/](prompts/) の標準のプロンプトで動きます。`prompt` にファイルを書くと、追加の指示として足されます。

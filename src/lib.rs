@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod config;
 pub mod discussion;
 pub mod doctor;
@@ -13,4 +14,5 @@ pub mod prompt;
 pub mod review;
 pub mod settings;
 pub mod setup;
+pub mod tick;
 pub mod transition;

@@ -3,7 +3,7 @@
 //! product（どのリポジトリのIssueを、どのリポジトリで作業するか）と、
 //! cell（どのラベルを拾い、どのプロンプトで動くか）を書く。
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -24,6 +24,10 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # issues = "y-hirakaw/agentcells"    # Issueを置くリポジトリ
 # repos = ["y-hirakaw/agentcells"]   # 作業するリポジトリ
 # cells = ["triage"]                 # このproductで動かすcell
+#
+# [product.commands]                 # AIが `agentcells cell run <名前>` で実行できるコマンド（これ以外は実行できない）
+# test = "npm test"
+# build = "npm run build"
 #
 # cell: どのラベルが付いたIssue/PRを拾い、どのプロンプトで動くか
 #
@@ -83,6 +87,9 @@ pub struct Product {
     pub repos: Vec<RepoName>,
     /// このproductで動かすcellの名前
     pub cells: Vec<String>,
+    /// AIが `agentcells cell run <名前>` で実行できるコマンド。AIは、ここに書いたもの以外は実行できない
+    #[serde(default)]
+    pub commands: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,6 +266,17 @@ impl Config {
                     "product「{}」の cells が空です。動かすcellを書いてください",
                     p.name
                 ));
+            }
+            for (name, command) in &p.commands {
+                if !is_valid_name(name) {
+                    problems.push(format!(
+                        "product「{}」のコマンドの名前「{name}」に使えない文字があります（英小文字・数字・-）",
+                        p.name
+                    ));
+                }
+                if command.trim().is_empty() {
+                    problems.push(format!("product「{}」のコマンド「{name}」が空です", p.name));
+                }
             }
             for name in &p.cells {
                 let Some(cell) = self.cell(name) else {
@@ -656,6 +674,22 @@ timeout_minutes = 10
         let config = Config::parse(&text, dir.path()).unwrap();
         let repos: Vec<String> = config.repos().iter().map(|r| r.to_string()).collect();
         assert_eq!(repos, vec!["y-hirakaw/agentcells", "y-hirakaw/web"]);
+    }
+
+    #[test]
+    fn products_can_name_commands_for_the_ai() {
+        let text = VALID.replace(
+            "cells = [\"triage\", \"review\"]",
+            "cells = [\"triage\", \"review\"]\n\n[product.commands]\ntest = \"npm test\"",
+        );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(&text, dir.path()).unwrap();
+        assert_eq!(config.products[0].commands["test"], "npm test");
+
+        let bad = text.replace("test = \"npm test\"", "Run_Tests = \"\"");
+        let message = problems_of(&bad);
+        assert!(message.contains("「Run_Tests」に使えない文字"), "{message}");
+        assert!(message.contains("が空です"), "{message}");
     }
 
     #[test]

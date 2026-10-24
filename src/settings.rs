@@ -32,7 +32,18 @@ pub const DENY_GH: &[&str] = &[
     "Bash(gh api:*)",
 ];
 
+/// AIに許すツール。読むのは自由にし、書き換えは次の2つの道だけにする。
+/// - ファイルの作成と更新: Edit・Writeを、その仕事のworktreeの中だけに許す（`runtime_settings` で足す）
+/// - それ以外（削除、移動、コミット、gitを読む、ビルドやテスト）: `agentcells cell` を通す。CLIが範囲を確かめる
+///
+/// Bashは `agentcells cell` だけを許す。`ls` や `git diff` のようなコマンドでも、オプションでファイルに
+/// 書けるものがある（`git diff --output` など）ので許さない。Claude Codeは、許したコマンドに
+/// `>`、`;`、`&&`、`$(...)` で別の操作を付け足すことを止める（2.1.310で確かめた）。
+pub const ALLOW_BASE: &[&str] = &["Read", "Glob", "Grep", "Bash(agentcells cell:*)"];
+
 /// 1回の実行で渡す設定を作る。
+///
+/// `worktree` の中だけに、ファイルの作成と更新（Edit、Write）を許す。ただし `.git` と、置いた秘密のファイルは除く。
 ///
 /// 次のファイルはAIに読ませない。
 /// - `placed_files`: worktreeに置いた秘密のファイル（絶対パス）
@@ -45,21 +56,34 @@ pub const DENY_GH: &[&str] = &[
 pub fn runtime_settings(
     home: &Home,
     config: &Config,
+    worktree: &Path,
     placed_files: &[PathBuf],
 ) -> Result<serde_json::Value> {
-    let mut deny: Vec<String> = DENY_GH.iter().map(|s| s.to_string()).collect();
-    for path in placed_files {
-        deny_read(&mut deny, path, "")?;
+    let mut allow: Vec<String> = ALLOW_BASE.iter().map(|s| s.to_string()).collect();
+    for tool in ["Edit", "Write"] {
+        rule(&mut allow, tool, worktree, "/**")?;
     }
-    deny_read(&mut deny, &home.files_dir(), "/**")?;
-    deny_read(&mut deny, &home.config_path(), "")?;
+
+    let mut deny: Vec<String> = DENY_GH.iter().map(|s| s.to_string()).collect();
+    // .git（linked worktreeではリポジトリを指すファイル）を書き換えさせない
+    for tool in ["Edit", "Write"] {
+        rule(&mut deny, tool, &worktree.join(".git"), "")?;
+        rule(&mut deny, tool, &worktree.join(".git"), "/**")?;
+    }
+    for path in placed_files {
+        for tool in ["Read", "Edit", "Write"] {
+            rule(&mut deny, tool, path, "")?;
+        }
+    }
+    rule(&mut deny, "Read", &home.files_dir(), "/**")?;
+    rule(&mut deny, "Read", &home.config_path(), "")?;
     if let Some(app) = &config.github_app {
-        deny_read(&mut deny, &app.private_key, "")?;
+        rule(&mut deny, "Read", &app.private_key, "")?;
     }
     if let Some(dir) = gh_config_dir(|key| std::env::var_os(key)) {
-        deny_read(&mut deny, &dir, "/**")?;
+        rule(&mut deny, "Read", &dir, "/**")?;
     }
-    Ok(json!({ "permissions": { "deny": deny } }))
+    Ok(json!({ "permissions": { "allow": allow, "deny": deny } }))
 }
 
 /// ghの設定ディレクトリ。ghと同じく `GH_CONFIG_DIR`、`XDG_CONFIG_HOME/gh`、`~/.config/gh` の順に探す。
@@ -76,14 +100,14 @@ fn gh_config_dir(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<Pat
         .and_then(|home| absolute(home.join(".config/gh")))
 }
 
-/// `Read(//絶対パス)` の形でdenyを足す（先頭の / を重ねる）。
+/// `Read(//絶対パス)` の形で、ツールとパスの決まりを足す（先頭の / を重ねる）。
 ///
 /// Claude Codeが比べるパスと形が違うと効かないので、書いたままのパスと、
 /// シンボリックリンクや `..` を解いたパス（macOSの /var → /private/var など）の両方を足す。
-fn deny_read(deny: &mut Vec<String>, path: &Path, suffix: &str) -> Result<()> {
+fn rule(rules: &mut Vec<String>, tool: &str, path: &Path, suffix: &str) -> Result<()> {
     if !path.is_absolute() {
         return Err(Error::new(format!(
-            "Readを禁止するパスは絶対パスにしてください: {}",
+            "許可や禁止に書くパスは絶対パスにしてください: {}",
             path.display()
         )));
     }
@@ -94,9 +118,9 @@ fn deny_read(deny: &mut Vec<String>, path: &Path, suffix: &str) -> Result<()> {
         paths.push(resolved);
     }
     for p in paths {
-        let rule = format!("Read(/{}{suffix})", p.display());
-        if !deny.contains(&rule) {
-            deny.push(rule);
+        let rule = format!("{tool}(/{}{suffix})", p.display());
+        if !rules.contains(&rule) {
+            rules.push(rule);
         }
     }
     Ok(())
@@ -120,13 +144,46 @@ mod tests {
         Home::new(PathBuf::from("/home/me/.agentcells"))
     }
 
-    fn deny_of(config: &Config, placed: &[PathBuf]) -> Vec<String> {
-        runtime_settings(&home(), config, placed).unwrap()["permissions"]["deny"]
+    fn rules_of(config: &Config, placed: &[PathBuf], kind: &str) -> Vec<String> {
+        runtime_settings(&home(), config, Path::new("/w/octo/app/12"), placed).unwrap()
+            ["permissions"][kind]
             .as_array()
             .unwrap()
             .iter()
             .map(|d| d.as_str().unwrap().to_string())
             .collect()
+    }
+
+    fn deny_of(config: &Config, placed: &[PathBuf]) -> Vec<String> {
+        rules_of(config, placed, "deny")
+    }
+
+    #[test]
+    fn allows_reading_and_writing_only_inside_the_worktree() {
+        let allow = rules_of(&Config::default(), &[], "allow");
+        assert_eq!(
+            allow,
+            vec![
+                "Read",
+                "Glob",
+                "Grep",
+                "Bash(agentcells cell:*)",
+                "Edit(//w/octo/app/12/**)",
+                "Write(//w/octo/app/12/**)",
+            ]
+        );
+        let deny = deny_of(
+            &Config::default(),
+            &[PathBuf::from("/w/octo/app/12/key.jks")],
+        );
+        for rule in [
+            "Edit(//w/octo/app/12/.git)",
+            "Write(//w/octo/app/12/.git/**)",
+            "Edit(//w/octo/app/12/key.jks)",
+            "Write(//w/octo/app/12/key.jks)",
+        ] {
+            assert!(deny.contains(&rule.to_string()), "{rule} should be denied");
+        }
     }
 
     #[test]
@@ -197,7 +254,7 @@ mod tests {
         };
         let home = Home::new(link.clone());
         let deny: Vec<String> =
-            runtime_settings(&home, &config, &[]).unwrap()["permissions"]["deny"]
+            runtime_settings(&home, &config, &link, &[]).unwrap()["permissions"]["deny"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -249,6 +306,7 @@ mod tests {
             runtime_settings(
                 &home(),
                 &Config::default(),
+                Path::new("/w"),
                 &[PathBuf::from("local.properties")]
             )
             .is_err()
