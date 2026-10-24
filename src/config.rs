@@ -32,11 +32,13 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # label = "ac:triage"                # 拾うラベル（ac: で始める）
 # prompt = "cells/triage.md"         # プロンプトのファイル（このファイルからの相対パス）
 # next = ["implement", "done"]       # 進めてよい先（cellの名前か done）。needs-human はいつでも選べる
-# max_rounds = 3                     # 往復の上限（省略すると3）
+# max_rounds = 3                     # 往復の上限（1〜3。省略すると3）
 # timeout_minutes = 30               # 1回の実行の上限（省略すると30）
 "#;
 
-const DEFAULT_MAX_ROUNDS: u32 = 3;
+/// 往復の上限。これより多く往復させず、人間に回す。
+pub const MAX_ROUNDS_LIMIT: u32 = 3;
+const DEFAULT_MAX_ROUNDS: u32 = MAX_ROUNDS_LIMIT;
 const DEFAULT_TIMEOUT_MINUTES: u32 = 30;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -271,9 +273,9 @@ impl Config {
                     c.name
                 ));
             }
-            if c.max_rounds == 0 {
+            if !(1..=MAX_ROUNDS_LIMIT).contains(&c.max_rounds) {
                 problems.push(format!(
-                    "cell「{}」の max_rounds は1以上にしてください",
+                    "cell「{}」の max_rounds は1から{MAX_ROUNDS_LIMIT}までにしてください",
                     c.name
                 ));
             }
@@ -318,7 +320,7 @@ name = "review"
 on = "pull_request"
 label = "ac:review"
 prompt = "cells/review.md"
-max_rounds = 5
+max_rounds = 2
 timeout_minutes = 10
 "#;
 
@@ -344,6 +346,15 @@ timeout_minutes = 10
         let config = Config::parse(VALID, dir.path()).unwrap();
         assert_eq!(config.cell("triage").unwrap().next, vec!["review", "done"]);
         assert!(config.cell("review").unwrap().next.is_empty());
+    }
+
+    #[test]
+    fn max_rounds_is_capped_at_three() {
+        let ok = VALID.replace("max_rounds = 2", "max_rounds = 3");
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        assert!(Config::parse(&ok, dir.path()).is_ok());
+        let over = VALID.replace("max_rounds = 2", "max_rounds = 4");
+        assert!(problems_of(&over).contains("1から3まで"));
     }
 
     #[test]
@@ -412,7 +423,7 @@ timeout_minutes = 10
 
         let review = config.cell("review").unwrap();
         assert_eq!(review.on, vec![Target::PullRequest]);
-        assert_eq!(review.max_rounds, 5);
+        assert_eq!(review.max_rounds, 2);
     }
 
     #[test]
@@ -449,7 +460,7 @@ timeout_minutes = 10
                 "cells = [\"triage\", \"deploy\"]",
             )
             .replace("label = \"ac:review\"", "label = \"review\"")
-            .replace("max_rounds = 5", "max_rounds = 0");
+            .replace("max_rounds = 2", "max_rounds = 0");
         let message = problems_of(&text);
         assert!(message.contains("deploy"), "{message}");
         assert!(message.contains("ac: で始めて"), "{message}");

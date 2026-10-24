@@ -37,7 +37,7 @@ on = "pull_request"          # issue か pull_request（両方なら ["issue", "
 label = "ac:review"          # 拾うラベル
 prompt = "cells/review.md"   # プロンプトのファイル
 next = ["implement", "done"] # 進めてよい先（cellの名前か done）
-max_rounds = 5               # 往復の上限（無限ループを防ぐ。省略すると3）
+max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 ```
 
@@ -69,6 +69,7 @@ cellが終わったら、AIは「次はどこか」と、Issue/PRに残すコメ
 
 - Issueを扱うcellから、PRを扱うcellに進むときは、実行の中で作られたPRにラベルを付ける。PRが作られていなければ人間に回す
 - `done` は、Issueなら閉じる。PRなら、自動マージの判断（dispatcher）ができるまでは `ac:needs-human` を付けて検品を頼む
+- 往復は最大3回（`max_rounds` は1〜3）。進む先のcellが、そのIssue/PRですでに上限の回数動いていたら人間に回す。implementの最初の実装はIssueの上で数え、PRでは指摘を直した回数を数えるので、review → implement の差し戻しは最大3回になる
 
 ### 2. 振り分け: dispatcher
 
