@@ -163,7 +163,8 @@ fn call_api(
         })?;
     if !out.success {
         let stderr = out.stderr.trim();
-        let message = if stderr.contains("timed out") {
+        // curlの終了コード28はタイムアウト
+        let message = if out.code == Some(28) {
             format!("GitHubから{MAX_TIME_SECS}秒以内に応答がありません: {stderr}")
         } else {
             format!("GitHubに接続できません: {stderr}")
@@ -257,6 +258,9 @@ fn api_as_app(
     })
 }
 
+const RATE_LIMIT_HINT: &str =
+    "GitHub APIの呼び出しの上限（rate limit）に達しました。時間をおいてもう一度実行してください";
+
 /// GitHub APIの失敗。
 struct ApiError {
     status: u16,
@@ -275,8 +279,10 @@ impl From<ApiError> for Error {
             301 | 302 | 307 | 308 => {
                 "リポジトリの名前や持ち主が変わっていないか確かめ、config.toml を新しい名前にしてください"
             }
-            403 | 429 => {
-                "GitHub APIの呼び出しの上限（rate limit）に達した可能性があります。時間をおいてもう一度実行してください"
+            429 => RATE_LIMIT_HINT,
+            403 if e.message.to_lowercase().contains("rate limit") => RATE_LIMIT_HINT,
+            403 => {
+                "GitHub Appの権限と、インストールが一時停止（suspend）されていないかを、Appの設定画面で確かめてください"
             }
             _ => "時間をおいてもう一度実行し、続くようならエラーの内容を確かめてください",
         };
@@ -301,6 +307,7 @@ pub(crate) mod fake {
     pub fn response(status: u16, body: &str) -> crate::probe::Output {
         crate::probe::Output {
             success: true,
+            code: Some(0),
             stdout: format!("{body}\n{status}"),
             stderr: String::new(),
         }
@@ -762,6 +769,43 @@ mod tests {
     }
 
     #[test]
+    fn only_rate_limits_get_the_rate_limit_hint() {
+        let suspended = FakeProbe::default().with_output(
+            fake::key("GET", "/app", None),
+            fake::response(403, r#"{"message":"This installation has been suspended"}"#),
+        );
+        let hint = app_info(&suspended, "JWT").unwrap_err().hint.unwrap();
+        assert!(hint.contains("suspend"), "{hint}");
+
+        let limited = FakeProbe::default().with_output(
+            fake::key("GET", "/app", None),
+            fake::response(403, r#"{"message":"API rate limit exceeded"}"#),
+        );
+        let hint = app_info(&limited, "JWT").unwrap_err().hint.unwrap();
+        assert!(hint.contains("rate limit"), "{hint}");
+    }
+
+    #[test]
+    fn timeouts_are_told_by_the_exit_code() {
+        let mut probe = FakeProbe::default();
+        probe.outputs.insert(
+            fake::key("GET", "/app", None),
+            crate::probe::Output {
+                success: false,
+                code: Some(28),
+                stdout: String::new(),
+                stderr: "curl: (28) something changed".to_string(),
+            },
+        );
+        let err = app_info(&probe, "JWT").unwrap_err();
+        assert!(
+            err.message.contains("秒以内に応答がありません"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
     fn redirects_point_to_renamed_repos() {
         let probe = FakeProbe::default().with_output(
             fake::key("GET", "/repos/octo/old/installation", None),
@@ -832,6 +876,14 @@ mod tests {
             }
         }
 
+        /// proxyの環境変数がある環境（会社のネットワークや一部のCI）でも、手元のサーバーに直接送る。
+        fn without_proxy(mut env: Vec<(String, String)>) -> WithEnv {
+            for key in ["NO_PROXY", "no_proxy"] {
+                env.push((key.to_string(), "*".to_string()));
+            }
+            WithEnv(env)
+        }
+
         #[test]
         fn sends_the_jwt_as_bearer_and_ignores_curlrc() {
             let curl_home = tempfile::tempdir().unwrap();
@@ -840,7 +892,7 @@ mod tests {
                 "header = \"X-From-Curlrc: yes\"\n",
             )
             .unwrap();
-            let probe = WithEnv(vec![(
+            let probe = without_proxy(vec![(
                 "CURL_HOME".to_string(),
                 curl_home.path().display().to_string(),
             )]);
@@ -862,7 +914,7 @@ mod tests {
         #[test]
         fn reads_the_status_of_errors() {
             let (base, server) = serve_once("404 Not Found", r#"{"message":"Not Found"}"#);
-            let found = call_api(&SystemProbe, &base, "JWT", "GET", "/x", None).unwrap();
+            let found = call_api(&without_proxy(vec![]), &base, "JWT", "GET", "/x", None).unwrap();
             assert_eq!(found, None);
             server.join().unwrap();
         }

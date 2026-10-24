@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Clone, Default)]
 pub struct Output {
     pub success: bool,
+    /// 終了コード。シグナルで終わったときは `None`
+    pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -70,6 +72,7 @@ impl Probe for SystemProbe {
         }
         Some(Output {
             success: out.status.success(),
+            code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
@@ -124,7 +127,7 @@ pub(crate) mod fake {
                 Output {
                     success,
                     stdout: stdout.to_string(),
-                    stderr: String::new(),
+                    ..Output::default()
                 },
             );
             self

@@ -273,17 +273,6 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
             "GitHub Appを作り、config.toml の [github_app] に書くのがおすすめです（手順は README の「GitHub App」）",
         );
     };
-    // Appとしての呼び出しにはcurlを使う（JWTをBearerで送るため）
-    if probe
-        .run("curl", &["--version"])
-        .is_none_or(|out| !out.success)
-    {
-        return Check::fail(
-            NAME,
-            "GitHub Appを使うのに要るcurlが見つかりません",
-            "curlを入れてください（Debian/Ubuntuなら `sudo apt install curl`）",
-        );
-    }
     // 鍵の権限はネットワークに出ずに確かめられるので先に見て、ほかの結果と一緒に知らせる。
     let loose = loose_permissions(&app.private_key).map(|mode| {
         format!(
@@ -296,6 +285,19 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
         Some(note) => format!("{fix}。あわせて、{note}"),
         None => fix,
     };
+    // Appとしての呼び出しにはcurlを使う（JWTをBearerで送るため）
+    if probe
+        .run("curl", &["--version"])
+        .is_none_or(|out| !out.success)
+    {
+        return Check::fail(
+            NAME,
+            "GitHub Appを使うのに要るcurlが見つかりません",
+            with_loose(
+                "curlを入れてください（Debian/Ubuntuなら `sudo apt install curl`）".to_string(),
+            ),
+        );
+    }
     let fail = |err: crate::error::Error| {
         Check::fail(
             NAME,
@@ -593,6 +595,18 @@ private_key = "github-app.pem"
         let check = find(&run(&home, Some(&path), &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("curl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_private_key_is_reported_even_without_curl() {
+        let (_dir, home, path) = setup_home();
+        set_mode(&home.root().join("github-app.pem"), 0o644);
+        let mut probe = healthy();
+        probe.outputs.remove("curl --version");
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.fix.unwrap().contains("chmod 600"));
     }
 
     #[test]
