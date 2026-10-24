@@ -57,11 +57,19 @@ const SECRET_PLACES: &[&str] = &[
 ];
 
 /// 1回の実行の場所。
+///
+/// 作業の場所は、仕事ごとに `git clone --shared --separate-git-dir=<git_dir>` で作ったcloneにする。
+/// - linked worktree（`git worktree add`）だと、コミットのために元のリポジトリの `.git` を書けるようにする必要があり、
+///   AIのビルドがその `.git/config` やhooksを書き換えると、あとでCLIがsandboxの外で動かすgitで任意のコードが動く
+/// - sandboxは、作業ディレクトリの直下の `.git` には、許しても書かせない（2.1.310で確かめた）。
+///   そのため `.git` の実体を作業ディレクトリの外（仕事ごとの使い捨ての場所）に置き、そこを書けるようにする
 pub struct RunPaths<'a> {
-    /// 作業するworktree
+    /// 作業するclone
     pub worktree: &'a Path,
-    /// gitの共通のディレクトリ（linked worktreeなら、元のリポジトリの `.git`）。コミットで書き込む
+    /// このcloneの `.git` の実体（仕事ごと）。コミットのためにsandboxから書ける
     pub git_dir: &'a Path,
+    /// `--shared` で共有している、元のリポジトリのオブジェクト（`.git/objects`）。読むだけ
+    pub shared_objects: &'a Path,
     /// 今の仕事のファイル（`AGENTCELLS_CONTEXT`）。`agentcells cell` が読む
     pub context: &'a Path,
     /// worktreeに置いた秘密のファイル（絶対パス）
@@ -76,9 +84,9 @@ pub struct RunPaths<'a> {
 /// - Bashは `agentcells cell` だけ
 ///
 /// sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
-/// - 書けるのは、worktreeと、gitの共通のディレクトリだけ
-/// - `~/.agentcells`（App の秘密鍵、`files/`、`config.toml`、ほかの仕事のworktree）、ghの設定、
-///   秘密がよく置かれる場所は読ませない。ただし今の仕事のworktree、gitの共通のディレクトリ、今の仕事のファイルは読める
+/// - 書けるのは、作業するcloneと、その `.git` の実体（仕事ごとの使い捨て）だけ。元のリポジトリには書けない
+/// - `~/.agentcells`（App の秘密鍵、`files/`、`config.toml`、ほかの仕事のclone）、ghの設定、
+///   秘密がよく置かれる場所は読ませない。ただし今の仕事のclone、共有しているオブジェクト、今の仕事のファイルは読める
 /// - sandboxの外でコマンドを動かすことは許さない
 ///
 /// 信頼していないディレクトリではprojectの設定のallowが無視されるので、cellに要るallowもここで渡す。
@@ -120,6 +128,7 @@ pub fn runtime_settings(home: &Home, config: &Config, run: &RunPaths) -> Result<
     }
     let mut allow_read = forms(worktree)?;
     allow_read.extend(forms(run.git_dir)?);
+    allow_read.extend(forms(run.shared_objects)?);
     allow_read.extend(forms(run.context)?);
 
     Ok(json!({
@@ -214,7 +223,8 @@ mod tests {
     fn settings_of(config: &Config, placed: &[PathBuf]) -> serde_json::Value {
         let run = RunPaths {
             worktree: Path::new("/w/octo/app/12"),
-            git_dir: Path::new("/home/me/.agentcells/repos/octo/app/.git"),
+            git_dir: Path::new("/home/me/.agentcells/gitdirs/octo/app/12"),
+            shared_objects: Path::new("/home/me/.agentcells/repos/octo/app/.git/objects"),
             context: Path::new("/home/me/.agentcells/runs/1/context.json"),
             placed,
         };
@@ -265,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_writes_only_to_git_dir_and_hides_agentcells_home() {
+    fn sandbox_writes_only_to_the_clone_and_hides_agentcells_home() {
         let config = Config {
             github_app: Some(GithubApp {
                 id: "Iv23li".to_string(),
@@ -279,9 +289,10 @@ mod tests {
         // sandboxの外でコマンドを動かさせない
         assert_eq!(sandbox["allowUnsandboxedCommands"], false);
         let fs = &sandbox["filesystem"];
+        // 書けるのは、この仕事の .git の実体だけ。元のリポジトリには書けない
         assert_eq!(
             strings(&fs["allowWrite"]),
-            vec!["/home/me/.agentcells/repos/octo/app/.git"]
+            vec!["/home/me/.agentcells/gitdirs/octo/app/12"]
         );
         let deny_read = strings(&fs["denyRead"]);
         for path in [
@@ -297,7 +308,8 @@ mod tests {
         let allow_read = strings(&fs["allowRead"]);
         for path in [
             "/w/octo/app/12",
-            "/home/me/.agentcells/repos/octo/app/.git",
+            "/home/me/.agentcells/gitdirs/octo/app/12",
+            "/home/me/.agentcells/repos/octo/app/.git/objects",
             "/home/me/.agentcells/runs/1/context.json",
         ] {
             assert!(
@@ -358,6 +370,7 @@ mod tests {
         let run = RunPaths {
             worktree: &link,
             git_dir: &link,
+            shared_objects: &link,
             context: &link,
             placed: &[],
         };
@@ -407,7 +420,8 @@ mod tests {
         let placed = [PathBuf::from("local.properties")];
         let run = RunPaths {
             worktree: Path::new("/w"),
-            git_dir: Path::new("/w/.git"),
+            git_dir: Path::new("/g"),
+            shared_objects: Path::new("/r/.git/objects"),
             context: Path::new("/c.json"),
             placed: &placed,
         };

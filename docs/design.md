@@ -140,7 +140,8 @@ cells = ["triage", "implement", "review"]
 ```
 
 - PRは作業するリポジトリに作り、Issueにリンクをコメントする
-- 作業は仕事ごとのworktreeで行う。人間がふだん使っているcloneとは別に、作業用のcloneを持つ
+- 作業は仕事ごとの作業場所（このドキュメントではworktreeと呼ぶ）で行う。人間がふだん使っているcloneとは別に、作業用のcloneを `repos/` に持つ
+- 仕事ごとの作業場所は、`git worktree add` ではなく、`repos/` のcloneから `git clone --shared --separate-git-dir=gitdirs/...` で作る（予定）。オブジェクトは共有して読むだけにし、`.git` の実体は仕事ごとに作業場所の外に置く。理由は「AIに許すこと」のsandboxを参照
 - `claude -p` はworktreeの中で起動する。作業するリポジトリのCLAUDE.mdと設定がそのまま効く
 - PRがマージかクローズされたら、worktreeを片付ける
 
@@ -158,7 +159,9 @@ agentcellsのリポジトリの中ではなく、独立した場所（`~/.agentc
   .claude/settings.json                  cellとして動くエージェントの設定（setupで置く）
   CLAUDE.md                              cellとして動くエージェントへの指示（setupで置く）
   repos/<owner>/<repo>/                  作業用のclone
-  worktrees/<owner>/<repo>/<issue番号>/  仕事ごとのworktree
+  worktrees/<owner>/<repo>/<issue番号>/  仕事ごとの作業場所
+  gitdirs/<owner>/<repo>/<issue番号>/    仕事ごとの作業場所の .git の実体
+  runs/<実行のID>/                       今の仕事のファイルなど（AIは読めるが書けない）
   files/<owner>/<repo>/<配置するパス>     worktreeに置くファイル
   logs/                                  実行の記録
 ```
@@ -191,16 +194,19 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 
 sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
 
-- 書けるのは、worktreeと、gitの共通のディレクトリ（linked worktreeなら元のリポジトリの `.git`。コミットに要る）だけ
-- `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事のworktree）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は読ませない。今の仕事のworktree、gitの共通のディレクトリ、今の仕事のファイルだけは読める
+- 書けるのは、作業場所と、その `.git` の実体（`gitdirs/` の下の、その仕事の分）だけ。`repos/` の元のリポジトリには書けない
+- `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は読ませない。今の仕事の作業場所と `.git` の実体、共有している元のリポジトリのオブジェクト、今の仕事のファイルだけは読める
 - それ以外の場所は読める（ビルドに要るツールチェーンなどのため）
 - sandboxの外でコマンドを動かすことは許さない（`allowUnsandboxedCommands: false`）
-- sandboxの中からも、gitの共通のディレクトリには書ける。AIが `.git/config` を書き換えると、AIが終わったあとにCLIがsandboxの外で動かすgitに効くので、実行の前後で `.git/config` とhooksが変わっていないかを確かめ、変わっていたら人間に回す（予定）
+- sandboxの中からも、その仕事の `.git` の実体には書ける（`.git/config` やhooksを含む）。仕事ごとの使い捨てなので、ほかの仕事や元のリポジトリには効かない。AIが終わったあとにCLIがその作業場所で動かすgitは、使う人とシステムの設定を読まず、hooksとfsmonitorを止めて動かす。pushは、その場で作ったbareリポジトリから行う
+- linked worktreeにしない理由: コミットのために元のリポジトリの `.git` を書けるようにする必要があり、そこを書き換えられると、ほかの仕事や、CLIがsandboxの外で動かすgit（次の仕事の作業場所づくりなど）で任意のコードが動くため
 
 本物の `claude -p`（2.1.310、haiku）で確かめたこと（2026-10-25）:
 
 - worktreeの外へのWrite、`rm`、`.git` と `.GIT` の書き換えは止まる。Readもworktreeの外は止まる。worktreeの中の、外を指すシンボリックリンクを通したReadも、リンク先を解いて止まる（Writeは先にReadが要るので、これで止まる）
-- sandboxの中の `agentcells cell run` から、worktreeの外への書き込み、`~/.agentcells` の中、`~/.ssh` の読み取りは止まり、それ以外の場所は読める。gitの共通のディレクトリには書けて、コミットできる
+- sandboxの中の `agentcells cell run` から、worktreeの外への書き込み、`~/.agentcells` の中、`~/.ssh` の読み取りは止まり、それ以外の場所は読める
+- sandboxは、作業ディレクトリの直下の `.git` には、`allowWrite` に入れても書かせない。`--separate-git-dir` で外に置いた `.git` の実体を `allowWrite` に入れると、コミットできる。元のリポジトリの `.git/config` には書けず、オブジェクトだけ読める
+- 置いた秘密のファイルは、大文字・小文字を変えた名前でも、Readが止まる
 - 一時ディレクトリ（`/tmp`）は、sandboxでも書き込める。worktreeを一時ディレクトリに置かない
 - `permissions.blockReadsOutsideWorkingDirectories` は、`agentcells cell` が今の仕事のファイルを読めなくなり、ホームの下のツールチェーンも読めなくなるので使わない
 - sandboxは `GIT_CONFIG_*` の環境変数で `safe.directory` などを足す。作者の名前は足さない

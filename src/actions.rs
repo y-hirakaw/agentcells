@@ -30,12 +30,12 @@ pub struct Context {
     /// worktreeに置いた秘密のファイル（worktreeからの相対パス）。消したり動かしたりさせない
     #[serde(default)]
     pub placed: Vec<PathBuf>,
-    /// 置いた秘密のファイルの中身（gitのblobのハッシュ）。名前を変えたり写したりしても、コミットさせない
+    /// 置いた秘密のファイルの中身（gitのblobのハッシュ）。名前を変えたり写したりしても、コミットさせない。
+    /// `placed` と同じ数だけ要る（書き忘れると守りが黙って弱くなるので、`commit` が断る）
     #[serde(default)]
     pub placed_blobs: Vec<String>,
     /// コミットの作者。使う人のgitの設定は読まないので、ここで渡す
-    #[serde(default)]
-    pub identity: Option<Identity>,
+    pub identity: Identity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +110,18 @@ impl Context {
         let Ok(relative) = resolved.strip_prefix(&worktree) else {
             return Ok(());
         };
-        if let Some(placed) = self.placed.iter().find(|p| p.starts_with(relative)) {
+        // 大文字・小文字を区別しないファイルシステムでは LOCAL.properties も同じファイルを指すので、
+        // 名前を大文字・小文字を問わず比べ、さらに同じファイルかも確かめる
+        let lower = relative.to_string_lossy().to_lowercase();
+        if let Some(placed) = self.placed.iter().find(|p| {
+            let placed_lower = p.to_string_lossy().to_lowercase();
+            placed_lower == lower
+                || placed_lower.starts_with(&format!("{lower}/"))
+                || same_file(&worktree.join(p), resolved)
+                || p.ancestors()
+                    .skip(1)
+                    .any(|a| !a.as_os_str().is_empty() && same_file(&worktree.join(a), resolved))
+        }) {
             return Err(Error::new(format!(
                 "{} は置いた秘密のファイル（{}）なので、消したり動かしたりできません",
                 relative.display(),
@@ -326,6 +337,12 @@ pub fn commit(context: &Context, message: &str) -> Result<String> {
     if message.trim().is_empty() {
         return Err(Error::new("コミットのメッセージが空です").with_hint("-m で書いてください"));
     }
+    if context.placed_blobs.len() != context.placed.len() {
+        return Err(Error::new(
+            "今の仕事のファイルに、置いた秘密のファイルの中身のハッシュがそろっていません",
+        )
+        .with_hint("agentcellsの不具合です。人間に回してください（needs-human）"));
+    }
     let wt = &context.worktree;
     git_output(wt, &["add", "-A"])?;
     let staged = staged_blobs(wt)?;
@@ -350,15 +367,12 @@ pub fn commit(context: &Context, message: &str) -> Result<String> {
             leaked.join(", ")
         )));
     }
-    let mut args: Vec<String> = Vec::new();
-    if let Some(identity) = &context.identity {
-        args.extend([
-            "-c".to_string(),
-            format!("user.name={}", identity.name),
-            "-c".to_string(),
-            format!("user.email={}", identity.email),
-        ]);
-    }
+    let mut args: Vec<String> = vec![
+        "-c".to_string(),
+        format!("user.name={}", context.identity.name),
+        "-c".to_string(),
+        format!("user.email={}", context.identity.email),
+    ];
     args.extend(
         ["commit", "-q", "-m", message]
             .iter()
@@ -463,8 +477,11 @@ mod tests {
             .into_iter()
             .collect(),
             placed: vec![PathBuf::from("local.properties")],
-            placed_blobs: Vec::new(),
-            identity: None,
+            placed_blobs: vec!["0000000000000000000000000000000000000000".to_string()],
+            identity: Identity {
+                name: "t".to_string(),
+                email: "t@example.com".to_string(),
+            },
         };
         (dir, context)
     }
@@ -566,6 +583,8 @@ mod tests {
         // gitignoreされていない場所に置いた秘密は、コミットせずに外して断る
         std::fs::write(wt.join("secret.env"), "TOKEN=x").unwrap();
         ctx.placed.push(PathBuf::from("secret.env"));
+        ctx.placed_blobs
+            .push("0000000000000000000000000000000000000001".to_string());
         let err = commit(&ctx, "leak").unwrap_err();
         assert!(err.message.contains("secret.env"), "{}", err.message);
         assert_eq!(git(&wt, &["diff", "--cached", "--name-only"]), "");
@@ -610,16 +629,25 @@ mod tests {
     fn commit_uses_the_given_identity_without_user_config() {
         let (_dir, mut ctx) = setup();
         let wt = ctx.worktree.clone();
-        ctx.identity = Some(Identity {
+        ctx.identity = Identity {
             name: "agentcells-yh[bot]".to_string(),
             email: "1+agentcells-yh[bot]@users.noreply.github.com".to_string(),
-        });
+        };
         std::fs::write(wt.join("d.txt"), "d").unwrap();
         commit(&ctx, "Add d").unwrap();
         assert_eq!(
             git(&wt, &["log", "-1", "--format=%an <%ae>"]),
             "agentcells-yh[bot] <1+agentcells-yh[bot]@users.noreply.github.com>"
         );
+    }
+
+    #[test]
+    fn commit_refuses_when_placed_hashes_are_missing() {
+        let (_dir, mut ctx) = setup();
+        ctx.placed_blobs.clear();
+        std::fs::write(ctx.worktree.join("e.txt"), "e").unwrap();
+        let err = commit(&ctx, "Add e").unwrap_err();
+        assert!(err.message.contains("ハッシュがそろっていません"));
     }
 
     #[test]
