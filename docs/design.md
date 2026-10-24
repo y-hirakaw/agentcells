@@ -155,7 +155,7 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - Appのときは、JWT（有効期限9分）でリポジトリのインストールを探し、そのリポジトリだけに使えるトークン（有効期限1時間）を作る。Issueのリポジトリと作業するリポジトリが別なら、それぞれに作る
 - トークンには、使い道に要る権限だけを付ける。ラベルを作るならIssuesの書き込みだけ、作業（push、PR、コメント、レビュー）ならContents・Issues・Pull requestsの書き込み。Appに付けたほかの権限（Workflowsなど）は付けない
 - トークンもJWTも、コマンドの引数には書かない（`ps` で見えるため）
-  - Appとしての呼び出し（Appの情報、インストールの検索、トークンの作成）は、JWTを `Authorization: Bearer` で送る必要がある。`token` 方式では「A JSON web token could not be decoded」で断られる（2026-10-24に本物のAppで確かめた）。ghの `GH_TOKEN` は `token` 方式で送るので、これにはcurlを使い、ヘッダーはcurlの設定として標準入力から渡す。`--disable` で `~/.curlrc` を読まない（AIも書けるため）
+  - Appとしての呼び出し（Appの情報、インストールの検索、トークンの作成）は、JWTを `Authorization: Bearer` で送る必要がある。`token` 方式では「A JSON web token could not be decoded」で断られる（2026-10-24に本物のAppで確かめた）。ghの `GH_TOKEN` は `token` 方式で送るので、これにはcurlを使い、ヘッダーはcurlの設定として標準入力から渡す。`--disable` で `~/.curlrc` を読まない（AIも書けるため）。リダイレクトは追わず（Authorizationをほかに送らないため）、接続10秒・全体60秒で打ち切る。テストでは本物のcurlで手元のサーバーに送り、届くヘッダーを確かめる
   - 作ったトークン（installation token、ghのアカウントのトークン）は `token` 方式で受け付けられるので、ghには `GH_TOKEN` で、gitにはcredential helperが読む環境変数で渡す。`GH_HOST` もgithub.comにする（当面はgithub.comだけを扱う）
 - トークンを渡すghには、毎回まっさらな設定ディレクトリ（`GH_CONFIG_DIR`）を使う。`~/.config/gh/config.yml` はAIも書けて、`http_unix_socket` などで通信を横取りできるため
 - AIの実行（`claude -p`）にはトークンを渡さない。AIはコミットまでで、書き込みはCLIだけがする

@@ -273,6 +273,17 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
             "GitHub Appを作り、config.toml の [github_app] に書くのがおすすめです（手順は README の「GitHub App」）",
         );
     };
+    // Appとしての呼び出しにはcurlを使う（JWTをBearerで送るため）
+    if probe
+        .run("curl", &["--version"])
+        .is_none_or(|out| !out.success)
+    {
+        return Check::fail(
+            NAME,
+            "GitHub Appを使うのに要るcurlが見つかりません",
+            "curlを入れてください（Debian/Ubuntuなら `sudo apt install curl`）",
+        );
+    }
     // 鍵の権限はネットワークに出ずに確かめられるので先に見て、ほかの結果と一緒に知らせる。
     let loose = loose_permissions(&app.private_key).map(|mode| {
         format!(
@@ -408,9 +419,10 @@ id = "Iv23liTEST"
 private_key = "github-app.pem"
 "#;
 
-    /// GitHub Appの呼び出しに答える。JWTは環境変数で渡るので、引数は毎回同じになる。
+    /// GitHub Appの呼び出しに答える。JWTは標準入力で渡るので、引数は毎回同じになる。
     fn with_app(probe: FakeProbe) -> FakeProbe {
         probe
+            .with("curl --version", true, "curl 8.7.1\n")
             .with_output(
                 fake::key("GET", "/app", None),
                 fake::response(
@@ -574,6 +586,16 @@ private_key = "github-app.pem"
     }
 
     #[test]
+    fn github_app_without_curl_fails() {
+        let (_dir, home, path) = setup_home();
+        let mut probe = healthy();
+        probe.outputs.remove("curl --version");
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("curl"));
+    }
+
+    #[test]
     fn github_is_checked_even_when_prompts_are_missing() {
         let (_dir, home, path) = setup_home();
         std::fs::remove_file(home.root().join("triage.md")).unwrap();
@@ -604,7 +626,13 @@ private_key = "github-app.pem"
             "{}",
             check.detail
         );
-        assert!(!probe.calls.borrow().iter().any(|c| c.starts_with("curl")));
+        assert!(
+            !probe
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("curl --disable"))
+        );
     }
 
     #[test]

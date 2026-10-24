@@ -140,7 +140,19 @@ fn api_as_app_or_not_found(
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<Option<serde_json::Value>> {
-    let args = curl_args(method, path, body);
+    call_api(probe, API, jwt, method, path, body)
+}
+
+/// `base` はテストで手元のサーバーに向けるために分けている。
+fn call_api(
+    probe: &dyn Probe,
+    base: &str,
+    jwt: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>> {
+    let args = curl_args(base, method, path, body);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let config = format!("header = \"Authorization: Bearer {jwt}\"\n");
     let out = probe
@@ -150,10 +162,13 @@ fn api_as_app_or_not_found(
                 .with_hint("GitHub Appを使うにはcurlが要ります。curlを入れてください")
         })?;
     if !out.success {
-        return Err(
-            Error::new(format!("GitHubに接続できません: {}", out.stderr.trim()))
-                .with_hint("ネットワークにつながっているか確かめてください"),
-        );
+        let stderr = out.stderr.trim();
+        let message = if stderr.contains("timed out") {
+            format!("GitHubから{MAX_TIME_SECS}秒以内に応答がありません: {stderr}")
+        } else {
+            format!("GitHubに接続できません: {stderr}")
+        };
+        return Err(Error::new(message).with_hint("ネットワークにつながっているか確かめてください"));
     }
     let (response, status) = out
         .stdout
@@ -165,7 +180,11 @@ fn api_as_app_or_not_found(
     }
     let json: serde_json::Value = serde_json::from_str(response).unwrap_or_default();
     if !(200..300).contains(&status) {
-        let message = json["message"].as_str().unwrap_or("").to_string();
+        // JSONでない応答（proxyの502など）は、本文の先頭を載せる。JWTは本文に入らない
+        let message = json["message"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| response.trim().chars().take(200).collect());
         return Err(ApiError { status, message }.into());
     }
     if json.is_null() {
@@ -174,12 +193,27 @@ fn api_as_app_or_not_found(
     Ok(Some(json))
 }
 
-/// curlの引数。秘密は入れない。
-fn curl_args(method: &str, path: &str, body: Option<&serde_json::Value>) -> Vec<String> {
+/// 接続と応答を待つ上限。ネットワークが詰まっても、定期実行が止まったままにならないようにする。
+const CONNECT_TIMEOUT_SECS: u32 = 10;
+const MAX_TIME_SECS: u32 = 60;
+
+/// curlの引数。秘密は入れない。リダイレクトは追わない（Authorizationをほかに送らないため）。
+fn curl_args(
+    base: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let connect_timeout = CONNECT_TIMEOUT_SECS.to_string();
+    let max_time = MAX_TIME_SECS.to_string();
     let mut args: Vec<String> = [
         "--disable",
         "--silent",
         "--show-error",
+        "--connect-timeout",
+        &connect_timeout,
+        "--max-time",
+        &max_time,
         "--config",
         "-",
         "--write-out",
@@ -202,7 +236,7 @@ fn curl_args(method: &str, path: &str, body: Option<&serde_json::Value>) -> Vec<
             body.to_string(),
         ]);
     }
-    args.push(format!("{API}{path}"));
+    args.push(format!("{base}{path}"));
     args
 }
 
@@ -238,6 +272,12 @@ impl From<ApiError> for Error {
             422 => {
                 "GitHub Appの設定画面の Permissions で、Contents・Issues・Pull requests を Read and write にしてください"
             }
+            301 | 302 | 307 | 308 => {
+                "リポジトリの名前や持ち主が変わっていないか確かめ、config.toml を新しい名前にしてください"
+            }
+            403 | 429 => {
+                "GitHub APIの呼び出しの上限（rate limit）に達した可能性があります。時間をおいてもう一度実行してください"
+            }
             _ => "時間をおいてもう一度実行し、続くようならエラーの内容を確かめてください",
         };
         Error::new(format!(
@@ -253,7 +293,7 @@ impl From<ApiError> for Error {
 pub(crate) mod fake {
     pub fn key(method: &str, path: &str, body: Option<&serde_json::Value>) -> String {
         std::iter::once("curl".to_string())
-            .chain(super::curl_args(method, path, body))
+            .chain(super::curl_args(super::API, method, path, body))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -709,6 +749,123 @@ mod tests {
         };
         let err = credentials(&config, &probe, &repo("octo/app"), Purpose::Work).unwrap_err();
         assert!(err.message.contains("インストールされていないか"));
+    }
+
+    #[test]
+    fn non_json_errors_show_the_start_of_the_body() {
+        let probe = FakeProbe::default().with_output(
+            fake::key("GET", "/app", None),
+            fake::response(502, "<html>Bad Gateway</html>"),
+        );
+        let err = app_info(&probe, "JWT").unwrap_err();
+        assert!(err.message.contains("Bad Gateway"), "{}", err.message);
+    }
+
+    #[test]
+    fn redirects_point_to_renamed_repos() {
+        let probe = FakeProbe::default().with_output(
+            fake::key("GET", "/repos/octo/old/installation", None),
+            fake::response(301, r#"{"message":"Moved Permanently"}"#),
+        );
+        let err = installation_id(&probe, "JWT", &repo("octo/old")).unwrap_err();
+        assert!(err.hint.unwrap().contains("名前"));
+    }
+
+    /// 本物のcurlで、手元のサーバーに送られる内容を確かめる。
+    #[cfg(unix)]
+    mod curl {
+        use super::*;
+        use crate::probe::{Output, SystemProbe};
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        /// 1回だけリクエストを受け、届いたヘッダーを返すサーバー。
+        fn serve_once(
+            status: &str,
+            body: &'static str,
+        ) -> (String, std::thread::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let status = status.to_string();
+            let handle = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+                let mut stream = stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                headers
+            });
+            (base, handle)
+        }
+
+        /// 環境変数を足して本物のコマンドを動かす。`CURL_HOME` に置いた .curlrc が読まれないかを確かめるのに使う。
+        struct WithEnv(Vec<(String, String)>);
+
+        impl Probe for WithEnv {
+            fn run_with_input(
+                &self,
+                program: &str,
+                args: &[&str],
+                env: &[(&str, &str)],
+                input: Option<&str>,
+            ) -> Option<Output> {
+                let mut all: Vec<(&str, &str)> = self
+                    .0
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                all.extend_from_slice(env);
+                SystemProbe.run_with_input(program, args, &all, input)
+            }
+        }
+
+        #[test]
+        fn sends_the_jwt_as_bearer_and_ignores_curlrc() {
+            let curl_home = tempfile::tempdir().unwrap();
+            std::fs::write(
+                curl_home.path().join(".curlrc"),
+                "header = \"X-From-Curlrc: yes\"\n",
+            )
+            .unwrap();
+            let probe = WithEnv(vec![(
+                "CURL_HOME".to_string(),
+                curl_home.path().display().to_string(),
+            )]);
+            let (base, server) = serve_once("200 OK", r#"{"slug":"agentcells-bot"}"#);
+
+            let json = call_api(&probe, &base, "JWT.TEST.SIG", "GET", "/app", None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(json["slug"], "agentcells-bot");
+
+            let headers = server.join().unwrap().to_lowercase();
+            assert!(
+                headers.contains("authorization: bearer jwt.test.sig"),
+                "{headers}"
+            );
+            assert!(!headers.contains("x-from-curlrc"), "{headers}");
+        }
+
+        #[test]
+        fn reads_the_status_of_errors() {
+            let (base, server) = serve_once("404 Not Found", r#"{"message":"Not Found"}"#);
+            let found = call_api(&SystemProbe, &base, "JWT", "GET", "/x", None).unwrap();
+            assert_eq!(found, None);
+            server.join().unwrap();
+        }
     }
 
     /// 本物のgitで、helperとhooksの扱いを確かめる。

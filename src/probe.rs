@@ -53,16 +53,49 @@ impl Probe for SystemProbe {
             .stderr(Stdio::piped())
             .spawn()
             .ok()?;
-        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-            // 読まずに終わるコマンドもあるので、書けなくてもエラーにしない
-            let _ = stdin.write_all(input.as_bytes());
-        }
+        // 出力を読むのと並んで書く。大きな入力で、互いに待ったまま止まらないように
+        let writer = match (input, child.stdin.take()) {
+            (Some(input), Some(mut stdin)) => {
+                let input = input.to_string();
+                // 読まずに終わるコマンドもあるので、書けなくてもエラーにしない
+                Some(std::thread::spawn(move || {
+                    let _ = stdin.write_all(input.as_bytes());
+                }))
+            }
+            _ => None,
+        };
         let out = child.wait_with_output().ok()?;
+        if let Some(writer) = writer {
+            let _ = writer.join();
+        }
         Some(Output {
             success: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passes_stdin_to_the_command() {
+        let out = SystemProbe
+            .run_with_input("cat", &[], &[], Some("hello"))
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(out.stdout, "hello");
+    }
+
+    #[test]
+    fn large_input_does_not_deadlock() {
+        let input = "x".repeat(1 << 20);
+        let out = SystemProbe
+            .run_with_input("cat", &[], &[], Some(&input))
+            .unwrap();
+        assert_eq!(out.stdout.len(), input.len());
     }
 }
 
