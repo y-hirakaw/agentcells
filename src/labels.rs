@@ -131,7 +131,7 @@ fn create_label(
         "--description",
         &label.description,
     ];
-    run_gh(probe, &args, repo, &credentials.gh_env()).map(|_| ())
+    run_gh(probe, &args, repo, &credentials.gh_env()?).map(|_| ())
 }
 
 fn run_gh(
@@ -257,15 +257,24 @@ prompt = "review.md"
     #[test]
     fn sync_creates_only_missing_labels() {
         let (_dir, config) = config();
-        let probe = FakeProbe::default().with_fallback(true).with(
-            "gh label list --repo octo/app --json name --limit 1000",
-            true,
-            r#"[{"name":"ac:working"},{"name":"ac:needs-human"}]"#,
-        );
+        let probe = FakeProbe::default()
+            .with_fallback(true)
+            .with("gh auth token --hostname github.com", true, "gho_me\n")
+            .with(
+                "gh label list --repo octo/app --json name --limit 1000",
+                true,
+                r#"[{"name":"ac:working"},{"name":"ac:needs-human"}]"#,
+            );
         let probe = with_empty_list(probe, &["octo/issues", "octo/web"]);
 
         sync(&config, &probe, false).unwrap();
 
+        // Appがなくても、ghのアカウントのトークンを環境変数で渡して作る
+        for (call, env) in probe.calls.borrow().iter().zip(probe.envs.borrow().iter()) {
+            if call.starts_with("gh label create") {
+                assert!(env.contains(&("GH_TOKEN".to_string(), "gho_me".to_string())));
+            }
+        }
         let creates: Vec<String> = probe
             .calls
             .borrow()

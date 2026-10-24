@@ -39,6 +39,7 @@ pub const DENY_GH: &[&str] = &[
 /// - `files/` の下: worktreeに置くファイルの元
 /// - GitHub Appの秘密鍵: 読まれると、インストール先のリポジトリへのトークンをいくらでも作れる
 /// - `config.toml`: 秘密鍵の場所などが書いてある
+/// - ghの設定ディレクトリ: keyringを使わない環境では、`hosts.yml` にトークンが平文で入っている
 ///
 /// 信頼していないディレクトリではprojectの設定のallowが無視されるので、cellに要るallowもここで渡す。
 pub fn runtime_settings(
@@ -55,7 +56,24 @@ pub fn runtime_settings(
     if let Some(app) = &config.github_app {
         deny_read(&mut deny, &app.private_key, "")?;
     }
+    if let Some(dir) = gh_config_dir(|key| std::env::var_os(key)) {
+        deny_read(&mut deny, &dir, "/**")?;
+    }
     Ok(json!({ "permissions": { "deny": deny } }))
+}
+
+/// ghの設定ディレクトリ。ghと同じく `GH_CONFIG_DIR`、`XDG_CONFIG_HOME/gh`、`~/.config/gh` の順に探す。
+fn gh_config_dir(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let absolute = |p: PathBuf| p.is_absolute().then_some(p);
+    if let Some(dir) = var("GH_CONFIG_DIR").map(PathBuf::from) {
+        return absolute(dir);
+    }
+    if let Some(dir) = var("XDG_CONFIG_HOME").map(PathBuf::from) {
+        return absolute(dir.join("gh"));
+    }
+    var("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| absolute(home.join(".config/gh")))
 }
 
 /// `Read(//絶対パス)` の形でdenyを足す（先頭の / を重ねる）。
@@ -195,6 +213,34 @@ mod tests {
         ] {
             assert!(deny.contains(&rule), "{rule} should be denied: {deny:?}");
         }
+    }
+
+    #[test]
+    fn finds_the_gh_config_dir_like_gh_does() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        assert_eq!(
+            gh_config_dir(env(&[("GH_CONFIG_DIR", "/x/gh"), ("HOME", "/home/me")])),
+            Some(PathBuf::from("/x/gh"))
+        );
+        assert_eq!(
+            gh_config_dir(env(&[
+                ("XDG_CONFIG_HOME", "/x/config"),
+                ("HOME", "/home/me")
+            ])),
+            Some(PathBuf::from("/x/config/gh"))
+        );
+        assert_eq!(
+            gh_config_dir(env(&[("HOME", "/home/me")])),
+            Some(PathBuf::from("/home/me/.config/gh"))
+        );
+        assert_eq!(gh_config_dir(env(&[("GH_CONFIG_DIR", "relative")])), None);
     }
 
     #[test]

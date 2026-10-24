@@ -215,10 +215,7 @@ mod tests {
         }
 
         fn token() -> Credentials {
-            Credentials::App {
-                token: "ghs_test".to_string(),
-                gh_config: tempfile::tempdir().unwrap(),
-            }
+            Credentials::new(crate::github::Source::App, "ghs_test".to_string()).unwrap()
         }
 
         /// トークンを環境変数から書き出すスクリプト。これが動いたら漏れたことになる。
@@ -279,10 +276,43 @@ mod tests {
         }
 
         #[test]
+        fn stage_works_from_a_linked_worktree_without_running_its_hooks() {
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("main");
+            git_in(dir.path(), &["init", "-q", "main"]);
+            git_in(&main, &["commit", "-q", "--allow-empty", "-m", "base"]);
+            let linked = dir.path().join("linked");
+            git_in(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "ac/octo-app-2",
+                    linked.to_str().unwrap(),
+                ],
+            );
+            git_in(&linked, &["commit", "-q", "--allow-empty", "-m", "work"]);
+            // fetchのときに動くかもしれない設定を、AIが書いたとする
+            let marker = dir.path().join("ran");
+            let command = format!("touch '{}'", marker.display());
+            git_in(&main, &["config", "uploadpack.packObjectsHook", &command]);
+            git_in(&main, &["config", "core.fsmonitor", &command]);
+
+            let staging = stage(&SystemProbe, &linked, "ac/octo-app-2").unwrap();
+            assert_eq!(
+                git_in(staging.path(), &["rev-parse", "refs/heads/ac/octo-app-2"]),
+                git_in(&linked, &["rev-parse", "HEAD"])
+            );
+            assert!(!marker.exists());
+        }
+
+        #[test]
         fn push_does_not_run_ext_commands_even_if_configured() {
             // stageしたリポジトリは毎回新しいので本来はこの設定を持たないが、持っていても漏れないことを確かめる
             let dir = tempfile::tempdir().unwrap();
-            let work = tampered_worktree(dir.path());
+            tampered_worktree(dir.path());
             let staging = dir.path().join("work/.git");
 
             let err = push_staged(
@@ -295,7 +325,6 @@ mod tests {
             .unwrap_err();
             assert!(err.message.contains("not allowed"), "{}", err.message);
             assert!(!dir.path().join("leaked").exists());
-            drop(work);
         }
     }
 }

@@ -1,7 +1,7 @@
 //! GitHubに書き込むときの認証。
 //!
 //! GitHub Appを推奨する。Appのトークンで書き込むと、コメントやPRが「<Appの名前>[bot]」になり、
-//! 人間の発言と見分けられる。Appを設定していなければ、ghにログインしているアカウントで書き込む。
+//! 人間の発言と見分けられる。Appを設定していなければ、ghにログインしているアカウントのトークンで書き込む。
 //!
 //! トークンは引数に書かず、環境変数で渡す（`ps` で見えないように）。AIの実行には渡さない。
 //! AIはBashで、ghやgitの設定ファイル、worktreeの `.git/config` を書き換えられる。
@@ -111,15 +111,18 @@ fn empty_gh_config() -> Result<TempDir> {
 
 /// トークンを渡してghを動かすときの環境変数。
 /// GitHub Enterpriseを向いた `GH_HOST` があっても、github.comに送る。
-fn gh_token_env<'a>(token: &'a str, gh_config: &'a Path) -> Vec<(&'static str, &'a str)> {
-    vec![
+fn gh_token_env<'a>(token: &'a str, gh_config: &'a Path) -> Result<Vec<(&'static str, &'a str)>> {
+    let gh_config = gh_config.to_str().ok_or_else(|| {
+        Error::new(format!(
+            "一時ディレクトリのパスに使えない文字があります: {}",
+            gh_config.display()
+        ))
+    })?;
+    Ok(vec![
         ("GH_TOKEN", token),
         ("GH_HOST", GITHUB_HOST),
-        (
-            "GH_CONFIG_DIR",
-            gh_config.to_str().unwrap_or("/nonexistent"),
-        ),
-    ]
+        ("GH_CONFIG_DIR", gh_config),
+    ])
 }
 
 /// GitHub Appとして `gh api` を呼ぶ。JWTは環境変数で渡す（GitHubは `token` 方式で送ったJWTも受け付ける）。
@@ -143,7 +146,7 @@ fn api_as_app_or_not_found(
     let args: Vec<&str> = std::iter::once("api").chain(args.iter().copied()).collect();
     let gh_config = empty_gh_config()?;
     let out = probe
-        .run_with_env("gh", &args, &gh_token_env(jwt, gh_config.path()))
+        .run_with_env("gh", &args, &gh_token_env(jwt, gh_config.path())?)
         .ok_or_else(|| {
             Error::new("ghが見つかりません").with_hint("`agentcells doctor` で確かめてください")
         })?;
@@ -271,20 +274,42 @@ fn installation_token(
         .ok_or_else(|| Error::new("GitHubの応答にトークンがありません"))
 }
 
-/// 書き込みに使う認証。
-pub enum Credentials {
-    /// GitHub Appのトークン（そのリポジトリだけに使える）と、ghのための空の設定ディレクトリ
-    App { token: String, gh_config: TempDir },
+/// どのアカウントで書き込むか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// GitHub App（そのリポジトリだけに使えるトークン）
+    App,
     /// ghにログインしているアカウント
     Gh,
 }
 
+/// 書き込みに使う認証。どちらのアカウントでも、トークンを1つ持ち、ghとgitに環境変数で渡す。
+///
+/// ghのアカウントでも、ghの設定（`~/.config/gh`）はAIが書けるので、トークンを最初に1回だけ取り出し、
+/// あとはAppと同じように、まっさらな設定のghとgitで使う。
+pub struct Credentials {
+    pub source: Source,
+    token: String,
+    gh_config: TempDir,
+}
+
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Credentials::App { .. } => f.write_str("Credentials::App { token: <hidden> }"),
-            Credentials::Gh => f.write_str("Credentials::Gh"),
-        }
+        write!(
+            f,
+            "Credentials {{ source: {:?}, token: <hidden> }}",
+            self.source
+        )
+    }
+}
+
+impl Credentials {
+    pub fn new(source: Source, token: String) -> Result<Self> {
+        Ok(Self {
+            source,
+            token,
+            gh_config: empty_gh_config()?,
+        })
     }
 }
 
@@ -298,11 +323,8 @@ pub const ISOLATED_GIT_ENV: &[(&str, &str)] = &[
 
 impl Credentials {
     /// `gh` で書き込むときに足す環境変数。
-    pub fn gh_env(&self) -> Vec<(&'static str, &str)> {
-        match self {
-            Credentials::App { token, gh_config } => gh_token_env(token, gh_config.path()),
-            Credentials::Gh => Vec::new(),
-        }
+    pub fn gh_env(&self) -> Result<Vec<(&'static str, &str)>> {
+        gh_token_env(&self.token, self.gh_config.path())
     }
 
     /// トークンを使う `git push` に付ける引数。
@@ -313,12 +335,9 @@ impl Credentials {
     /// - helperはgithub.com宛てにだけ付ける。URLをほかのホストに向けられても、トークンを渡さない
     /// - hooks（pre-pushなど）を動かさない
     pub fn git_args(&self) -> Vec<String> {
-        let helper = match self {
-            Credentials::App { .. } => format!(
-                "!f() {{ test \"$1\" = get || exit 0; echo username=x-access-token; echo \"password=${GIT_TOKEN_ENV}\"; }}; f"
-            ),
-            Credentials::Gh => "!gh auth git-credential".to_string(),
-        };
+        let helper = format!(
+            "!f() {{ test \"$1\" = get || exit 0; echo username=x-access-token; echo \"password=${GIT_TOKEN_ENV}\"; }}; f"
+        );
         [
             "-c".to_string(),
             "credential.helper=".to_string(),
@@ -337,9 +356,7 @@ impl Credentials {
     pub fn git_env(&self) -> Vec<(&'static str, &str)> {
         let mut env = ISOLATED_GIT_ENV.to_vec();
         env.push(("GIT_ALLOW_PROTOCOL", "https"));
-        if let Credentials::App { token, .. } = self {
-            env.push((GIT_TOKEN_ENV, token));
-        }
+        env.push((GIT_TOKEN_ENV, &self.token));
         env
     }
 }
@@ -352,7 +369,7 @@ pub fn credentials(
     purpose: Purpose,
 ) -> Result<Credentials> {
     let Some(app) = &config.github_app else {
-        return Ok(Credentials::Gh);
+        return Credentials::new(Source::Gh, gh_account_token(probe)?);
     };
     let jwt = jwt(app, now()?)?;
     let installation = installation_id(probe, &jwt, repo)?.ok_or_else(|| {
@@ -362,10 +379,23 @@ pub fn credentials(
         .with_hint("`agentcells doctor` でインストールのURLを確かめてください")
     })?;
     let token = installation_token(probe, &jwt, installation, repo, purpose)?;
-    Ok(Credentials::App {
-        token,
-        gh_config: empty_gh_config()?,
-    })
+    Credentials::new(Source::App, token)
+}
+
+/// ghにログインしているアカウントのトークンを取り出す。`gh auth token` は通信しないので、
+/// ghの設定にある通信の設定（`http_unix_socket` など）の影響を受けない。
+fn gh_account_token(probe: &dyn Probe) -> Result<String> {
+    let out = probe
+        .run("gh", &["auth", "token", "--hostname", GITHUB_HOST])
+        .ok_or_else(|| {
+            Error::new("ghが見つかりません").with_hint("`agentcells doctor` で確かめてください")
+        })?;
+    let token = out.stdout.trim();
+    if !out.success || token.is_empty() {
+        return Err(Error::new("ghのアカウントのトークンを取り出せません")
+            .with_hint("`gh auth login` でgithub.comにログインしてください"));
+    }
+    Ok(token.to_string())
 }
 
 #[cfg(test)]
@@ -500,19 +530,26 @@ mod tests {
     }
 
     #[test]
-    fn credentials_use_gh_without_an_app() {
-        let probe = FakeProbe::default();
+    fn without_an_app_the_gh_token_is_used_with_an_empty_gh_config() {
+        let probe =
+            FakeProbe::default().with("gh auth token --hostname github.com", true, "gho_me\n");
         let creds =
             credentials(&Config::default(), &probe, &repo("octo/app"), Purpose::Work).unwrap();
-        assert!(matches!(creds, Credentials::Gh));
-        assert!(creds.gh_env().is_empty());
-        assert!(
-            creds
-                .git_args()
-                .join(" ")
-                .contains("!gh auth git-credential")
-        );
-        assert!(probe.calls.borrow().is_empty());
+        assert_eq!(creds.source, Source::Gh);
+        // AIが書けるghの設定を読まないよう、Appのときと同じように渡す
+        let env: BTreeMap<&str, &str> = creds.gh_env().unwrap().into_iter().collect();
+        assert_eq!(env["GH_TOKEN"], "gho_me");
+        assert!(Path::new(env["GH_CONFIG_DIR"]).is_dir());
+        assert!(creds.git_env().contains(&(GIT_TOKEN_ENV, "gho_me")));
+        assert!(!format!("{creds:?}").contains("gho_me"));
+    }
+
+    #[test]
+    fn without_an_app_a_logged_out_gh_points_to_login() {
+        let probe = FakeProbe::default().with("gh auth token --hostname github.com", false, "");
+        let err =
+            credentials(&Config::default(), &probe, &repo("octo/app"), Purpose::Work).unwrap_err();
+        assert!(err.hint.unwrap().contains("gh auth login"));
     }
 
     #[test]
@@ -532,7 +569,8 @@ mod tests {
         };
         let creds = credentials(&config, &probe, &repo("octo/app"), Purpose::Work).unwrap();
 
-        let env: BTreeMap<&str, &str> = creds.gh_env().into_iter().collect();
+        assert_eq!(creds.source, Source::App);
+        let env: BTreeMap<&str, &str> = creds.gh_env().unwrap().into_iter().collect();
         assert_eq!(env["GH_TOKEN"], "ghs_secret");
         assert!(Path::new(env["GH_CONFIG_DIR"]).is_dir());
         assert!(creds.git_env().contains(&(GIT_TOKEN_ENV, "ghs_secret")));
@@ -654,10 +692,7 @@ mod tests {
         }
 
         fn token() -> Credentials {
-            Credentials::App {
-                token: "ghs_test".to_string(),
-                gh_config: tempfile::tempdir().unwrap(),
-            }
+            Credentials::new(Source::App, "ghs_test".to_string()).unwrap()
         }
 
         #[test]
