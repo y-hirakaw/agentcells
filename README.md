@@ -49,7 +49,7 @@ cd agentcells
 
 ### GitHub App（推奨）
 
-コメントやPRは、GitHub Appか、ghにログインしているあなたのアカウントで書き込みます。あなたのアカウントのままだと、AIの発言があなたの発言に見えてわかりにくいので、GitHub Appを作るのがおすすめです。
+コメントやPRは、GitHub Appか、ghにログインしているあなたのアカウントで書き込みます（当面はgithub.comだけに対応しています）。あなたのアカウントのままだと、AIの発言があなたの発言に見えてわかりにくいので、GitHub Appを作るのがおすすめです。
 
 1. GitHubの Settings → Developer settings → GitHub Apps → New GitHub App で作る
    - Webhookは使わないので、Activeのチェックを外す

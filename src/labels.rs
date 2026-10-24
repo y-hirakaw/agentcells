@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::github::{self, Credentials};
 use crate::home::RepoName;
 use crate::probe::Probe;
 
@@ -82,9 +83,11 @@ pub fn sync(
             .into_iter()
             .filter(|l| !existing.contains(&l.name.to_lowercase()))
             .collect();
-        if !dry_run {
+        if !dry_run && !missing.is_empty() {
+            // 読むのはghのアカウントで、作るのは書き込みのアカウント（GitHub Appがあればそれ）で行う
+            let credentials = github::credentials(config, probe, &repo)?;
             for label in &missing {
-                create_label(&repo, label, probe)?;
+                create_label(&repo, label, probe, &credentials)?;
             }
         }
         result.push((repo, missing));
@@ -98,7 +101,7 @@ fn existing_labels(repo: &RepoName, probe: &dyn Probe) -> Result<HashSet<String>
     let args = [
         "label", "list", "--repo", &repo_arg, "--json", "name", "--limit", "1000",
     ];
-    let out = run_gh(probe, &args, repo)?;
+    let out = run_gh(probe, &args, repo, &[])?;
     let names: Vec<serde_json::Value> = serde_json::from_str(&out).map_err(|e| {
         Error::new(format!("{repo} のラベル一覧を読めません: {e}"))
             .with_hint("ghのバージョンが古い可能性があります。ghを新しくしてください")
@@ -110,7 +113,12 @@ fn existing_labels(repo: &RepoName, probe: &dyn Probe) -> Result<HashSet<String>
         .collect())
 }
 
-fn create_label(repo: &RepoName, label: &Label, probe: &dyn Probe) -> Result<()> {
+fn create_label(
+    repo: &RepoName,
+    label: &Label,
+    probe: &dyn Probe,
+    credentials: &Credentials,
+) -> Result<()> {
     let repo_arg = repo.to_string();
     let args = [
         "label",
@@ -123,11 +131,16 @@ fn create_label(repo: &RepoName, label: &Label, probe: &dyn Probe) -> Result<()>
         "--description",
         &label.description,
     ];
-    run_gh(probe, &args, repo).map(|_| ())
+    run_gh(probe, &args, repo, &credentials.gh_env()).map(|_| ())
 }
 
-fn run_gh(probe: &dyn Probe, args: &[&str], repo: &RepoName) -> Result<String> {
-    let out = probe.run("gh", args).ok_or_else(|| {
+fn run_gh(
+    probe: &dyn Probe,
+    args: &[&str],
+    repo: &RepoName,
+    env: &[(&str, &str)],
+) -> Result<String> {
+    let out = probe.run_with_env("gh", args, env).ok_or_else(|| {
         Error::new("GitHub CLI（gh）が見つかりません")
             .with_hint("`agentcells doctor` で直し方を確かめてください")
     })?;
@@ -140,7 +153,7 @@ fn run_gh(probe: &dyn Probe, args: &[&str], repo: &RepoName) -> Result<String> {
             out.stderr.trim()
         ))
         .with_hint(format!(
-            "{repo} があるか、`gh auth status` のアカウントにそのリポジトリへの書き込み権限があるかを確かめてください"
+            "{repo} があるか、書き込みのアカウントにそのリポジトリへの権限があるかを `agentcells doctor` で確かめてください"
         )))
     }
 }
@@ -275,7 +288,60 @@ prompt = "review.md"
         let (_dir, config) = config();
         let probe = FakeProbe::default().with_fallback(false);
         let err = sync(&config, &probe, true).unwrap_err();
-        assert!(err.hint.unwrap().contains("gh auth status"));
+        assert!(err.hint.unwrap().contains("agentcells doctor"));
+    }
+
+    #[test]
+    fn sync_creates_labels_as_the_github_app() {
+        let (_dir, mut config) = config();
+        config.github_app = Some(crate::config::GithubApp {
+            id: "Iv23liTEST".to_string(),
+            private_key: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/github-app-test-key.pem"),
+        });
+        let mut probe = with_empty_list(
+            FakeProbe::default().with_fallback(true),
+            &["octo/app", "octo/issues", "octo/web"],
+        );
+        for (i, repo) in ["octo/app", "octo/issues", "octo/web"].iter().enumerate() {
+            let name = repo.split('/').nth(1).unwrap();
+            probe = probe
+                .with(
+                    &format!("gh api /repos/{repo}/installation"),
+                    true,
+                    &format!(r#"{{"id":{i}}}"#),
+                )
+                .with(
+                    &format!(
+                        "gh api -X POST /app/installations/{i}/access_tokens -f repositories[]={name} \
+                         -f permissions[contents]=write -f permissions[issues]=write \
+                         -f permissions[pull_requests]=write"
+                    ),
+                    true,
+                    &format!(r#"{{"token":"ghs_{name}"}}"#),
+                );
+        }
+
+        sync(&config, &probe, false).unwrap();
+
+        let calls = probe.calls.borrow();
+        let envs = probe.envs.borrow();
+        let mut creates = 0;
+        for (call, env) in calls.iter().zip(envs.iter()) {
+            if call.starts_with("gh label create") {
+                creates += 1;
+                let repo = call.split("--repo octo/").nth(1).unwrap();
+                let name = repo.split(' ').next().unwrap();
+                assert!(
+                    env.contains(&("GH_TOKEN".to_string(), format!("ghs_{name}"))),
+                    "{call}: {env:?}"
+                );
+            } else if call.starts_with("gh label list") {
+                // 読むのはghのアカウントのまま
+                assert!(env.is_empty(), "{call}: {env:?}");
+            }
+        }
+        assert_eq!(creates, 10);
     }
 
     #[test]

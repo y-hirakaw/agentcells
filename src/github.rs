@@ -19,6 +19,16 @@ use crate::probe::Probe;
 /// git の credential helper がトークンを読む環境変数。
 pub const GIT_TOKEN_ENV: &str = "AGENTCELLS_GITHUB_TOKEN";
 
+/// 書き込む先。当面はgithub.comだけを扱う。
+const GITHUB_HOST: &str = "github.com";
+
+/// installation tokenに付ける権限。Appに付けた権限のうち、書き込みに要るものだけにする（Workflowsなどは付けない）。
+const TOKEN_PERMISSIONS: &[(&str, &str)] = &[
+    ("contents", "write"),
+    ("issues", "write"),
+    ("pull_requests", "write"),
+];
+
 /// JWTの有効期限。GitHubの上限は10分なので、それより短くする。
 const JWT_LIFETIME_SECS: u64 = 9 * 60;
 /// 時計のずれに備えて、発行時刻を少し前にする。
@@ -31,11 +41,15 @@ struct Claims<'a> {
     iss: &'a str,
 }
 
-pub fn now() -> u64 {
+/// 今の時刻（UNIX時間の秒）。JWTの有効期限に使うので、時計がおかしいときはエラーにする。
+pub fn now() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|_| {
+            Error::new("この機械の時計が1970年より前になっています")
+                .with_hint("時計を合わせてください（GitHub AppのJWTは時刻を使います）")
+        })
 }
 
 /// GitHub Appとして名乗るためのJWTを作る。
@@ -66,9 +80,10 @@ pub fn jwt(app: &GithubApp, now: u64) -> Result<String> {
 /// GitHub Appとして `gh api` を呼ぶ。JWTは環境変数で渡す（GitHubは `token` 方式で送ったJWTも受け付ける）。
 fn api_as_app(probe: &dyn Probe, jwt: &str, args: &[&str]) -> Result<serde_json::Value> {
     api_as_app_or_not_found(probe, jwt, args)?.ok_or_else(|| {
+        let path = args.iter().find(|a| a.starts_with('/')).unwrap_or(&"");
         ApiError {
             not_found: true,
-            message: format!("{} が見つかりません (HTTP 404)", args.join(" ")),
+            message: format!("{path} が見つかりません (HTTP 404)"),
         }
         .into()
     })
@@ -82,7 +97,7 @@ fn api_as_app_or_not_found(
 ) -> Result<Option<serde_json::Value>> {
     let args: Vec<&str> = std::iter::once("api").chain(args.iter().copied()).collect();
     let out = probe
-        .run_with_env("gh", &args, &[("GH_TOKEN", jwt)])
+        .run_with_env("gh", &args, &app_env(jwt))
         .ok_or_else(|| {
             Error::new("ghが見つかりません").with_hint("`agentcells doctor` で確かめてください")
         })?;
@@ -97,6 +112,11 @@ fn api_as_app_or_not_found(
     serde_json::from_str(&out.stdout)
         .map(Some)
         .map_err(|e| Error::new(format!("GitHubの応答を読めません: {e}")))
+}
+
+/// GitHub Appとして呼ぶときの環境変数。GitHub Enterpriseを向いた `GH_HOST` があっても、github.comに送る。
+fn app_env(token: &str) -> [(&'static str, &str); 2] {
+    [("GH_TOKEN", token), ("GH_HOST", GITHUB_HOST)]
 }
 
 /// `gh api` の失敗。404は「ない」として扱いたいので見分ける。
@@ -151,7 +171,7 @@ pub fn installation_id(probe: &dyn Probe, jwt: &str, repo: &RepoName) -> Result<
         .ok_or_else(|| Error::new("GitHubの応答にインストールのIDがありません"))
 }
 
-/// そのリポジトリだけに使えるトークンを作る（有効期限は1時間）。
+/// そのリポジトリだけに使え、書き込みに要る権限だけを持つトークンを作る（有効期限は1時間）。
 fn installation_token(
     probe: &dyn Probe,
     jwt: &str,
@@ -159,8 +179,17 @@ fn installation_token(
     repo: &RepoName,
 ) -> Result<String> {
     let path = format!("/app/installations/{installation}/access_tokens");
-    let repository = format!("repositories[]={}", repo.name);
-    let token = api_as_app(probe, jwt, &["-X", "POST", &path, "-f", &repository])?;
+    let mut fields = vec![format!("repositories[]={}", repo.name)];
+    fields.extend(
+        TOKEN_PERMISSIONS
+            .iter()
+            .map(|(name, level)| format!("permissions[{name}]={level}")),
+    );
+    let mut args = vec!["-X", "POST", path.as_str()];
+    for field in &fields {
+        args.extend(["-f", field.as_str()]);
+    }
+    let token = api_as_app(probe, jwt, &args)?;
     token["token"]
         .as_str()
         .map(str::to_string)
@@ -188,32 +217,49 @@ impl Credentials {
     /// `gh` で書き込むときに足す環境変数。
     pub fn gh_env(&self) -> Vec<(&'static str, &str)> {
         match self {
-            Credentials::App { token } => vec![("GH_TOKEN", token)],
+            Credentials::App { token } => app_env(token).to_vec(),
             Credentials::Gh => Vec::new(),
         }
     }
 
-    /// `git push` などに付ける引数。使う人のgitの設定（credential helper）に頼らず、決まった認証を使う。
+    /// `git push` などに付ける引数。
+    ///
+    /// worktreeの `.git/config` はAIが書き換えられるので、それに頼らない。
+    /// - 使う人やリポジトリの設定にあるcredential helperを、空の helper で外す
+    /// - helperはgithub.com宛てにだけ付ける。remoteのURLや `url.*.insteadOf` をほかのホストに向けられても、トークンを渡さない
+    /// - hooks（pre-pushなど）を動かさない。AIが置いたhookにトークンを渡さない
     pub fn git_args(&self) -> Vec<String> {
         let helper = match self {
             Credentials::App { .. } => format!(
-                "credential.helper=!f() {{ echo username=x-access-token; echo \"password=${GIT_TOKEN_ENV}\"; }}; f"
+                "!f() {{ test \"$1\" = get || exit 0; echo username=x-access-token; echo \"password=${GIT_TOKEN_ENV}\"; }}; f"
             ),
-            Credentials::Gh => "credential.helper=!gh auth git-credential".to_string(),
+            Credentials::Gh => "!gh auth git-credential".to_string(),
         };
-        // 空の helper で、使う人の設定にある helper を外す
-        ["-c", "credential.helper=", "-c", &helper]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "-c".to_string(),
+            "credential.helper=".to_string(),
+            "-c".to_string(),
+            format!("credential.https://{GITHUB_HOST}.helper={helper}"),
+            "-c".to_string(),
+            "core.hooksPath=/dev/null".to_string(),
+        ]
+        .to_vec()
     }
 
     /// `git push` などで足す環境変数。
+    ///
+    /// 使う人とシステムのgitの設定は読まない（AIは `git config --global` も実行できるため）。
+    /// パスワードの入力を求めて止まらないようにする。
     pub fn git_env(&self) -> Vec<(&'static str, &str)> {
-        match self {
-            Credentials::App { token } => vec![(GIT_TOKEN_ENV, token)],
-            Credentials::Gh => Vec::new(),
+        let mut env = vec![
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ];
+        if let Credentials::App { token } = self {
+            env.push((GIT_TOKEN_ENV, token));
         }
+        env
     }
 }
 
@@ -222,10 +268,12 @@ pub fn credentials(config: &Config, probe: &dyn Probe, repo: &RepoName) -> Resul
     let Some(app) = &config.github_app else {
         return Ok(Credentials::Gh);
     };
-    let jwt = jwt(app, now())?;
+    let jwt = jwt(app, now()?)?;
     let installation = installation_id(probe, &jwt, repo)?.ok_or_else(|| {
-        Error::new(format!("GitHub Appが {repo} にインストールされていません"))
-            .with_hint("`agentcells doctor` でインストールのURLを確かめてください")
+        Error::new(format!(
+            "GitHub Appが {repo} にインストールされていないか、{repo} が見つかりません"
+        ))
+        .with_hint("`agentcells doctor` でインストールのURLを確かめてください")
     })?;
     let token = installation_token(probe, &jwt, installation, repo)?;
     Ok(Credentials::App { token })
@@ -261,7 +309,7 @@ mod tests {
 
     #[test]
     fn jwt_is_signed_with_rs256_and_short_lived() {
-        let now = now();
+        let now = now().unwrap();
         let token = jwt(&app(), now).unwrap();
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_required_spec_claims(&["exp", "iss"]);
@@ -281,7 +329,7 @@ mod tests {
         std::fs::write(&path, "not a key").unwrap();
         let mut app = app();
         app.private_key = path;
-        let err = jwt(&app, now()).unwrap_err();
+        let err = jwt(&app, now().unwrap()).unwrap_err();
         assert!(
             err.message.contains("秘密鍵として読めません"),
             "{}",
@@ -297,7 +345,10 @@ mod tests {
         assert!(!probe.calls.borrow()[0].contains("JWT"));
         assert_eq!(
             probe.envs.borrow()[0],
-            vec![("GH_TOKEN".to_string(), "JWT".to_string())]
+            vec![
+                ("GH_TOKEN".to_string(), "JWT".to_string()),
+                ("GH_HOST".to_string(), "github.com".to_string())
+            ]
         );
     }
 
@@ -354,7 +405,9 @@ mod tests {
         let probe = FakeProbe::default()
             .with("gh api /repos/octo/app/installation", true, r#"{"id":42}"#)
             .with(
-                "gh api -X POST /app/installations/42/access_tokens -f repositories[]=app",
+                "gh api -X POST /app/installations/42/access_tokens -f repositories[]=app \
+                 -f permissions[contents]=write -f permissions[issues]=write \
+                 -f permissions[pull_requests]=write",
                 true,
                 r#"{"token":"ghs_secret"}"#,
             );
@@ -364,8 +417,11 @@ mod tests {
         };
         let creds = credentials(&config, &probe, &repo("octo/app")).unwrap();
 
-        assert_eq!(creds.gh_env(), vec![("GH_TOKEN", "ghs_secret")]);
-        assert_eq!(creds.git_env(), vec![(GIT_TOKEN_ENV, "ghs_secret")]);
+        assert_eq!(
+            creds.gh_env(),
+            vec![("GH_TOKEN", "ghs_secret"), ("GH_HOST", "github.com")]
+        );
+        assert!(creds.git_env().contains(&(GIT_TOKEN_ENV, "ghs_secret")));
         // トークンはgitの引数にも、Debugの表示にも出さない
         assert!(!creds.git_args().join(" ").contains("ghs_secret"));
         assert!(!format!("{creds:?}").contains("ghs_secret"));
@@ -388,6 +444,126 @@ mod tests {
             ..Config::default()
         };
         let err = credentials(&config, &probe, &repo("octo/app")).unwrap_err();
-        assert!(err.message.contains("インストールされていません"));
+        assert!(err.message.contains("インストールされていないか"));
+    }
+
+    /// 本物のgitで、helperとhooksの扱いを確かめる。
+    #[cfg(unix)]
+    mod git {
+        use super::*;
+        use std::io::Write;
+        use std::path::Path;
+        use std::process::{Command, Output, Stdio};
+
+        fn git(dir: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+
+        /// AIが書き換えたかもしれない設定（別のhelperとhooksPath）を持つリポジトリを作る。
+        fn tampered_repo() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            git(dir.path(), &["init", "-q", "work"]);
+            let work = dir.path().join("work");
+            git(
+                &work,
+                &[
+                    "config",
+                    "credential.helper",
+                    "!f() { echo password=from-repo-config; }; f",
+                ],
+            );
+            let hooks = dir.path().join("hooks");
+            std::fs::create_dir(&hooks).unwrap();
+            let hook = hooks.join("pre-push");
+            let marker = dir.path().join("hook-ran");
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\necho \"$AGENTCELLS_GITHUB_TOKEN\" > '{}'\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            git(
+                &work,
+                &["config", "core.hooksPath", hooks.to_str().unwrap()],
+            );
+            dir
+        }
+
+        fn fill(work: &Path, creds: &Credentials, host: &str) -> Output {
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(work)
+                .args(creds.git_args())
+                .args(["credential", "fill"])
+                .envs(creds.git_env())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            write!(
+                child.stdin.take().unwrap(),
+                "protocol=https\nhost={host}\n\n"
+            )
+            .unwrap();
+            child.wait_with_output().unwrap()
+        }
+
+        fn token() -> Credentials {
+            Credentials::App {
+                token: "ghs_test".to_string(),
+            }
+        }
+
+        #[test]
+        fn helper_gives_the_token_to_github_only() {
+            let dir = tampered_repo();
+            let work = dir.path().join("work");
+
+            let out = fill(&work, &token(), "github.com");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{out:?}");
+            assert!(stdout.contains("username=x-access-token"), "{stdout}");
+            assert!(stdout.contains("password=ghs_test"), "{stdout}");
+            assert!(!stdout.contains("from-repo-config"), "{stdout}");
+
+            // remoteのURLやinsteadOfでほかのホストに向けられても、トークンは渡さない
+            let out = fill(&work, &token(), "evil.example.com");
+            assert!(!out.status.success(), "{out:?}");
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("ghs_test"));
+        }
+
+        #[test]
+        fn push_does_not_run_hooks() {
+            let dir = tampered_repo();
+            let work = dir.path().join("work");
+            git(dir.path(), &["init", "-q", "--bare", "remote.git"]);
+            git(&work, &["commit", "-q", "--allow-empty", "-m", "x"]);
+
+            let creds = token();
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&work)
+                .args(creds.git_args())
+                .args(["push", "-q", "../remote.git", "HEAD:refs/heads/ac/test"])
+                .envs(creds.git_env())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert!(!dir.path().join("hook-ran").exists());
+        }
     }
 }

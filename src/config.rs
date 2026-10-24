@@ -600,6 +600,18 @@ timeout_minutes = 10
     }
 
     #[test]
+    fn repos_lists_issue_and_work_repos_once() {
+        let text = VALID.replace(
+            "repos = [\"y-hirakaw/agentcells\"]",
+            "repos = [\"y-hirakaw/agentcells\", \"y-hirakaw/web\"]",
+        );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(&text, dir.path()).unwrap();
+        let repos: Vec<String> = config.repos().iter().map(|r| r.to_string()).collect();
+        assert_eq!(repos, vec!["y-hirakaw/agentcells", "y-hirakaw/web"]);
+    }
+
+    #[test]
     fn github_app_is_optional() {
         let dir = base_with_prompts(&["triage.md", "review.md"]);
         assert!(

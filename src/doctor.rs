@@ -272,15 +272,29 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
             "GitHub Appを作り、config.toml の [github_app] に書くのがおすすめです（手順は README の「GitHub App」）",
         );
     };
+    // 鍵の権限はネットワークに出ずに確かめられるので先に見て、ほかの結果と一緒に知らせる。
+    let loose = loose_permissions(&app.private_key).map(|mode| {
+        format!(
+            "秘密鍵 {} をほかのユーザーも読めます（権限 {mode:o}）。`chmod 600 {}` を実行してください",
+            app.private_key.display(),
+            app.private_key.display()
+        )
+    });
+    let with_loose = |fix: String| match &loose {
+        Some(note) => format!("{fix}\nあわせて: {note}"),
+        None => fix,
+    };
     let fail = |err: crate::error::Error| {
         Check::fail(
             NAME,
             err.message,
-            err.hint
-                .unwrap_or_else(|| "[github_app] の設定を確かめてください".to_string()),
+            with_loose(
+                err.hint
+                    .unwrap_or_else(|| "[github_app] の設定を確かめてください".to_string()),
+            ),
         )
     };
-    let jwt = match github::jwt(app, github::now()) {
+    let jwt = match github::now().and_then(|now| github::jwt(app, now)) {
         Ok(jwt) => jwt,
         Err(err) => return fail(err),
     };
@@ -300,34 +314,22 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
         return Check::fail(
             NAME,
             format!(
-                "GitHub App「{slug}」が次のリポジトリにインストールされていません: {}",
+                "GitHub App「{slug}」が次のリポジトリにインストールされていないか、リポジトリが見つかりません: {}",
                 missing.join(", ")
             ),
-            format!(
-                "https://github.com/apps/{slug}/installations/new からインストールしてください"
-            ),
+            with_loose(format!(
+                "https://github.com/apps/{slug}/installations/new からインストールしてください。リポジトリ名も確かめてください"
+            )),
         );
     }
-    if let Some(mode) = loose_permissions(&app.private_key) {
-        return Check::warn(
-            NAME,
-            format!(
-                "GitHub App「{slug}」で書き込みますが、秘密鍵 {} をほかのユーザーも読めます（権限 {mode:o}）",
-                app.private_key.display()
-            ),
-            format!(
-                "`chmod 600 {}` を実行してください",
-                app.private_key.display()
-            ),
-        );
+    let detail = format!(
+        "GitHub App「{slug}」で書き込みます（{}件のリポジトリ）",
+        config.repos().len()
+    );
+    match loose {
+        Some(note) => Check::warn(NAME, detail, note),
+        None => Check::ok(NAME, detail),
     }
-    Check::ok(
-        NAME,
-        format!(
-            "GitHub App「{slug}」で書き込みます（{}件のリポジトリ）",
-            config.repos().len()
-        ),
-    )
 }
 
 /// 持ち主以外も読み書きできる権限なら、その権限を返す。
@@ -522,6 +524,78 @@ private_key = "github-app.pem"
         let _ = (path, mode);
     }
 
+    fn failing(stderr: &str) -> crate::probe::Output {
+        crate::probe::Output {
+            success: false,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn github_check_warns_when_config_is_missing() {
+        let (_dir, home, path) = setup_home();
+        std::fs::remove_file(home.config_path()).unwrap();
+        let check = find(&run(&home, Some(&path), &healthy()), "github").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.fix.unwrap().contains("config"));
+    }
+
+    #[test]
+    fn broken_private_key_fails_without_calling_github() {
+        let (_dir, home, path) = setup_home();
+        std::fs::write(home.root().join("github-app.pem"), "not a key").unwrap();
+        let probe = healthy();
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("秘密鍵として読めません"),
+            "{}",
+            check.detail
+        );
+        assert!(!probe.calls.borrow().iter().any(|c| c.starts_with("gh api")));
+    }
+
+    #[test]
+    fn lists_every_repo_without_the_app() {
+        let (_dir, home, path) = setup_home();
+        let config = CONFIG.replace(
+            "repos = [\"octo/app\"]",
+            "repos = [\"octo/app\", \"octo/web\", \"octo/api\"]",
+        );
+        std::fs::write(home.config_path(), format!("{config}{GITHUB_APP}")).unwrap();
+        let mut probe = healthy().with("gh api /repos/octo/web/installation", true, r#"{"id":7}"#);
+        probe.outputs.insert(
+            "gh api /repos/octo/api/installation".to_string(),
+            failing("gh: Not Found (HTTP 404)\n"),
+        );
+        probe.outputs.insert(
+            "gh api /repos/octo/app/installation".to_string(),
+            failing("gh: Not Found (HTTP 404)\n"),
+        );
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.ends_with("octo/api, octo/app"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn server_errors_are_not_reported_as_missing_installations() {
+        let (_dir, home, path) = setup_home();
+        let mut probe = healthy();
+        probe.outputs.insert(
+            "gh api /repos/octo/app/installation".to_string(),
+            failing("gh: Server Error (HTTP 500)\n"),
+        );
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("HTTP 500"), "{}", check.detail);
+        assert!(!check.detail.contains("インストールされていない"));
+    }
+
     #[test]
     fn without_github_app_warns_that_ai_speaks_as_you() {
         let (_dir, home, path) = setup_home();
@@ -583,6 +657,21 @@ private_key = "github-app.pem"
         set_mode(&home.root().join("github-app.pem"), 0o644);
         let check = find(&run(&home, Some(&path), &healthy()), "github").clone();
         assert_eq!(check.status, Status::Warn);
+        assert!(check.fix.unwrap().contains("chmod 600"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_private_key_is_reported_even_when_another_check_fails() {
+        let (_dir, home, path) = setup_home();
+        set_mode(&home.root().join("github-app.pem"), 0o644);
+        let mut probe = healthy();
+        probe.outputs.insert(
+            "gh api /repos/octo/app/installation".to_string(),
+            failing("gh: Not Found (HTTP 404)\n"),
+        );
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("chmod 600"));
     }
 

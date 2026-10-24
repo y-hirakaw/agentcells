@@ -151,13 +151,24 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 | 準備 | Appを作り、リポジトリにインストールし、`config.toml` の `[github_app]` に書く | なし（`gh auth login` だけ） |
 
 - `[github_app]` を書かなければ、ghのアカウントで書き込む。`doctor` はそのことを知らせ、Appを勧める
+- 今これを使って書き込むのは `labels sync` だけ。コメント、push、PR、レビューは `tick` で使う（予定）。読み取り（ラベルの一覧など）は、ghのアカウントのままで行う
 - Appのときは、JWT（有効期限9分）でリポジトリのインストールを探し、そのリポジトリだけに使えるトークン（有効期限1時間）を作る。Issueのリポジトリと作業するリポジトリが別なら、それぞれに作る
-- トークンもJWTも、コマンドの引数には書かず環境変数で渡す（`ps` で見えないように）。GitHubは `Authorization: token` で送ったJWTも受け付けるので、ghには `GH_TOKEN` で渡せる
-- gitには `-c credential.helper=` で、使う人のgitの設定にあるcredential helperを外してから、agentcellsのhelperを渡す。Appならトークンを、ghのアカウントなら `gh auth git-credential` を使う
+- トークンに付ける権限は、Contents・Issues・Pull requestsの書き込みだけにする。Appに付けたほかの権限（Workflowsなど）は付けない
+- トークンもJWTも、コマンドの引数には書かず環境変数で渡す（`ps` で見えないように）。GitHubは `Authorization: token` で送ったJWTも受け付けるので、ghには `GH_TOKEN` で渡せる。`GH_HOST` もgithub.comにする（当面はgithub.comだけを扱う）
 - AIの実行（`claude -p`）にはトークンを渡さない。AIはコミットまでで、書き込みはCLIだけがする
+- AIの実行には、Appの秘密鍵、`config.toml`、`files/` の下を `Read(//絶対パス)` のdenyで読ませない。秘密鍵を読まれると、インストール先のすべてのリポジトリへのトークンを作れてしまうため（`files/**` のようなディレクトリの指定も効くことを、2.1.310で確かめた）
 - Appのときは、AIのコミットの作者も `<Appの名前>[bot]` にする（予定。`GIT_AUTHOR_NAME` などで渡す）
-- `doctor` は、秘密鍵が読めるか、idと鍵が合っているか、設定にあるすべてのリポジトリにAppがインストールされているか、鍵の権限が600か、を確かめる。インストールされていなければ、インストールのURLを出す
-- Appに要る権限は、Contents（読み書き）、Issues（読み書き）、Pull requests（読み書き）、Metadata（読み取り）。`.github/workflows` を変えるPRを作るならWorkflows（読み書き）も要る
+- `doctor` は、秘密鍵が読めるか、idと鍵が合っているか、設定にあるすべてのリポジトリにAppがインストールされているか、鍵を持ち主だけが読めるか（600など）、を確かめる。インストールされていなければ、インストールのURLを出す
+- Appに要る権限は、Contents（読み書き）、Issues（読み書き）、Pull requests（読み書き）、Metadata（読み取り）
+
+gitで書き込むとき（pushなど）は、worktreeの `.git/config` をAIが書き換えられることを前提にする。
+
+- `-c credential.helper=` で、使う人やリポジトリの設定にあるcredential helperを外してから、agentcellsのhelperを渡す。Appならトークンを、ghのアカウントなら `gh auth git-credential` を使う
+- helperはgithub.com宛てにだけ付ける（`credential.https://github.com.helper`）。remoteのURLや `url.*.insteadOf` をほかのホストに向けられても、トークンを渡さない
+- `core.hooksPath=/dev/null` でhooks（pre-pushなど）を動かさない。AIが置いたhookにトークンを渡さない
+- 使う人とシステムのgitの設定は読まない（`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_CONFIG_NOSYSTEM=1`）。AIは `git config --global` も実行できるため
+- `GIT_TERMINAL_PROMPT=0` で、パスワードの入力を求めて止まらないようにする
+- テストでは本物のgitを動かし、トークンがgithub.com以外に渡らないことと、hooksが動かないことを確かめる
 
 ## gitignoreされたファイルの配置
 
