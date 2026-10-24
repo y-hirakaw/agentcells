@@ -30,6 +30,8 @@ const GITHUB_HOST: &str = "github.com";
 /// トークンを何に使うか。使い道に要る権限だけをトークンに付ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
+    /// Issue/PRを読む
+    Read,
     /// ラベルを作る
     Labels,
     /// ブランチのpush、PRの作成、コメント、レビュー、ラベルの付け替え
@@ -40,6 +42,7 @@ impl Purpose {
     /// Appに付けた権限のうち、この使い道に要るもの（Workflowsなどは付けない）。
     pub fn permissions(self) -> &'static [(&'static str, &'static str)] {
         match self {
+            Purpose::Read => &[("issues", "read"), ("pull_requests", "read")],
             Purpose::Labels => &[("issues", "write")],
             Purpose::Work => &[
                 ("contents", "write"),
@@ -516,7 +519,7 @@ pub fn credentials(
     purpose: Purpose,
 ) -> Result<Credentials> {
     let Some(app) = &config.github_app else {
-        return Credentials::new(Source::Gh, gh_account_token(probe)?);
+        return gh_account_credentials(probe);
     };
     let jwt = jwt(app, now()?)?;
     let installation = installation_id(probe, &jwt, repo)?.ok_or_else(|| {
@@ -527,6 +530,11 @@ pub fn credentials(
     })?;
     let token = installation_token(probe, &jwt, installation, repo, purpose)?;
     Credentials::new(Source::App, token)
+}
+
+/// ghにログインしているアカウントの認証。リポジトリによらない。
+pub fn gh_account_credentials(probe: &dyn Probe) -> Result<Credentials> {
+    Credentials::new(Source::Gh, gh_account_token(probe)?)
 }
 
 /// ghにログインしているアカウントのトークンを取り出す。`gh auth token` は通信しないので、

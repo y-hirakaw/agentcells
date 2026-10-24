@@ -39,6 +39,10 @@ pub struct LineComment {
 pub struct Discussion {
     pub title: String,
     pub body: String,
+    /// 本文を書いた人
+    pub author: String,
+    /// 本文を書いた人が、リポジトリの持ち主か、メンバーか、コラボレーターか
+    pub author_trusted: bool,
     /// PRのベースブランチとブランチ
     pub base: Option<String>,
     pub head: Option<String>,
@@ -57,6 +61,9 @@ struct RawItem {
     title: String,
     #[serde(default)]
     body: Option<String>,
+    user: Option<User>,
+    #[serde(default)]
+    author_association: String,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +129,8 @@ pub fn fetch(
     let mut discussion = Discussion {
         title: raw.title,
         body: raw.body.unwrap_or_default(),
+        author: login(raw.user),
+        author_trusted: trusted(&raw.author_association),
         ..Discussion::default()
     };
 
@@ -253,7 +262,7 @@ mod tests {
             FakeProbe::default(),
             "octo/app",
             3,
-            r#"{"title":"ログインできない","body":null}"#,
+            r#"{"title":"ログインできない","body":null,"user":{"login":"stranger"},"author_association":"NONE"}"#,
         );
         let probe = fake::with_list(
             probe,
@@ -266,6 +275,8 @@ mod tests {
         let d = fetch(&probe, &[], Target::Issue, &repo(), 3).unwrap();
         assert_eq!(d.title, "ログインできない");
         assert_eq!(d.body, "");
+        assert_eq!(d.author, "stranger");
+        assert!(!d.author_trusted);
         assert_eq!(d.posts.len(), 2);
         assert!(d.posts[0].trusted);
         assert!(!d.posts[1].trusted);
