@@ -174,22 +174,36 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 
 ### AIに許すこと
 
-読むことは自由にし、作成・追加・更新・削除は決まった道だけにする。
+読むのはその仕事のworktreeの中だけにし、作成・追加・更新・削除は決まった道だけにする。Claude Codeのツールの権限と、sandboxの2つで守る。
 
 | 種類 | 扱い |
 | --- | --- |
-| 読む | Read・Glob・Grepを許す。Claude Codeは `git status` のような読むだけのコマンドを自分で許す |
+| 読む | Readを、その仕事のworktreeの中だけに許す。Claude Codeは `git status` のような読むだけのコマンドを自分で許す |
 | ファイルの作成と更新 | Edit・Writeを、その仕事のworktreeの中だけに許す（`.git` と置いた秘密のファイルを除く）。編集のたびにCLIを通すと、AIが実装しにくくなるため |
-| ファイルの削除と移動 | `agentcells cell rm` / `agentcells cell mv`。CLIがworktreeの中か（シンボリックリンクの先を含めて）を確かめる |
-| コミット | `agentcells cell commit -m`。置いた秘密のファイルが入っていたら断る。hooksは動かさない |
-| gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output` のようにファイルに書くオプションや、外のコマンドを動かすオプションは断る |
+| ファイルの削除と移動 | `agentcells cell rm` / `agentcells cell mv`。CLIがworktreeの中か（シンボリックリンクの先を含めて）を確かめ、`.git`（大文字・小文字を問わない）と置いた秘密のファイルは断る |
+| コミット | `agentcells cell commit -m`。置いた秘密のファイルと同じ中身（blobのハッシュ）のファイルが入っていたら断る（名前を変えたり写したりしても止める）。hooksとfsmonitorは動かさず、使う人とシステムのgitの設定は読まない。作者は今の仕事のファイルで渡す |
+| gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output`、`--ext-diff`、`--no-index` は断る |
 | ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
 
 - Bashは `Bash(agentcells cell:*)` だけを許す。`ls` や `git diff` でも、オプションでファイルに書けるものがあるため
-- Claude Codeは、許したコマンドに `>`、`;`、`&&`、`$(...)` で別の操作を付け足すことを止める（作業ディレクトリの中に向けても止まることを、2.1.310で確かめた）
-- `agentcells cell` は、`tick` が書いた「今の仕事」のファイル（worktree、使えるコマンド、置いた秘密のファイル）を、環境変数 `AGENTCELLS_CONTEXT` で受け取る。AIは環境変数を変えて呼べない（`AGENTCELLS_CONTEXT=... agentcells cell` は `agentcells cell` で始まらないので許されない）
-- 本物の `claude -p` で、worktreeの外へのWrite、`rm`、`.git` の書き換えが止まり、`agentcells cell` の各コマンドが動くことを確かめた（2026-10-24）
-- ビルドやテストを実行すると、AIが書き換えたビルドの設定やテストも動く。間接的には任意のコードを動かせるので、閉じ込めるには sandbox が要る（concept.md）
+- Claude Codeは、許したコマンドに `>`、`;`、`&&`、`$(...)` で別の操作を付け足すことを止める（作業ディレクトリの中に向けても止まる）
+- `agentcells cell` は、`tick` が書いた「今の仕事」のファイル（worktree、使えるコマンド、置いた秘密のファイルとその中身のハッシュ、コミットの作者）を、環境変数 `AGENTCELLS_CONTEXT` で受け取る。AIは環境変数を変えて呼べない（`AGENTCELLS_CONTEXT=... agentcells cell` は `agentcells cell` で始まらないので許されない）。このファイルはworktreeの外（`~/.agentcells` の下）に置き、AIには書かせない（予定）
+
+sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
+
+- 書けるのは、worktreeと、gitの共通のディレクトリ（linked worktreeなら元のリポジトリの `.git`。コミットに要る）だけ
+- `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事のworktree）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は読ませない。今の仕事のworktree、gitの共通のディレクトリ、今の仕事のファイルだけは読める
+- それ以外の場所は読める（ビルドに要るツールチェーンなどのため）
+- sandboxの外でコマンドを動かすことは許さない（`allowUnsandboxedCommands: false`）
+- sandboxの中からも、gitの共通のディレクトリには書ける。AIが `.git/config` を書き換えると、AIが終わったあとにCLIがsandboxの外で動かすgitに効くので、実行の前後で `.git/config` とhooksが変わっていないかを確かめ、変わっていたら人間に回す（予定）
+
+本物の `claude -p`（2.1.310、haiku）で確かめたこと（2026-10-25）:
+
+- worktreeの外へのWrite、`rm`、`.git` と `.GIT` の書き換えは止まる。Readもworktreeの外は止まる。worktreeの中の、外を指すシンボリックリンクを通したReadも、リンク先を解いて止まる（Writeは先にReadが要るので、これで止まる）
+- sandboxの中の `agentcells cell run` から、worktreeの外への書き込み、`~/.agentcells` の中、`~/.ssh` の読み取りは止まり、それ以外の場所は読める。gitの共通のディレクトリには書けて、コミットできる
+- 一時ディレクトリ（`/tmp`）は、sandboxでも書き込める。worktreeを一時ディレクトリに置かない
+- `permissions.blockReadsOutsideWorkingDirectories` は、`agentcells cell` が今の仕事のファイルを読めなくなり、ホームの下のツールチェーンも読めなくなるので使わない
+- sandboxは `GIT_CONFIG_*` の環境変数で `safe.directory` などを足す。作者の名前は足さない
 
 Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 

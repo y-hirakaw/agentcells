@@ -3,6 +3,7 @@
 //! 仕事は、cellのラベルが付いていて、処理中（`ac:working`）でも人間待ち（`ac:needs-human`）でもない、
 //! 開いているIssue/PR。Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す。
 
+use std::collections::HashMap;
 use std::fs::File;
 
 use serde::Deserialize;
@@ -79,6 +80,8 @@ pub fn find(
     credentials_for: &dyn Fn(&RepoName) -> Result<Credentials>,
 ) -> Result<Vec<Work>> {
     let mut found = Vec::new();
+    // Appのトークンはリポジトリごとなので、1回のtickの中ではリポジトリごとに1つだけ作って使い回す
+    let mut cache: HashMap<RepoName, Credentials> = HashMap::new();
     for product in &config.products {
         for name in &product.cells {
             let Some(cell) = config.cell(name) else {
@@ -90,16 +93,21 @@ pub fn find(
                     Target::PullRequest => product.repos.iter().collect(),
                 };
                 for repo in repos {
-                    let credentials = credentials_for(repo)?;
-                    let mut items = list(probe, &credentials.gh_env()?, item, repo, &cell.label)?;
+                    if !cache.contains_key(repo) {
+                        cache.insert(repo.clone(), credentials_for(repo)?);
+                    }
+                    let env = cache[repo].gh_env()?;
+                    let mut items = list(probe, &env, item, repo, &cell.label)?;
                     items.sort_by_key(|i| i.number);
                     found.extend(
                         items
                             .into_iter()
                             .filter(|i| {
-                                !i.labels
-                                    .iter()
-                                    .any(|l| l.name == WORKING || l.name == NEEDS_HUMAN)
+                                // GitHubのラベル名は大文字・小文字を区別しない
+                                !i.labels.iter().any(|l| {
+                                    l.name.eq_ignore_ascii_case(WORKING)
+                                        || l.name.eq_ignore_ascii_case(NEEDS_HUMAN)
+                                })
                             })
                             .map(|i| Work {
                                 product: product.name.clone(),
@@ -202,7 +210,7 @@ next = ["done"]
                 r#"[{"number":9,"title":"後","labels":[{"name":"ac:triage"}]},
                     {"number":3,"title":"先","labels":[{"name":"ac:triage"}]},
                     {"number":4,"title":"処理中","labels":[{"name":"ac:triage"},{"name":"ac:working"}]},
-                    {"number":5,"title":"人間待ち","labels":[{"name":"ac:triage"},{"name":"ac:needs-human"}]}]"#,
+                    {"number":5,"title":"人間待ち","labels":[{"name":"ac:triage"},{"name":"AC:Needs-Human"}]}]"#,
             )
             .with(
                 "gh pr list --repo octo/app --label ac:review --state open --json number,title,labels --limit 100",
@@ -234,6 +242,36 @@ next = ["done"]
             );
             assert!(env.iter().any(|(k, _)| k == "GH_CONFIG_DIR"));
         }
+    }
+
+    #[test]
+    fn makes_one_token_per_repo() {
+        let (_dir, mut config) = config();
+        // 同じリポジトリを、2つのcellで、IssueとしてもPRとしても見る
+        config.products[0].repos = vec![RepoName::parse("octo/issues").unwrap()];
+        config.cells[1].on = vec![Target::Issue, Target::PullRequest];
+        let mut probe = FakeProbe::default();
+        for (kind, label) in [
+            ("issue", "ac:triage"),
+            ("issue", "ac:review"),
+            ("pr", "ac:review"),
+        ] {
+            probe = probe.with(
+                &format!(
+                    "gh {kind} list --repo octo/issues --label {label} --state open --json number,title,labels --limit 100"
+                ),
+                true,
+                "[]",
+            );
+        }
+        let made = std::cell::Cell::new(0);
+        let counting = |repo: &RepoName| {
+            made.set(made.get() + 1);
+            token(repo)
+        };
+        assert!(find(&config, &probe, &counting).unwrap().is_empty());
+        assert_eq!(probe.calls.borrow().len(), 3);
+        assert_eq!(made.get(), 1);
     }
 
     #[test]

@@ -6,15 +6,17 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
-## [0.3.0] - 2026-10-24
+## [0.3.0] - 2026-10-25
 
 ### 追加
 
-- **AIに許すことを、読むことと決まった道だけにした**
-  - 読むこと（Read・Glob・Grep）は自由にし、ファイルの作成と更新（Edit・Write）はその仕事のworktreeの中だけに許す。それ以外の削除・移動・コミット・ビルドやテストは `agentcells cell` を通す。Issueに仕込まれた指示に従ってしまっても、できることを限るため
+- **AIに許すことを、worktreeの中を読むことと、決まった道だけにした**
+  - 読むこと（Read）と、ファイルの作成と更新（Edit・Write）は、その仕事のworktreeの中だけに許す。それ以外の削除・移動・コミット・ビルドやテストは `agentcells cell` を通す。Issueに仕込まれた指示に従ってしまっても、できることを限るため
   - Bashは `agentcells cell` だけを許す。`git diff --output` のように、読むコマンドでもファイルに書けるものがあるため
+- **Claude Codeのsandbox**
+  - AIが動かすコマンド（ビルドやテストを含む）を、sandboxの中で動かす。書けるのはworktreeとgitの共通のディレクトリだけで、`~/.agentcells`（Appの秘密鍵など）や `~/.ssh` などは読めない。sandboxの外では動かせない。ビルドやテストは、AIが書き換えたコードを動かすため
 - **`agentcells cell`**（cellとして動くAIが使う）
-  - `git`（status/diff/log/show/blame。ファイルに書くオプションは断る）、`rm`、`mv`（worktreeの外やシンボリックリンクの先は断る）、`commit`（置いた秘密のファイルは断り、hooksは動かさない）、`run`（設定に書いたコマンドだけ）
+  - `git`（status/diff/log/show/blame。ファイルに書くオプションや `--no-index` は断る）、`rm`、`mv`（worktreeの外、シンボリックリンクの先、`.git`、置いた秘密のファイルは断る）、`commit`（置いた秘密のファイルと同じ中身のものは断り、hooksとfsmonitorは動かさず、使う人のgitの設定は読まない）、`run`（設定に書いたコマンドだけ）
 - **`[product.commands]`**
   - AIが `agentcells cell run <名前>` で実行できるコマンドを、productごとに書く
 - **`agentcells tick --dry-run`**

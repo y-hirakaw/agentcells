@@ -15,6 +15,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::github::ISOLATED_GIT_ENV;
 
 pub const CONTEXT_ENV: &str = "AGENTCELLS_CONTEXT";
 
@@ -26,9 +27,21 @@ pub struct Context {
     /// `agentcells cell run <名前>` で実行できるコマンド
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
-    /// worktreeに置いた秘密のファイル（worktreeからの相対パス）。コミットさせない
+    /// worktreeに置いた秘密のファイル（worktreeからの相対パス）。消したり動かしたりさせない
     #[serde(default)]
     pub placed: Vec<PathBuf>,
+    /// 置いた秘密のファイルの中身（gitのblobのハッシュ）。名前を変えたり写したりしても、コミットさせない
+    #[serde(default)]
+    pub placed_blobs: Vec<String>,
+    /// コミットの作者。使う人のgitの設定は読まないので、ここで渡す
+    #[serde(default)]
+    pub identity: Option<Identity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub name: String,
+    pub email: String,
 }
 
 impl Context {
@@ -82,11 +95,56 @@ impl Context {
         if relative.as_os_str().is_empty() {
             return Err(Error::new("worktreeそのものは扱えません"));
         }
-        if relative.components().next() == Some(Component::Normal(".git".as_ref())) {
+        if is_git_entry(&worktree, relative) {
             return Err(Error::new(format!("{} は .git の中です", path.display())));
         }
         Ok(resolved)
     }
+
+    /// 置いた秘密のファイルか、それを含むディレクトリなら断る。
+    fn not_placed(&self, resolved: &Path) -> Result<()> {
+        let worktree = self
+            .worktree
+            .canonicalize()
+            .map_err(|e| Error::new(format!("worktreeがありません: {e}")))?;
+        let Ok(relative) = resolved.strip_prefix(&worktree) else {
+            return Ok(());
+        };
+        if let Some(placed) = self.placed.iter().find(|p| p.starts_with(relative)) {
+            return Err(Error::new(format!(
+                "{} は置いた秘密のファイル（{}）なので、消したり動かしたりできません",
+                relative.display(),
+                placed.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// worktreeからの相対パスの先頭が `.git` か。大文字・小文字を区別しないファイルシステム（macOSの標準）では
+/// `.GIT` も同じものを指すので、名前を大文字・小文字を問わず比べ、さらに同じファイルかも確かめる。
+fn is_git_entry(worktree: &Path, relative: &Path) -> bool {
+    let Some(Component::Normal(first)) = relative.components().next() else {
+        return false;
+    };
+    if first.to_string_lossy().eq_ignore_ascii_case(".git") {
+        return true;
+    }
+    same_file(&worktree.join(first), &worktree.join(".git"))
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 impl Context {
@@ -103,7 +161,7 @@ impl Context {
             Error::new(format!("{} はworktreeの外です", dir.display()))
                 .with_hint("worktreeの中のファイルだけを扱えます")
         })?;
-        if relative.components().next() == Some(Component::Normal(".git".as_ref())) {
+        if is_git_entry(&worktree, relative) {
             return Err(Error::new(format!("{} は .git の中です", dir.display())));
         }
         Ok(())
@@ -133,6 +191,9 @@ pub fn remove(context: &Context, cwd: &Path, paths: &[PathBuf]) -> Result<Vec<Pa
         .map(|p| context.inside(cwd, p))
         .collect::<Result<_>>()?;
     for target in &targets {
+        context.not_placed(target)?;
+    }
+    for target in &targets {
         let meta = std::fs::symlink_metadata(target)
             .map_err(|e| Error::new(format!("{} がありません: {e}", target.display())))?;
         let result = if meta.is_dir() {
@@ -148,6 +209,7 @@ pub fn remove(context: &Context, cwd: &Path, paths: &[PathBuf]) -> Result<Vec<Pa
 /// ファイルかディレクトリを動かす。移す先のディレクトリがなければ作る。
 pub fn rename(context: &Context, cwd: &Path, from: &Path, to: &Path) -> Result<()> {
     let from = context.inside(cwd, from)?;
+    context.not_placed(&from)?;
     // 移す先の親がまだないときは、いちばん近くにあるディレクトリがworktreeの中かを確かめてから作る
     let to_joined = normalize(&cwd.join(to));
     if let Some(parent) = to_joined.parent()
@@ -164,6 +226,7 @@ pub fn rename(context: &Context, cwd: &Path, from: &Path, to: &Path) -> Result<(
             .map_err(|e| Error::new(format!("{} を作れません: {e}", parent.display())))?;
     }
     let to = context.inside(cwd, to)?;
+    context.not_placed(&to)?;
     if to.exists() {
         return Err(Error::new(format!("{} はすでにあります", to.display())));
     }
@@ -187,7 +250,12 @@ pub fn git_read_args(subcommand: &str, args: &[String]) -> Result<Vec<String>> {
     }
     for arg in args {
         let lower = arg.to_ascii_lowercase();
-        if lower.starts_with("--output") || lower.starts_with("--ext-diff") || lower == "-o" {
+        // --no-index はworktreeの外のファイルを読めるので断る
+        if lower.starts_with("--output")
+            || lower.starts_with("--ext-diff")
+            || lower.starts_with("--no-index")
+            || lower == "-o"
+        {
             return Err(Error::new(format!("{arg} は使えません")).with_hint(
                 "ファイルに書くオプションや、外のコマンドを動かすオプションは使えません",
             ));
@@ -227,11 +295,19 @@ pub fn git_read(context: &Context, subcommand: &str, args: &[String]) -> Result<
     Ok(git_in(&context.worktree, &args)?.code().unwrap_or(1))
 }
 
+/// 書き換えのためのgit。使う人とシステムのgitの設定は読まず、fsmonitorとhooksは動かさない。
 fn git_output(worktree: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(worktree)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .args(args)
+        .envs(ISOLATED_GIT_ENV.iter().copied())
         .output()
         .map_err(|e| Error::new(format!("gitを動かせません: {e}")))?;
     if !out.status.success() {
@@ -244,46 +320,88 @@ fn git_output(worktree: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// worktreeの変更をすべてコミットする。置いた秘密のファイルが入っていたら、コミットせずに断る。
-/// hooksは動かさない（AIが置いたhookを動かさないため）。
+/// worktreeの変更をすべてコミットする。置いた秘密のファイルの中身が入っていたら、コミットせずに断る。
+/// 名前で比べると、名前を変えたり写したりしたものを見逃すので、中身（blobのハッシュ）で比べる。
 pub fn commit(context: &Context, message: &str) -> Result<String> {
     if message.trim().is_empty() {
         return Err(Error::new("コミットのメッセージが空です").with_hint("-m で書いてください"));
     }
     let wt = &context.worktree;
     git_output(wt, &["add", "-A"])?;
-    let staged = git_output(wt, &["diff", "--cached", "--name-only", "-z"])?;
-    let staged: Vec<&str> = staged.split('\0').filter(|s| !s.is_empty()).collect();
+    let staged = staged_blobs(wt)?;
     if staged.is_empty() {
         return Err(Error::new("コミットする変更がありません"));
     }
-    let secrets: Vec<&str> = staged
+    let leaked: Vec<&str> = staged
         .iter()
-        .copied()
-        .filter(|s| context.placed.iter().any(|p| p == Path::new(s)))
+        .filter(|(blob, path)| {
+            context.placed_blobs.contains(blob)
+                || context.placed.iter().any(|p| p == Path::new(path))
+        })
+        .map(|(_, path)| path.as_str())
         .collect();
-    if !secrets.is_empty() {
+    if !leaked.is_empty() {
         // 入れてしまったものを外してから断る
         let mut args = vec!["reset", "-q", "--"];
-        args.extend(secrets.iter().copied());
+        args.extend(leaked.iter().copied());
         git_output(wt, &args)?;
         return Err(Error::new(format!(
-            "置いた秘密のファイルはコミットできません: {}",
-            secrets.join(", ")
+            "置いた秘密のファイルと同じ中身のファイルは、コミットできません: {}",
+            leaked.join(", ")
         )));
     }
-    git_output(
-        wt,
+    let mut args: Vec<String> = Vec::new();
+    if let Some(identity) = &context.identity {
+        args.extend([
+            "-c".to_string(),
+            format!("user.name={}", identity.name),
+            "-c".to_string(),
+            format!("user.email={}", identity.email),
+        ]);
+    }
+    args.extend(
+        ["commit", "-q", "-m", message]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    git_output(wt, &args)?;
+    Ok(git_output(wt, &["rev-parse", "--short", "HEAD"])?
+        .trim()
+        .to_string())
+}
+
+/// コミットに入る（消すもの以外の）ファイルの、新しい中身のハッシュとパス。
+fn staged_blobs(worktree: &Path) -> Result<Vec<(String, String)>> {
+    // 形: ":古いmode 新しいmode 古いhash 新しいhash 状態\0パス\0"（名前の変更は検出しない）
+    let raw = git_output(
+        worktree,
         &[
-            "-c",
-            "core.hooksPath=/dev/null",
-            "commit",
-            "-q",
-            "-m",
-            message,
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-renames",
         ],
     )?;
-    Ok(git_output(wt, &["rev-parse", "--short", "HEAD"])?
+    let mut fields = raw.split('\0').filter(|s| !s.is_empty());
+    let mut staged = Vec::new();
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let parts: Vec<&str> = meta.split_whitespace().collect();
+        if let Some(blob) = parts.get(3) {
+            staged.push((blob.to_string(), path.to_string()));
+        }
+    }
+    Ok(staged)
+}
+
+/// ファイルの中身のハッシュ（gitのblob）。`tick` が、置いた秘密のファイルについて求める。
+pub fn blob_hash(worktree: &Path, file: &Path) -> Result<String> {
+    let file = file
+        .to_str()
+        .ok_or_else(|| Error::new(format!("パスに使えない文字があります: {}", file.display())))?;
+    Ok(git_output(worktree, &["hash-object", "--", file])?
         .trim()
         .to_string())
 }
@@ -345,6 +463,8 @@ mod tests {
             .into_iter()
             .collect(),
             placed: vec![PathBuf::from("local.properties")],
+            placed_blobs: Vec::new(),
+            identity: None,
         };
         (dir, context)
     }
@@ -420,7 +540,13 @@ mod tests {
         let args = git_read_args("diff", &["origin/main...HEAD".to_string()]).unwrap();
         assert!(args.contains(&"--no-ext-diff".to_string()));
         assert_eq!(args.last().unwrap(), "origin/main...HEAD");
-        for bad in ["--output=/tmp/x", "--OUTPUT", "--ext-diff", "-o"] {
+        for bad in [
+            "--output=/tmp/x",
+            "--OUTPUT",
+            "--ext-diff",
+            "-o",
+            "--no-index",
+        ] {
             assert!(git_read_args("diff", &[bad.to_string()]).is_err(), "{bad}");
         }
         assert!(git_read_args("push", &[]).is_err());
@@ -444,6 +570,56 @@ mod tests {
         assert!(err.message.contains("secret.env"), "{}", err.message);
         assert_eq!(git(&wt, &["diff", "--cached", "--name-only"]), "");
         assert_eq!(git(&wt, &["log", "-1", "--format=%s"]), "Add b");
+    }
+
+    #[test]
+    fn placed_secrets_cannot_be_renamed_or_committed_under_another_name() {
+        let (_dir, mut ctx) = setup();
+        let wt = ctx.worktree.clone();
+        std::fs::write(wt.join("local.properties"), "SECRET=1\n").unwrap();
+        ctx.placed_blobs = vec![blob_hash(&wt, &wt.join("local.properties")).unwrap()];
+
+        let err = rename(
+            &ctx,
+            &wt,
+            Path::new("local.properties"),
+            Path::new("leaked.txt"),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("置いた秘密"), "{}", err.message);
+        assert!(remove(&ctx, &wt, &[PathBuf::from("local.properties")]).is_err());
+
+        // Writeで写したものも、中身で見分けて断る
+        std::fs::write(wt.join("copy.txt"), "SECRET=1\n").unwrap();
+        let err = commit(&ctx, "leak").unwrap_err();
+        assert!(err.message.contains("copy.txt"), "{}", err.message);
+        assert_eq!(git(&wt, &["diff", "--cached", "--name-only"]), "");
+    }
+
+    #[test]
+    fn uppercase_git_is_still_git() {
+        let (_dir, ctx) = setup();
+        let wt = ctx.worktree.clone();
+        for bad in [".GIT", ".Git/config", ".GIT/HEAD"] {
+            assert!(ctx.inside(&wt, Path::new(bad)).is_err(), "{bad}");
+        }
+        assert!(rename(&ctx, &wt, Path::new("a.txt"), Path::new(".GIT/x")).is_err());
+    }
+
+    #[test]
+    fn commit_uses_the_given_identity_without_user_config() {
+        let (_dir, mut ctx) = setup();
+        let wt = ctx.worktree.clone();
+        ctx.identity = Some(Identity {
+            name: "agentcells-yh[bot]".to_string(),
+            email: "1+agentcells-yh[bot]@users.noreply.github.com".to_string(),
+        });
+        std::fs::write(wt.join("d.txt"), "d").unwrap();
+        commit(&ctx, "Add d").unwrap();
+        assert_eq!(
+            git(&wt, &["log", "-1", "--format=%an <%ae>"]),
+            "agentcells-yh[bot] <1+agentcells-yh[bot]@users.noreply.github.com>"
+        );
     }
 
     #[test]

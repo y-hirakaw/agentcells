@@ -32,35 +32,60 @@ pub const DENY_GH: &[&str] = &[
     "Bash(gh api:*)",
 ];
 
-/// AIに許すツール。読むのは自由にし、書き換えは次の2つの道だけにする。
-/// - ファイルの作成と更新: Edit・Writeを、その仕事のworktreeの中だけに許す（`runtime_settings` で足す）
+/// AIに許すツール。読むのはその仕事のworktreeの中だけにし、書き換えは次の2つの道だけにする。
+/// - ファイルの作成と更新: Edit・Writeを、その仕事のworktreeの中だけに許す
 /// - それ以外（削除、移動、コミット、gitを読む、ビルドやテスト）: `agentcells cell` を通す。CLIが範囲を確かめる
 ///
 /// Bashは `agentcells cell` だけを許す。`ls` や `git diff` のようなコマンドでも、オプションでファイルに
 /// 書けるものがある（`git diff --output` など）ので許さない。Claude Codeは、許したコマンドに
 /// `>`、`;`、`&&`、`$(...)` で別の操作を付け足すことを止める（2.1.310で確かめた）。
-pub const ALLOW_BASE: &[&str] = &["Read", "Glob", "Grep", "Bash(agentcells cell:*)"];
+pub const ALLOW_BASH: &str = "Bash(agentcells cell:*)";
 
-/// 1回の実行で渡す設定を作る。
+/// 使う人のホームの下で、秘密がよく置かれる場所。AIが動かすコマンド（sandboxの中）に読ませない。
+const SECRET_PLACES: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".netrc",
+    ".git-credentials",
+    ".docker",
+    ".kube",
+    ".npmrc",
+    ".pypirc",
+    ".config/gcloud",
+    "Library/Keychains",
+];
+
+/// 1回の実行の場所。
+pub struct RunPaths<'a> {
+    /// 作業するworktree
+    pub worktree: &'a Path,
+    /// gitの共通のディレクトリ（linked worktreeなら、元のリポジトリの `.git`）。コミットで書き込む
+    pub git_dir: &'a Path,
+    /// 今の仕事のファイル（`AGENTCELLS_CONTEXT`）。`agentcells cell` が読む
+    pub context: &'a Path,
+    /// worktreeに置いた秘密のファイル（絶対パス）
+    pub placed: &'a [PathBuf],
+}
+
+/// 1回の実行で渡す設定を作る。2つの守りを重ねる。
 ///
-/// `worktree` の中だけに、ファイルの作成と更新（Edit、Write）を許す。ただし `.git` と、置いた秘密のファイルは除く。
+/// Claude Codeのツールの権限:
+/// - 読む（Read）のは、worktreeの中だけ
+/// - ファイルの作成と更新（Edit、Write）は、worktreeの中だけ。`.git` と置いた秘密のファイルは除く
+/// - Bashは `agentcells cell` だけ
 ///
-/// 次のファイルはAIに読ませない。
-/// - `placed_files`: worktreeに置いた秘密のファイル（絶対パス）
-/// - `files/` の下: worktreeに置くファイルの元
-/// - GitHub Appの秘密鍵: 読まれると、インストール先のリポジトリへのトークンをいくらでも作れる
-/// - `config.toml`: 秘密鍵の場所などが書いてある
-/// - ghの設定ディレクトリ: keyringを使わない環境では、`hosts.yml` にトークンが平文で入っている
+/// sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
+/// - 書けるのは、worktreeと、gitの共通のディレクトリだけ
+/// - `~/.agentcells`（App の秘密鍵、`files/`、`config.toml`、ほかの仕事のworktree）、ghの設定、
+///   秘密がよく置かれる場所は読ませない。ただし今の仕事のworktree、gitの共通のディレクトリ、今の仕事のファイルは読める
+/// - sandboxの外でコマンドを動かすことは許さない
 ///
 /// 信頼していないディレクトリではprojectの設定のallowが無視されるので、cellに要るallowもここで渡す。
-pub fn runtime_settings(
-    home: &Home,
-    config: &Config,
-    worktree: &Path,
-    placed_files: &[PathBuf],
-) -> Result<serde_json::Value> {
-    let mut allow: Vec<String> = ALLOW_BASE.iter().map(|s| s.to_string()).collect();
-    for tool in ["Edit", "Write"] {
+pub fn runtime_settings(home: &Home, config: &Config, run: &RunPaths) -> Result<serde_json::Value> {
+    let worktree = run.worktree;
+    let mut allow = vec![ALLOW_BASH.to_string()];
+    for tool in ["Read", "Edit", "Write"] {
         rule(&mut allow, tool, worktree, "/**")?;
     }
 
@@ -70,20 +95,51 @@ pub fn runtime_settings(
         rule(&mut deny, tool, &worktree.join(".git"), "")?;
         rule(&mut deny, tool, &worktree.join(".git"), "/**")?;
     }
-    for path in placed_files {
+    for path in run.placed {
         for tool in ["Read", "Edit", "Write"] {
             rule(&mut deny, tool, path, "")?;
         }
     }
-    rule(&mut deny, "Read", &home.files_dir(), "/**")?;
-    rule(&mut deny, "Read", &home.config_path(), "")?;
+
+    let mut deny_read = forms(home.root())?;
     if let Some(app) = &config.github_app {
-        rule(&mut deny, "Read", &app.private_key, "")?;
+        deny_read.extend(forms(&app.private_key)?);
     }
     if let Some(dir) = gh_config_dir(|key| std::env::var_os(key)) {
-        rule(&mut deny, "Read", &dir, "/**")?;
+        deny_read.extend(forms(&dir)?);
     }
-    Ok(json!({ "permissions": { "allow": allow, "deny": deny } }))
+    if let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from)
+        && user_home.is_absolute()
+    {
+        for place in SECRET_PLACES {
+            deny_read.extend(forms(&user_home.join(place))?);
+        }
+    }
+    for path in run.placed {
+        deny_read.extend(forms(path)?);
+    }
+    let mut allow_read = forms(worktree)?;
+    allow_read.extend(forms(run.git_dir)?);
+    allow_read.extend(forms(run.context)?);
+
+    Ok(json!({
+        "permissions": { "allow": allow, "deny": deny },
+        "sandbox": {
+            "enabled": true,
+            "allowUnsandboxedCommands": false,
+            "filesystem": {
+                "allowWrite": forms(run.git_dir)?,
+                "denyRead": dedup(deny_read),
+                "allowRead": dedup(allow_read),
+            }
+        }
+    }))
+}
+
+fn dedup(mut v: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|x| seen.insert(x.clone()));
+    v
 }
 
 /// ghの設定ディレクトリ。ghと同じく `GH_CONFIG_DIR`、`XDG_CONFIG_HOME/gh`、`~/.config/gh` の順に探す。
@@ -101,10 +157,27 @@ fn gh_config_dir(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<Pat
 }
 
 /// `Read(//絶対パス)` の形で、ツールとパスの決まりを足す（先頭の / を重ねる）。
-///
-/// Claude Codeが比べるパスと形が違うと効かないので、書いたままのパスと、
-/// シンボリックリンクや `..` を解いたパス（macOSの /var → /private/var など）の両方を足す。
 fn rule(rules: &mut Vec<String>, tool: &str, path: &Path, suffix: &str) -> Result<()> {
+    for p in path_forms(path)? {
+        let rule = format!("{tool}(/{}{suffix})", p.display());
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
+    Ok(())
+}
+
+/// sandboxに書くパス。
+fn forms(path: &Path) -> Result<Vec<String>> {
+    Ok(path_forms(path)?
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect())
+}
+
+/// Claude Codeが比べるパスと形が違うと効かないので、書いたままのパスと、
+/// シンボリックリンクや `..` を解いたパス（macOSの /var → /private/var など）の両方を返す。
+fn path_forms(path: &Path) -> Result<Vec<PathBuf>> {
     if !path.is_absolute() {
         return Err(Error::new(format!(
             "許可や禁止に書くパスは絶対パスにしてください: {}",
@@ -117,13 +190,7 @@ fn rule(rules: &mut Vec<String>, tool: &str, path: &Path, suffix: &str) -> Resul
     {
         paths.push(resolved);
     }
-    for p in paths {
-        let rule = format!("{tool}(/{}{suffix})", p.display());
-        if !rules.contains(&rule) {
-            rules.push(rule);
-        }
-    }
-    Ok(())
+    Ok(paths)
 }
 
 /// シンボリックリンクと `..` を解く。まだないファイルは、親ディレクトリを解いてつなぐ。
@@ -144,14 +211,26 @@ mod tests {
         Home::new(PathBuf::from("/home/me/.agentcells"))
     }
 
-    fn rules_of(config: &Config, placed: &[PathBuf], kind: &str) -> Vec<String> {
-        runtime_settings(&home(), config, Path::new("/w/octo/app/12"), placed).unwrap()
-            ["permissions"][kind]
-            .as_array()
+    fn settings_of(config: &Config, placed: &[PathBuf]) -> serde_json::Value {
+        let run = RunPaths {
+            worktree: Path::new("/w/octo/app/12"),
+            git_dir: Path::new("/home/me/.agentcells/repos/octo/app/.git"),
+            context: Path::new("/home/me/.agentcells/runs/1/context.json"),
+            placed,
+        };
+        runtime_settings(&home(), config, &run).unwrap()
+    }
+
+    fn strings(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
             .unwrap()
             .iter()
             .map(|d| d.as_str().unwrap().to_string())
             .collect()
+    }
+
+    fn rules_of(config: &Config, placed: &[PathBuf], kind: &str) -> Vec<String> {
+        strings(&settings_of(config, placed)["permissions"][kind])
     }
 
     fn deny_of(config: &Config, placed: &[PathBuf]) -> Vec<String> {
@@ -164,10 +243,8 @@ mod tests {
         assert_eq!(
             allow,
             vec![
-                "Read",
-                "Glob",
-                "Grep",
                 "Bash(agentcells cell:*)",
+                "Read(//w/octo/app/12/**)",
                 "Edit(//w/octo/app/12/**)",
                 "Write(//w/octo/app/12/**)",
             ]
@@ -179,10 +256,54 @@ mod tests {
         for rule in [
             "Edit(//w/octo/app/12/.git)",
             "Write(//w/octo/app/12/.git/**)",
+            "Read(//w/octo/app/12/key.jks)",
             "Edit(//w/octo/app/12/key.jks)",
             "Write(//w/octo/app/12/key.jks)",
         ] {
             assert!(deny.contains(&rule.to_string()), "{rule} should be denied");
+        }
+    }
+
+    #[test]
+    fn sandbox_writes_only_to_git_dir_and_hides_agentcells_home() {
+        let config = Config {
+            github_app: Some(GithubApp {
+                id: "Iv23li".to_string(),
+                private_key: PathBuf::from("/keys/app.pem"),
+            }),
+            ..Config::default()
+        };
+        let settings = settings_of(&config, &[PathBuf::from("/w/octo/app/12/key.jks")]);
+        let sandbox = &settings["sandbox"];
+        assert_eq!(sandbox["enabled"], true);
+        // sandboxの外でコマンドを動かさせない
+        assert_eq!(sandbox["allowUnsandboxedCommands"], false);
+        let fs = &sandbox["filesystem"];
+        assert_eq!(
+            strings(&fs["allowWrite"]),
+            vec!["/home/me/.agentcells/repos/octo/app/.git"]
+        );
+        let deny_read = strings(&fs["denyRead"]);
+        for path in [
+            "/home/me/.agentcells",
+            "/keys/app.pem",
+            "/w/octo/app/12/key.jks",
+        ] {
+            assert!(
+                deny_read.contains(&path.to_string()),
+                "{path}: {deny_read:?}"
+            );
+        }
+        let allow_read = strings(&fs["allowRead"]);
+        for path in [
+            "/w/octo/app/12",
+            "/home/me/.agentcells/repos/octo/app/.git",
+            "/home/me/.agentcells/runs/1/context.json",
+        ] {
+            assert!(
+                allow_read.contains(&path.to_string()),
+                "{path}: {allow_read:?}"
+            );
         }
     }
 
@@ -207,31 +328,12 @@ mod tests {
     }
 
     #[test]
-    fn denies_reading_secret_files_by_absolute_path() {
+    fn denies_placed_secret_files_by_absolute_path() {
         let deny = deny_of(
             &Config::default(),
             &[PathBuf::from("/work/app/local.properties")],
         );
         assert!(deny.contains(&"Read(//work/app/local.properties)".to_string()));
-    }
-
-    #[test]
-    fn denies_reading_the_app_key_config_and_file_sources() {
-        let config = Config {
-            github_app: Some(GithubApp {
-                id: "Iv23li".to_string(),
-                private_key: PathBuf::from("/home/me/.agentcells/github-app.pem"),
-            }),
-            ..Config::default()
-        };
-        let deny = deny_of(&config, &[]);
-        for rule in [
-            "Read(//home/me/.agentcells/github-app.pem)",
-            "Read(//home/me/.agentcells/config.toml)",
-            "Read(//home/me/.agentcells/files/**)",
-        ] {
-            assert!(deny.contains(&rule.to_string()), "{rule} should be denied");
-        }
     }
 
     #[cfg(unix)]
@@ -253,22 +355,22 @@ mod tests {
             ..Config::default()
         };
         let home = Home::new(link.clone());
-        let deny: Vec<String> =
-            runtime_settings(&home, &config, &link, &[]).unwrap()["permissions"]["deny"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|d| d.as_str().unwrap().to_string())
-                .collect();
+        let run = RunPaths {
+            worktree: &link,
+            git_dir: &link,
+            context: &link,
+            placed: &[],
+        };
+        let settings = runtime_settings(&home, &config, &run).unwrap();
+        let deny_read = strings(&settings["sandbox"]["filesystem"]["denyRead"]);
 
         let resolved = real.canonicalize().unwrap();
-        for rule in [
-            format!("Read(/{}/app.pem)", resolved.display()),
-            format!("Read(/{}/files/**)", resolved.display()),
-            format!("Read(/{}/config.toml)", resolved.display()),
-            format!("Read(/{}/config.toml)", link.display()),
-        ] {
-            assert!(deny.contains(&rule), "{rule} should be denied: {deny:?}");
+        for path in [resolved.join("app.pem"), resolved.clone(), link.clone()] {
+            let path = path.display().to_string();
+            assert!(
+                deny_read.contains(&path),
+                "{path} should be denied: {deny_read:?}"
+            );
         }
     }
 
@@ -302,14 +404,13 @@ mod tests {
 
     #[test]
     fn rejects_relative_secret_paths() {
-        assert!(
-            runtime_settings(
-                &home(),
-                &Config::default(),
-                Path::new("/w"),
-                &[PathBuf::from("local.properties")]
-            )
-            .is_err()
-        );
+        let placed = [PathBuf::from("local.properties")];
+        let run = RunPaths {
+            worktree: Path::new("/w"),
+            git_dir: Path::new("/w/.git"),
+            context: Path::new("/c.json"),
+            placed: &placed,
+        };
+        assert!(runtime_settings(&home(), &Config::default(), &run).is_err());
     }
 }
