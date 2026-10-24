@@ -2,6 +2,7 @@ pub mod config;
 pub mod doctor;
 pub mod error;
 pub mod files;
+pub mod github;
 pub mod home;
 pub mod labels;
 pub mod marker;

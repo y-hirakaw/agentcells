@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::config::Config;
+use crate::github;
 use crate::home::Home;
 use crate::probe::Probe;
 
@@ -63,7 +64,9 @@ pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Chec
     checks.push(check_claude_auth(probe, claude_found));
     checks.push(check_home(home));
     checks.push(check_path(home, path_env));
-    checks.push(check_config(home));
+    let (config_check, config) = check_config(home);
+    checks.push(config_check);
+    checks.push(check_github(config.as_ref(), probe));
     checks
 }
 
@@ -207,24 +210,32 @@ fn check_path(home: &Home, path_env: Option<&OsStr>) -> Check {
     }
 }
 
-fn check_config(home: &Home) -> Check {
+/// 設定ファイルを確かめる。読めたら、ほかの確認に使えるように設定も返す。
+fn check_config(home: &Home) -> (Check, Option<Config>) {
     const NAME: &str = "config";
     let path = home.config_path();
     if !path.exists() {
-        return Check::warn(
+        let check = Check::warn(
             NAME,
             format!("{} がありません", path.display()),
             "`agentcells setup` を実行すると雛形が置かれます",
         );
+        return (check, None);
     }
-    match Config::load(&path) {
-        Err(err) => Check::fail(
-            NAME,
-            err.message,
-            err.hint
-                .unwrap_or_else(|| "設定ファイルを直してください".to_string()),
-        ),
-        Ok(config) if config.products.is_empty() => Check::warn(
+    let config = match Config::load(&path) {
+        Ok(config) => config,
+        Err(err) => {
+            let check = Check::fail(
+                NAME,
+                err.message,
+                err.hint
+                    .unwrap_or_else(|| "設定ファイルを直してください".to_string()),
+            );
+            return (check, None);
+        }
+    };
+    let check = match &config {
+        config if config.products.is_empty() => Check::warn(
             NAME,
             "productがまだありません",
             format!(
@@ -232,7 +243,7 @@ fn check_config(home: &Home) -> Check {
                 path.display()
             ),
         ),
-        Ok(config) => Check::ok(
+        config => Check::ok(
             NAME,
             format!(
                 "product {}件、cell {}件",
@@ -240,7 +251,96 @@ fn check_config(home: &Home) -> Check {
                 config.cells.len()
             ),
         ),
+    };
+    (check, Some(config))
+}
+
+/// 書き込みに使うアカウントを確かめる。GitHub Appを推奨し、なければghのアカウントで動くことを知らせる。
+fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
+    const NAME: &str = "github";
+    let Some(config) = config else {
+        return Check::warn(
+            NAME,
+            "設定ファイルを読めないので、書き込みに使うアカウントを確かめられません",
+            "先に config の問題を直してください",
+        );
+    };
+    let Some(app) = &config.github_app else {
+        return Check::warn(
+            NAME,
+            "ghにログインしているあなたのアカウントで書き込みます。AIのコメントやPRがあなたの名前になり、人間の発言と見分けにくくなります",
+            "GitHub Appを作り、config.toml の [github_app] に書くのがおすすめです（手順は README の「GitHub App」）",
+        );
+    };
+    let fail = |err: crate::error::Error| {
+        Check::fail(
+            NAME,
+            err.message,
+            err.hint
+                .unwrap_or_else(|| "[github_app] の設定を確かめてください".to_string()),
+        )
+    };
+    let jwt = match github::jwt(app, github::now()) {
+        Ok(jwt) => jwt,
+        Err(err) => return fail(err),
+    };
+    let slug = match github::app_slug(probe, &jwt) {
+        Ok(slug) => slug,
+        Err(err) => return fail(err),
+    };
+    let mut missing = Vec::new();
+    for repo in config.repos() {
+        match github::installation_id(probe, &jwt, repo) {
+            Ok(Some(_)) => {}
+            Ok(None) => missing.push(repo.to_string()),
+            Err(err) => return fail(err),
+        }
     }
+    if !missing.is_empty() {
+        return Check::fail(
+            NAME,
+            format!(
+                "GitHub App「{slug}」が次のリポジトリにインストールされていません: {}",
+                missing.join(", ")
+            ),
+            format!(
+                "https://github.com/apps/{slug}/installations/new からインストールしてください"
+            ),
+        );
+    }
+    if let Some(mode) = loose_permissions(&app.private_key) {
+        return Check::warn(
+            NAME,
+            format!(
+                "GitHub App「{slug}」で書き込みますが、秘密鍵 {} をほかのユーザーも読めます（権限 {mode:o}）",
+                app.private_key.display()
+            ),
+            format!(
+                "`chmod 600 {}` を実行してください",
+                app.private_key.display()
+            ),
+        );
+    }
+    Check::ok(
+        NAME,
+        format!(
+            "GitHub App「{slug}」で書き込みます（{}件のリポジトリ）",
+            config.repos().len()
+        ),
+    )
+}
+
+/// 持ち主以外も読み書きできる権限なら、その権限を返す。
+#[cfg(unix)]
+fn loose_permissions(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    (mode & 0o077 != 0).then_some(mode)
+}
+
+#[cfg(not(unix))]
+fn loose_permissions(_path: &Path) -> Option<u32> {
+    None
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -254,7 +354,7 @@ mod tests {
     use std::ffi::OsString;
 
     fn healthy() -> FakeProbe {
-        FakeProbe::default()
+        with_app(FakeProbe::default())
             .with("git --version", true, "git version 2.50.1\n")
             .with("gh --version", true, "gh version 2.87.2\n")
             .with("gh auth status", true, "")
@@ -284,13 +384,33 @@ label = "ac:triage"
 prompt = "triage.md"
 "#;
 
-    /// PATHに入っていて、正しい設定ファイルがある置き場所を作る。
+    const GITHUB_APP: &str = r#"
+[github_app]
+id = "Iv23liTEST"
+private_key = "github-app.pem"
+"#;
+
+    /// GitHub Appの呼び出しに答える。JWTは環境変数で渡るので、引数は毎回同じになる。
+    fn with_app(probe: FakeProbe) -> FakeProbe {
+        probe
+            .with("gh api /app", true, r#"{"slug":"agentcells-bot"}"#)
+            .with("gh api /repos/octo/app/installation", true, r#"{"id":42}"#)
+    }
+
+    /// PATHに入っていて、GitHub Appを使う正しい設定ファイルがある置き場所を作る。
     fn setup_home() -> (tempfile::TempDir, Home, OsString) {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::new(dir.path().join(".agentcells"));
         std::fs::create_dir_all(home.bin_dir()).unwrap();
-        std::fs::write(home.config_path(), CONFIG).unwrap();
+        std::fs::write(home.config_path(), format!("{CONFIG}{GITHUB_APP}")).unwrap();
         std::fs::write(home.root().join("triage.md"), "prompt").unwrap();
+        let key = home.root().join("github-app.pem");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/github-app-test-key.pem"),
+            &key,
+        )
+        .unwrap();
+        set_mode(&key, 0o600);
         let path = std::env::join_paths([home.bin_dir(), "/usr/bin".into()]).unwrap();
         (dir, home, path)
     }
@@ -390,6 +510,80 @@ prompt = "triage.md"
         let check = find(&run(&home, None, &healthy()), "home").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("agentcells setup"));
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = (path, mode);
+    }
+
+    #[test]
+    fn without_github_app_warns_that_ai_speaks_as_you() {
+        let (_dir, home, path) = setup_home();
+        std::fs::write(home.config_path(), CONFIG).unwrap();
+        let check = find(&run(&home, Some(&path), &healthy()), "github").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("あなたのアカウント"),
+            "{}",
+            check.detail
+        );
+        assert!(check.fix.unwrap().contains("[github_app]"));
+    }
+
+    #[test]
+    fn github_app_not_installed_fails_with_install_url() {
+        let (_dir, home, path) = setup_home();
+        let mut probe = healthy();
+        probe.outputs.insert(
+            "gh api /repos/octo/app/installation".to_string(),
+            crate::probe::Output {
+                success: false,
+                stdout: String::new(),
+                stderr: "gh: Not Found (HTTP 404)\n".to_string(),
+            },
+        );
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("octo/app"), "{}", check.detail);
+        assert!(
+            check
+                .fix
+                .unwrap()
+                .contains("https://github.com/apps/agentcells-bot/installations/new")
+        );
+    }
+
+    #[test]
+    fn github_app_with_wrong_key_fails() {
+        let (_dir, home, path) = setup_home();
+        let mut probe = healthy();
+        probe.outputs.insert(
+            "gh api /app".to_string(),
+            crate::probe::Output {
+                success: false,
+                stdout: String::new(),
+                stderr: "gh: A JSON web token could not be decoded (HTTP 401)\n".to_string(),
+            },
+        );
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.fix.unwrap().contains("[github_app]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_private_key_warns_with_chmod() {
+        let (_dir, home, path) = setup_home();
+        set_mode(&home.root().join("github-app.pem"), 0o644);
+        let check = find(&run(&home, Some(&path), &healthy()), "github").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.fix.unwrap().contains("chmod 600"));
     }
 
     #[test]

@@ -14,9 +14,8 @@ pub fn branch_name(issues: &RepoName, number: u64) -> String {
 /// PRの本文。1行目に目印を書き、Issueが閉じられるように `Closes owner/repo#番号` を入れる。
 pub fn body(cell: &str, round: u32, summary: &str, issues: &RepoName, number: u64) -> String {
     format!(
-        "{}\n\n{}\n\nCloses {issues}#{number}",
-        marker::header(cell, round),
-        summary.trim()
+        "{}\n\nCloses {issues}#{number}",
+        marker::comment(cell, round, summary)
     )
 }
 

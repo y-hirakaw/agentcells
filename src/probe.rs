@@ -11,14 +11,23 @@ pub struct Output {
 /// 外部コマンドを実行する。テストでは差し替える。
 pub trait Probe {
     /// コマンドが見つからないときは `None` を返す。
-    fn run(&self, program: &str, args: &[&str]) -> Option<Output>;
+    fn run(&self, program: &str, args: &[&str]) -> Option<Output> {
+        self.run_with_env(program, args, &[])
+    }
+
+    /// 環境変数を足して実行する。トークンは引数ではなく環境変数で渡す。
+    fn run_with_env(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Option<Output>;
 }
 
 pub struct SystemProbe;
 
 impl Probe for SystemProbe {
-    fn run(&self, program: &str, args: &[&str]) -> Option<Output> {
-        let out = Command::new(program).args(args).output().ok()?;
+    fn run_with_env(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Option<Output> {
+        let out = Command::new(program)
+            .args(args)
+            .envs(env.iter().copied())
+            .output()
+            .ok()?;
         Some(Output {
             success: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -33,13 +42,15 @@ pub(crate) mod fake {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    /// コマンドと引数の組に、決まった結果を返す。呼ばれたコマンドは `calls` に残る。
+    /// コマンドと引数の組に、決まった結果を返す。呼ばれたコマンドは `calls` に、
+    /// 渡された環境変数は `envs` に残る。
     /// 登録していないコマンドは、`fallback` があればそれを、なければ見つからない扱いにする。
     #[derive(Default)]
     pub struct FakeProbe {
         pub outputs: HashMap<String, Output>,
         pub fallback: Option<Output>,
         pub calls: RefCell<Vec<String>>,
+        pub envs: RefCell<Vec<Vec<(String, String)>>>,
     }
 
     impl FakeProbe {
@@ -65,12 +76,22 @@ pub(crate) mod fake {
     }
 
     impl Probe for FakeProbe {
-        fn run(&self, program: &str, args: &[&str]) -> Option<Output> {
+        fn run_with_env(
+            &self,
+            program: &str,
+            args: &[&str],
+            env: &[(&str, &str)],
+        ) -> Option<Output> {
             let key = std::iter::once(program)
                 .chain(args.iter().copied())
                 .collect::<Vec<_>>()
                 .join(" ");
             self.calls.borrow_mut().push(key.clone());
+            self.envs.borrow_mut().push(
+                env.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
             self.outputs
                 .get(&key)
                 .cloned()

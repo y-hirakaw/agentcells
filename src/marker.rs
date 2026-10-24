@@ -9,6 +9,11 @@ pub fn header(cell: &str, round: u32) -> String {
     format!("{TAG} {cell} round {round}")
 }
 
+/// 目印を1行目に付けたコメント。Issue/PRへのコメント、PRの本文、レビューの本文はすべてこの形にする。
+pub fn comment(cell: &str, round: u32, text: &str) -> String {
+    format!("{}\n\n{}", header(cell, round), text.trim())
+}
+
 /// コメントの1行目の目印を読む。目印がなければ `None`。`round1` のように空白がなくても読む。
 pub fn parse(body: &str) -> Option<(String, u32)> {
     let first = body.lines().next()?.trim();
@@ -42,6 +47,20 @@ mod tests {
         let h = header("review", 2);
         assert_eq!(h, "[agentcells] review round 2");
         assert_eq!(parse(&h), Some(("review".to_string(), 2)));
+    }
+
+    #[test]
+    fn comment_puts_the_marker_on_the_first_line() {
+        let c = comment(
+            "triage",
+            1,
+            "\n仕様について確認させてください。\n- ログインは必須ですか？\n",
+        );
+        assert_eq!(
+            c,
+            "[agentcells] triage round 1\n\n仕様について確認させてください。\n- ログインは必須ですか？"
+        );
+        assert_eq!(parse(&c), Some(("triage".to_string(), 1)));
     }
 
     #[test]

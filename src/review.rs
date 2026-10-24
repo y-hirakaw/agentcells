@@ -112,7 +112,7 @@ pub fn payload(
         .iter()
         .partition(|f| diff.contains(&f.path, f.line));
 
-    let mut body = format!("{}\n\n{}", marker::header(cell, round), summary.trim());
+    let mut body = marker::comment(cell, round, summary);
     if !outside.is_empty() {
         body.push_str("\n\n差分の外への指摘（行コメントを付けられないので、ここに書きます）:\n");
         for f in &outside {

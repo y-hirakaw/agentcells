@@ -3,7 +3,7 @@
 //! product（どのリポジトリのIssueを、どのリポジトリで作業するか）と、
 //! cell（どのラベルを拾い、どのプロンプトで動くか）を書く。
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -35,6 +35,14 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # review = false                     # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
 # max_rounds = 3                     # 往復の上限（1〜3。省略すると3）
 # timeout_minutes = 30               # 1回の実行の上限（省略すると30）
+#
+# github_app: GitHubへの書き込み（コメント、ラベル、push、PR）に使うGitHub App（推奨）
+# 書かなければ、ghにログインしているあなたのアカウントで書き込みます。
+# Appで書き込むと、コメントやPRが「<Appの名前>[bot]」になり、人間の発言と見分けられます。
+#
+# [github_app]
+# id = "Iv23li..."                   # Client ID（App IDでもよい）
+# private_key = "github-app.pem"     # 秘密鍵（このファイルからの相対パス。権限は600にする）
 "#;
 
 /// 往復の上限。これより多く往復させず、人間に回す。
@@ -49,6 +57,19 @@ pub struct Config {
     pub products: Vec<Product>,
     #[serde(default, rename = "cell")]
     pub cells: Vec<Cell>,
+    /// 書き込みに使うGitHub App。なければghにログインしているアカウントで書き込む
+    #[serde(default)]
+    pub github_app: Option<GithubApp>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubApp {
+    /// Client IDかApp ID
+    #[serde(deserialize_with = "string_or_number")]
+    pub id: String,
+    /// 秘密鍵のファイル。読み込んだあとは絶対パスになっている
+    pub private_key: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +139,22 @@ where
     })
 }
 
+fn string_or_number<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u64),
+    }
+    Ok(match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => s,
+        StringOrNumber::Number(n) => n.to_string(),
+    })
+}
+
 fn default_max_rounds() -> u32 {
     DEFAULT_MAX_ROUNDS
 }
@@ -151,6 +188,9 @@ impl Config {
         for cell in &mut config.cells {
             cell.prompt = base.join(&cell.prompt);
         }
+        if let Some(app) = &mut config.github_app {
+            app.private_key = base.join(&app.private_key);
+        }
         let problems = config.problems();
         if problems.is_empty() {
             Ok(config)
@@ -162,6 +202,14 @@ impl Config {
                 .join("\n");
             Err(Error::new(list).with_hint("上の項目を直してから、もう一度実行してください"))
         }
+    }
+
+    /// Issueを置くリポジトリと作業するリポジトリをすべて、重ならないように返す。
+    pub fn repos(&self) -> BTreeSet<&RepoName> {
+        self.products
+            .iter()
+            .flat_map(|p| std::iter::once(&p.issues).chain(&p.repos))
+            .collect()
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {
@@ -293,6 +341,20 @@ impl Config {
                 problems.push(format!(
                     "cell「{}」の timeout_minutes は1以上にしてください",
                     c.name
+                ));
+            }
+        }
+        if let Some(app) = &self.github_app {
+            if app.id.trim().is_empty() {
+                problems.push(
+                    "[github_app] の id が空です。GitHub AppのClient IDを書いてください"
+                        .to_string(),
+                );
+            }
+            if !app.private_key.is_file() {
+                problems.push(format!(
+                    "[github_app] の秘密鍵 {} がありません（GitHub Appの設定画面で作れます）",
+                    app.private_key.display()
                 ));
             }
         }
@@ -535,6 +597,40 @@ timeout_minutes = 10
         let message = problems_of(&text);
         assert!(message.contains("repos が空"), "{message}");
         assert!(message.contains("使えない文字"), "{message}");
+    }
+
+    #[test]
+    fn github_app_is_optional() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        assert!(
+            Config::parse(VALID, dir.path())
+                .unwrap()
+                .github_app
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn github_app_id_accepts_numbers_and_resolves_the_key_path() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        std::fs::write(dir.path().join("app.pem"), "key").unwrap();
+        for (id, expected) in [("123456", "123456"), ("\"Iv23liABC\"", "Iv23liABC")] {
+            let text = format!("{VALID}\n[github_app]\nid = {id}\nprivate_key = \"app.pem\"\n");
+            let app = Config::parse(&text, dir.path())
+                .unwrap()
+                .github_app
+                .unwrap();
+            assert_eq!(app.id, expected);
+            assert_eq!(app.private_key, dir.path().join("app.pem"));
+        }
+    }
+
+    #[test]
+    fn github_app_needs_an_id_and_a_key_file() {
+        let text = format!("{VALID}\n[github_app]\nid = \"\"\nprivate_key = \"missing.pem\"\n");
+        let message = problems_of(&text);
+        assert!(message.contains("id が空"), "{message}");
+        assert!(message.contains("missing.pem"), "{message}");
     }
 
     #[test]

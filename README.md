@@ -47,6 +47,26 @@ cd agentcells
 
 設定ファイル `~/.agentcells/config.toml` には、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [concept.md](concept.md) と、雛形のコメントを見てください。
 
+### GitHub App（推奨）
+
+コメントやPRは、GitHub Appか、ghにログインしているあなたのアカウントで書き込みます。あなたのアカウントのままだと、AIの発言があなたの発言に見えてわかりにくいので、GitHub Appを作るのがおすすめです。
+
+1. GitHubの Settings → Developer settings → GitHub Apps → New GitHub App で作る
+   - Webhookは使わないので、Activeのチェックを外す
+   - Repository permissions: Contents、Issues、Pull requests を Read and write にする（`.github/workflows` を変えるなら Workflows も）
+   - Where can this GitHub App be installed? は Only on this account でよい
+2. 作ったAppの画面で Generate a private key を押し、ダウンロードした `.pem` を `~/.agentcells/github-app.pem` に置いて `chmod 600` する
+3. Install App から、Issueのリポジトリと作業するリポジトリにインストールする
+4. `~/.agentcells/config.toml` に書く
+
+   ```toml
+   [github_app]
+   id = "Iv23li..."                 # Appの画面のClient ID
+   private_key = "github-app.pem"
+   ```
+
+5. `agentcells doctor` で確かめる。インストールが足りないリポジトリがあれば、インストールのURLが表示されます
+
 ## 開発
 
 Rustのバージョンは `rust-toolchain.toml` で決めています。

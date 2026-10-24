@@ -83,7 +83,7 @@ pub fn output_schema(cell: &Cell) -> serde_json::Value {
             },
             "comment": {
                 "type": "string",
-                "description": "Issue/PRに残すコメント。やったことと、次に進める理由を書く"
+                "description": "Issue/PRに残すコメント。やったことと、次に進める理由を書く。needs-human のときは、人間に確かめたいこと（仕様の質問など）や、できなかったこととその結果、人間にやってほしいこと（環境のせいでビルドが通らないなど）を書く"
             }
         },
         "required": ["next", "comment"],
