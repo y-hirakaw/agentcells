@@ -26,6 +26,34 @@ Issueを作ると、AIエージェントのcellが仕事を進めます。次の
 | maintenance | inspectorが報告したIssueを受けて、ラインそのものを直す |
 | shipping | 成果物の出荷（リリース）を担当する。製造とは責務を分ける |
 
+## インストール（作成中）
+
+今はソースからビルドします。Rustが入っていなければ、先に https://rustup.rs の手順で入れてください。
+
+```sh
+git clone https://github.com/y-hirakaw/agentcells.git
+cd agentcells
+./install.sh
+```
+
+`~/.agentcells/bin/agentcells` に入り、続けて `agentcells setup` が動きます。足りないものがあれば、直し方が表示されます。置き場所は環境変数 `AGENTCELLS_HOME` で変えられます。
+
+| コマンド | 何をするか |
+| --- | --- |
+| `agentcells doctor` | 動かすのに必要なものがそろっているかを確かめ、だめなら直し方を出す |
+| `agentcells setup` | 作業データの置き場所を用意する（何度実行してもよい） |
+| `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
+
+## 開発
+
+Rustのバージョンは `rust-toolchain.toml` で決めています。
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
 ## 対応するエージェント
 
 最初はClaude Codeを前提に作ります。名前と設計は特定のエージェントに依存しないようにしています。
