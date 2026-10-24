@@ -281,7 +281,7 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
         )
     });
     let with_loose = |fix: String| match &loose {
-        Some(note) => format!("{fix}\nあわせて: {note}"),
+        Some(note) => format!("{fix}。あわせて、{note}"),
         None => fix,
     };
     let fail = |err: crate::error::Error| {
@@ -298,10 +298,24 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
         Ok(jwt) => jwt,
         Err(err) => return fail(err),
     };
-    let slug = match github::app_slug(probe, &jwt) {
-        Ok(slug) => slug,
+    let info = match github::app_info(probe, &jwt) {
+        Ok(info) => info,
         Err(err) => return fail(err),
     };
+    let slug = &info.slug;
+    let missing_permissions = info.missing_permissions();
+    if !missing_permissions.is_empty() {
+        return Check::fail(
+            NAME,
+            format!(
+                "GitHub App「{slug}」に要る権限が足りません: {}",
+                missing_permissions.join(", ")
+            ),
+            with_loose(format!(
+                "https://github.com/settings/apps/{slug}/permissions で Read and write にし、インストール先で新しい権限を承認してください"
+            )),
+        );
+    }
     let mut missing = Vec::new();
     for repo in config.repos() {
         match github::installation_id(probe, &jwt, repo) {
@@ -395,7 +409,11 @@ private_key = "github-app.pem"
     /// GitHub Appの呼び出しに答える。JWTは環境変数で渡るので、引数は毎回同じになる。
     fn with_app(probe: FakeProbe) -> FakeProbe {
         probe
-            .with("gh api /app", true, r#"{"slug":"agentcells-bot"}"#)
+            .with(
+                "gh api /app",
+                true,
+                r#"{"slug":"agentcells-bot","permissions":{"contents":"write","issues":"write","pull_requests":"write","metadata":"read"}}"#,
+            )
             .with("gh api /repos/octo/app/installation", true, r#"{"id":42}"#)
     }
 
@@ -530,6 +548,20 @@ private_key = "github-app.pem"
             stdout: String::new(),
             stderr: stderr.to_string(),
         }
+    }
+
+    #[test]
+    fn github_app_without_needed_permissions_fails() {
+        let (_dir, home, path) = setup_home();
+        let probe = healthy().with(
+            "gh api /app",
+            true,
+            r#"{"slug":"agentcells-bot","permissions":{"contents":"write","metadata":"read"}}"#,
+        );
+        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("issues: write"), "{}", check.detail);
+        assert!(check.fix.unwrap().contains("/permissions"));
     }
 
     #[test]

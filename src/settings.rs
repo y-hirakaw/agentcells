@@ -12,7 +12,9 @@ use crate::home::Home;
 /// コメントとレビューもCLIが目印（`[agentcells] <cell> round <n>`）を付けて投稿するので、AIには書かせない。
 /// ブランチのpushとPRの作成もCLIがするので、AIはworktreeの中でコミットするところまでにする。
 /// `gh api` は何でもできてしまうので、まとめて止める。
+/// `gh auth` は、ghのアカウントで動くときに `gh auth token` でトークンを取り出せるので止める。
 pub const DENY_GH: &[&str] = &[
+    "Bash(gh auth:*)",
     "Bash(git push:*)",
     "Bash(gh pr create:*)",
     "Bash(gh issue comment:*)",
@@ -46,25 +48,49 @@ pub fn runtime_settings(
 ) -> Result<serde_json::Value> {
     let mut deny: Vec<String> = DENY_GH.iter().map(|s| s.to_string()).collect();
     for path in placed_files {
-        deny.push(deny_read(path)?);
+        deny_read(&mut deny, path, "")?;
     }
-    deny.push(deny_read(&home.files_dir().join("**"))?);
-    deny.push(deny_read(&home.config_path())?);
+    deny_read(&mut deny, &home.files_dir(), "/**")?;
+    deny_read(&mut deny, &home.config_path(), "")?;
     if let Some(app) = &config.github_app {
-        deny.push(deny_read(&app.private_key)?);
+        deny_read(&mut deny, &app.private_key, "")?;
     }
     Ok(json!({ "permissions": { "deny": deny } }))
 }
 
-/// 絶対パスは `Read(//絶対パス)` の形で書く（先頭の / を重ねる）。
-fn deny_read(path: &Path) -> Result<String> {
+/// `Read(//絶対パス)` の形でdenyを足す（先頭の / を重ねる）。
+///
+/// Claude Codeが比べるパスと形が違うと効かないので、書いたままのパスと、
+/// シンボリックリンクや `..` を解いたパス（macOSの /var → /private/var など）の両方を足す。
+fn deny_read(deny: &mut Vec<String>, path: &Path, suffix: &str) -> Result<()> {
     if !path.is_absolute() {
         return Err(Error::new(format!(
             "Readを禁止するパスは絶対パスにしてください: {}",
             path.display()
         )));
     }
-    Ok(format!("Read(/{})", path.display()))
+    let mut paths = vec![path.to_path_buf()];
+    if let Some(resolved) = resolve(path)
+        && resolved != path
+    {
+        paths.push(resolved);
+    }
+    for p in paths {
+        let rule = format!("Read(/{}{suffix})", p.display());
+        if !deny.contains(&rule) {
+            deny.push(rule);
+        }
+    }
+    Ok(())
+}
+
+/// シンボリックリンクと `..` を解く。まだないファイルは、親ディレクトリを解いてつなぐ。
+fn resolve(path: &Path) -> Option<PathBuf> {
+    if let Ok(p) = path.canonicalize() {
+        return Some(p);
+    }
+    let parent = path.parent()?.canonicalize().ok()?;
+    Some(parent.join(path.file_name()?))
 }
 
 #[cfg(test)]
@@ -97,6 +123,7 @@ mod tests {
             "Bash(gh pr review:*)",
             "Bash(gh pr create:*)",
             "Bash(git push:*)",
+            "Bash(gh auth:*)",
         ] {
             assert!(deny.iter().any(|d| d == rule), "{rule} should be denied");
         }
@@ -129,6 +156,44 @@ mod tests {
             "Read(//home/me/.agentcells/files/**)",
         ] {
             assert!(deny.contains(&rule.to_string()), "{rule} should be denied");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_both_the_written_and_the_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("app.pem"), "key").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let config = Config {
+            github_app: Some(GithubApp {
+                id: "Iv23li".to_string(),
+                // config.toml からの相対パスで書くと .. が残る
+                private_key: link.join("../link/app.pem"),
+            }),
+            ..Config::default()
+        };
+        let home = Home::new(link.clone());
+        let deny: Vec<String> =
+            runtime_settings(&home, &config, &[]).unwrap()["permissions"]["deny"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_str().unwrap().to_string())
+                .collect();
+
+        let resolved = real.canonicalize().unwrap();
+        for rule in [
+            format!("Read(/{}/app.pem)", resolved.display()),
+            format!("Read(/{}/files/**)", resolved.display()),
+            format!("Read(/{}/config.toml)", resolved.display()),
+            format!("Read(/{}/config.toml)", link.display()),
+        ] {
+            assert!(deny.contains(&rule), "{rule} should be denied: {deny:?}");
         }
     }
 

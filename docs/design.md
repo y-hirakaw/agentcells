@@ -153,22 +153,28 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - `[github_app]` を書かなければ、ghのアカウントで書き込む。`doctor` はそのことを知らせ、Appを勧める
 - 今これを使って書き込むのは `labels sync` だけ。コメント、push、PR、レビューは `tick` で使う（予定）。読み取り（ラベルの一覧など）は、ghのアカウントのままで行う
 - Appのときは、JWT（有効期限9分）でリポジトリのインストールを探し、そのリポジトリだけに使えるトークン（有効期限1時間）を作る。Issueのリポジトリと作業するリポジトリが別なら、それぞれに作る
-- トークンに付ける権限は、Contents・Issues・Pull requestsの書き込みだけにする。Appに付けたほかの権限（Workflowsなど）は付けない
+- トークンには、使い道に要る権限だけを付ける。ラベルを作るならIssuesの書き込みだけ、作業（push、PR、コメント、レビュー）ならContents・Issues・Pull requestsの書き込み。Appに付けたほかの権限（Workflowsなど）は付けない
 - トークンもJWTも、コマンドの引数には書かず環境変数で渡す（`ps` で見えないように）。GitHubは `Authorization: token` で送ったJWTも受け付けるので、ghには `GH_TOKEN` で渡せる。`GH_HOST` もgithub.comにする（当面はgithub.comだけを扱う）
+- トークンを渡すghには、毎回まっさらな設定ディレクトリ（`GH_CONFIG_DIR`）を使う。`~/.config/gh/config.yml` はAIも書けて、`http_unix_socket` などで通信を横取りできるため
 - AIの実行（`claude -p`）にはトークンを渡さない。AIはコミットまでで、書き込みはCLIだけがする
-- AIの実行には、Appの秘密鍵、`config.toml`、`files/` の下を `Read(//絶対パス)` のdenyで読ませない。秘密鍵を読まれると、インストール先のすべてのリポジトリへのトークンを作れてしまうため（`files/**` のようなディレクトリの指定も効くことを、2.1.310で確かめた）
+- AIの実行には、Appの秘密鍵、`config.toml`、`files/` の下を `Read(//絶対パス)` のdenyで読ませない。秘密鍵を読まれると、インストール先のすべてのリポジトリへのトークンを作れてしまうため（`files/**` のようなディレクトリの指定も効くことを、2.1.310で確かめた）。パスは、書いたままの形と、シンボリックリンクや `..` を解いた形の両方をdenyに入れる
+- `gh auth` もdenyにする。ghのアカウントで動くときは、`gh auth token` で使う人のトークンを取り出せるため（これもAppを勧める理由の1つ）
 - Appのときは、AIのコミットの作者も `<Appの名前>[bot]` にする（予定。`GIT_AUTHOR_NAME` などで渡す）
-- `doctor` は、秘密鍵が読めるか、idと鍵が合っているか、設定にあるすべてのリポジトリにAppがインストールされているか、鍵を持ち主だけが読めるか（600など）、を確かめる。インストールされていなければ、インストールのURLを出す
+- `doctor` は、秘密鍵が読めるか、idと鍵が合っているか、Appに要る権限が付いているか、設定にあるすべてのリポジトリにAppがインストールされているか、鍵を持ち主だけが読めるか（600など）、を確かめる。足りなければ、権限の設定画面やインストールのURLを出す
 - Appに要る権限は、Contents（読み書き）、Issues（読み書き）、Pull requests（読み書き）、Metadata（読み取り）
 
-gitで書き込むとき（pushなど）は、worktreeの `.git/config` をAIが書き換えられることを前提にする。
+gitで書き込むとき（push）は、worktreeの `.git/config` をAIが書き換えられることを前提にする。
 
+- トークンを使うpushは、worktreeからはしない。CLIがpushのたびに新しいbareリポジトリを作り、トークンを渡さずにworktreeのブランチを移し（fetch）、そこから `https://github.com/<owner>/<repo>.git` にpushする。URLごとの `http.<URL>.sslVerify` やproxyは `-c` でも上書きできないので、AIが書いた設定を読まない場所からpushする
+- `GIT_ALLOW_PROTOCOL=https` で、https以外の通信を止める。設定より優先されるので、`url.ext::<コマンド>.insteadOf` のような書き換えでコマンドを動かされない（ブランチを移すときは `file` だけを許す）
 - `-c credential.helper=` で、使う人やリポジトリの設定にあるcredential helperを外してから、agentcellsのhelperを渡す。Appならトークンを、ghのアカウントなら `gh auth git-credential` を使う
-- helperはgithub.com宛てにだけ付ける（`credential.https://github.com.helper`）。remoteのURLや `url.*.insteadOf` をほかのホストに向けられても、トークンを渡さない
-- `core.hooksPath=/dev/null` でhooks（pre-pushなど）を動かさない。AIが置いたhookにトークンを渡さない
+- helperはgithub.com宛てにだけ付ける（`credential.https://github.com.helper`）。URLをほかのホストに向けられても、トークンを渡さない
+- `core.hooksPath=/dev/null` でhooks（pre-pushなど）を動かさない
 - 使う人とシステムのgitの設定は読まない（`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_CONFIG_NOSYSTEM=1`）。AIは `git config --global` も実行できるため
 - `GIT_TERMINAL_PROMPT=0` で、パスワードの入力を求めて止まらないようにする
-- テストでは本物のgitを動かし、トークンがgithub.com以外に渡らないことと、hooksが動かないことを確かめる
+- テストでは本物のgitを動かし、書き換えた設定（`ext::`、`insteadOf`、URLごとのsslVerifyとproxy、hooksPath、helper）があっても、トークンが漏れないことを確かめる。守りを外すとテストが落ちることも確かめた
+
+ここまでは、どれも守りを重ねるためのもの。AIのBashは使う人と同じ権限で動くので、許すコマンドを絞ること（`--settings` のallow）がいちばんの守りになる。どのコマンドを許すかは `tick` を作るときに決める（予定）。
 
 ## gitignoreされたファイルの配置
 

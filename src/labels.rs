@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::github::{self, Credentials};
+use crate::github::{self, Credentials, Purpose};
 use crate::home::RepoName;
 use crate::probe::Probe;
 
@@ -85,7 +85,7 @@ pub fn sync(
             .collect();
         if !dry_run && !missing.is_empty() {
             // 読むのはghのアカウントで、作るのは書き込みのアカウント（GitHub Appがあればそれ）で行う
-            let credentials = github::credentials(config, probe, &repo)?;
+            let credentials = github::credentials(config, probe, &repo, Purpose::Labels)?;
             for label in &missing {
                 create_label(&repo, label, probe, &credentials)?;
             }
@@ -314,8 +314,7 @@ prompt = "review.md"
                 .with(
                     &format!(
                         "gh api -X POST /app/installations/{i}/access_tokens -f repositories[]={name} \
-                         -f permissions[contents]=write -f permissions[issues]=write \
-                         -f permissions[pull_requests]=write"
+                         -f permissions[issues]=write"
                     ),
                     true,
                     &format!(r#"{{"token":"ghs_{name}"}}"#),
@@ -341,7 +340,9 @@ prompt = "review.md"
                 assert!(env.is_empty(), "{call}: {env:?}");
             }
         }
-        assert_eq!(creates, 10);
+        // ラベルがまだ1つもないので、リポジトリごとに要るラベルをすべて作る
+        let expected: usize = required(&config).values().map(Vec::len).sum();
+        assert_eq!(creates, expected);
     }
 
     #[test]
