@@ -1,4 +1,5 @@
 pub mod config;
+pub mod discussion;
 pub mod doctor;
 pub mod error;
 pub mod files;

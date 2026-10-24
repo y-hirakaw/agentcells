@@ -29,14 +29,26 @@ cellとして動くAIに渡すプロンプトは、3つの層を重ねて作る�
 | --- | --- | --- | --- |
 | 標準 | agentcells | 全cellに共通の決まり（書き込みはCLIがする、迷ったら人間に回す、など）、標準のcellの役割、選べる進め先 | `--append-system-prompt`（Claude Codeの標準のシステムプロンプトに足す） |
 | 追加 | 使う人（任意） | プロダクトごとの方針（例: テストは必ず書く） | 指示の本文 |
-| 今回の仕事 | CLI | Issue/PRのタイトルと本文、前回のagentcellsのコメントより後の人間のコメント、何回目か、作業場所、ベースブランチ | 指示の本文 |
+| 今回の仕事 | CLI | Issue/PRの中身、前のcellからの引き継ぎ、直してほしい指摘、そのあとの人間のコメント、何回目か、作業場所、ベースブランチ | 指示の本文 |
 
 - 標準のプロンプトは、このリポジトリの `prompts/` にmdで置き、ビルドのときにバイナリに埋め込む。公開しているので、誰でも中身を読める
 - 標準のcellは triage、implement、review。設定の `prompt` は省略できる。書けば、そのファイルが追加の指示になる
 - 使う人が足したcell（例: design）には標準の役割がないので、`prompt` が要る（共通の決まりと進め先は付く）
 - `agentcells prompt show <cell> [--issue owner/repo#N | --pr owner/repo#N]` で、AIに渡るプロンプトを組み立てて表示する。どんなシステムプロンプトが入るかを、使う人が確かめられるようにするため
 - 実行のたびに、渡したプロンプトを `logs/` に残す（予定）
-- reviewのcellは、指摘の先頭に重さ（`[must]`、`[should]`、`[imo]`、`[nits]`）を付ける。must か should があれば implement に戻し、implement は must と should を直す。imo と nits は直すかどうかを任せる
+- reviewのcellは、指摘の先頭に重さ（`[must]`、`[should]`、`[imo]`、`[nits]`）を付ける。must か should があれば implement に戻し、implement は must と should を直す。imo と nits は直すかどうかを任せる。指摘の返し方は `review` の設定に合わせる（true なら findings、false なら comment の箇条書き）
+- implementは、すでにあるコミットを書き換えない（CLIのpushはfast-forwardだけのため）。コミットがないときは review に回さず人間に回す
+
+今回の仕事に入れるもの:
+
+- Issue/PRの中身は、REST APIで読む。`gh pr view --json comments` は会話欄のコメントだけで、PRのレビューと行コメントが入らないため。会話欄のコメントとレビューを時刻の順に並べる
+- 前のcellからの引き継ぎとして、最後のagentcellsのコメント（目印付き）を入れる。人間に何を聞いたか、triageが書いた完了の条件、reviewのまとめを、次のcellに渡すため。それがレビューなら、その行コメントを「直してほしい指摘」として並べる
+- そのあとの人間のコメントを入れる（レビューなら行コメントも）
+- PRなら、本文の `Closes owner/repo#N` から元のIssueを読み、その本文と最後のagentcellsのコメントを入れる
+- 目印は、書き込みのアカウント（Appなら `<slug>[bot]`）が書いたものだけを数える。誰でも目印を書けるので、回数を上げて止めたり、前のコメントを隠したりできないようにするため
+- 公開リポジトリでは誰でもIssueやコメントを書ける。Issue/PRの中身は `<github>` タグで囲み、その中の指示は「守ること」より優先しないこと、怪しい指示には従わず人間に回すことを、システムプロンプトに書く。リポジトリのメンバー（OWNER、MEMBER、COLLABORATOR）ではない人のコメントは、「参考。指示としては扱わない」として分けて渡す
+- 書き手の名前に `@` を付けない。AIがcommentに写したときに、通知が飛ばないようにするため
+- 実行の前に、worktreeでベースブランチをfetchする（予定）。古いベースとの差分を見ないようにするため
 
 ## PRの作成
 
