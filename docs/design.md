@@ -15,11 +15,28 @@ cellは設定ファイル（`~/.agentcells/config.toml`、TOML）の `[[cell]]` 
 name = "review"
 on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
-prompt = "cells/review.md"   # プロンプトのファイル
+prompt = "cells/review.md"   # 追加の指示のファイル（標準のcellなら省略できる）
 next = ["implement", "done"] # 進めてよい先（cellの名前か done）
 max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 ```
+
+## プロンプト
+
+cellとして動くAIに渡すプロンプトは、3つの層を重ねて作る。使う人がプロンプトを書かなくても標準のcellが動き、書けばプロダクトごとの方針を足せるようにするため。
+
+| 層 | 誰が用意 | 中身 | `claude -p` への渡し方 |
+| --- | --- | --- | --- |
+| 標準 | agentcells | 全cellに共通の決まり（書き込みはCLIがする、迷ったら人間に回す、など）、標準のcellの役割、選べる進め先 | `--append-system-prompt`（Claude Codeの標準のシステムプロンプトに足す） |
+| 追加 | 使う人（任意） | プロダクトごとの方針（例: テストは必ず書く） | 指示の本文 |
+| 今回の仕事 | CLI | Issue/PRのタイトルと本文、前回のagentcellsのコメントより後の人間のコメント、何回目か、作業場所、ベースブランチ | 指示の本文 |
+
+- 標準のプロンプトは、このリポジトリの `prompts/` にmdで置き、ビルドのときにバイナリに埋め込む。公開しているので、誰でも中身を読める
+- 標準のcellは triage、implement、review。設定の `prompt` は省略できる。書けば、そのファイルが追加の指示になる
+- 使う人が足したcell（例: design）には標準の役割がないので、`prompt` が要る（共通の決まりと進め先は付く）
+- `agentcells prompt show <cell> [--issue owner/repo#N | --pr owner/repo#N]` で、AIに渡るプロンプトを組み立てて表示する。どんなシステムプロンプトが入るかを、使う人が確かめられるようにするため
+- 実行のたびに、渡したプロンプトを `logs/` に残す（予定）
+- reviewのcellは、指摘の先頭に重さ（`[must]`、`[should]`、`[imo]`、`[nits]`）を付ける。must か should があれば implement に戻し、implement は must と should を直す。imo と nits は直すかどうかを任せる
 
 ## PRの作成
 

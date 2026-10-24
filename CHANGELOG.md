@@ -6,6 +6,18 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.2.0] - 2026-10-24
+
+### 追加
+
+- **標準のプロンプト**（`prompts/`）
+  - 全cellに共通の決まりと、triage・implement・reviewの役割を用意し、バイナリに埋め込んだ。使う人がプロンプトを書かなくても、標準のcellが動くようにするため
+  - 設定の `prompt` は、標準のcellなら省略できるようにした。書けば、そのファイルが追加の指示として足される
+  - reviewは指摘に must / should / imo / nits の重さを付け、implementは must と should を直す
+- **`agentcells prompt show`**
+  - 標準のプロンプト、追加の指示、今回の仕事（`--issue` か `--pr` で指定したIssue/PRの内容）を組み立てて表示する。どんなシステムプロンプトが入るかが、使う人から見えないと困るため
+  - 今回の仕事には、前回のagentcellsのコメントより後の人間のコメントを入れる。質問への答えを、次の実行に渡すため
+
 ## [0.1.1] - 2026-10-24
 
 ### 直したこと

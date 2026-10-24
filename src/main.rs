@@ -3,13 +3,14 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use agentcells::config::Config;
+use agentcells::config::{Config, Target};
 use agentcells::doctor::{self, Status};
 use agentcells::error::{Error, Result};
 use agentcells::files;
 use agentcells::home::{Home, RepoName};
 use agentcells::labels;
 use agentcells::probe::SystemProbe;
+use agentcells::prompt;
 use agentcells::setup;
 
 #[derive(Parser)]
@@ -34,6 +35,26 @@ enum Commands {
     Labels {
         #[command(subcommand)]
         command: LabelsCommands,
+    },
+    /// cellとして動くAIに渡すプロンプトを扱う
+    Prompt {
+        #[command(subcommand)]
+        command: PromptCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromptCommands {
+    /// 標準のプロンプト、追加の指示、今回の仕事を組み立てて表示する
+    Show {
+        /// cellの名前
+        cell: String,
+        /// このIssueを今回の仕事にする（owner/repo#12）
+        #[arg(long, conflicts_with = "pr")]
+        issue: Option<String>,
+        /// このPRを今回の仕事にする（owner/repo#12）
+        #[arg(long)]
+        pr: Option<String>,
     },
 }
 
@@ -124,6 +145,18 @@ fn run(command: Commands) -> Result<ExitCode> {
                     println!("{repo}: {verb} {}", label.name);
                 }
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Prompt {
+            command: PromptCommands::Show { cell, issue, pr },
+        } => {
+            let config = Config::load(&home.config_path())?;
+            let target = match (&issue, &pr) {
+                (Some(issue), _) => Some((Target::Issue, issue.as_str())),
+                (_, Some(pr)) => Some((Target::PullRequest, pr.as_str())),
+                _ => None,
+            };
+            print!("{}", prompt::show(&config, &SystemProbe, &cell, target)?);
             Ok(ExitCode::SUCCESS)
         }
     }

@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::home::RepoName;
 use crate::labels;
+use crate::prompt;
 use crate::transition;
 
 /// `agentcells setup` が、設定ファイルがないときに置く雛形。
@@ -30,7 +31,7 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # name = "triage"
 # on = "issue"                       # issue か pull_request（両方なら ["issue", "pull_request"]）
 # label = "ac:triage"                # 拾うラベル（ac: で始める）
-# prompt = "cells/triage.md"         # プロンプトのファイル（このファイルからの相対パス）
+# prompt = "cells/triage.md"         # 追加の指示のファイル（このファイルからの相対パス）。標準のcell（triage、implement、review）なら省略できる
 # next = ["implement", "done"]       # 進めてよい先（cellの名前か done）。needs-human はいつでも選べる
 # review = false                     # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
 # max_rounds = 3                     # 往復の上限（1〜3。省略すると3）
@@ -93,8 +94,10 @@ pub struct Cell {
     pub on: Vec<Target>,
     /// 拾うラベル
     pub label: String,
-    /// プロンプトのファイル。読み込んだあとは絶対パスになっている
-    pub prompt: PathBuf,
+    /// 標準のプロンプトに足す、追加の指示のファイル。読み込んだあとは絶対パスになっている。
+    /// 標準のcell（triage、implement、review）なら省略できる
+    #[serde(default)]
+    pub prompt: Option<PathBuf>,
     /// 進めてよい先（cellの名前か `done`）。`needs-human` は書かなくても選べる
     #[serde(default)]
     pub next: Vec<String>,
@@ -192,7 +195,9 @@ impl Config {
                 .with_hint("TOMLの書き方と項目名を確かめてください")
         })?;
         for cell in &mut config.cells {
-            cell.prompt = base.join(&cell.prompt);
+            if let Some(prompt) = &mut cell.prompt {
+                *prompt = base.join(&*prompt);
+            }
         }
         if let Some(app) = &mut config.github_app {
             app.private_key = base.join(&app.private_key);
@@ -324,12 +329,17 @@ impl Config {
                     c.label
                 ));
             }
-            if !c.prompt.is_file() {
-                problems.push(format!(
+            match &c.prompt {
+                Some(prompt) if !prompt.is_file() => problems.push(format!(
                     "cell「{}」のプロンプト {} がありません",
                     c.name,
-                    c.prompt.display()
-                ));
+                    prompt.display()
+                )),
+                None if prompt::builtin(&c.name).is_none() => problems.push(format!(
+                    "cell「{}」には標準のプロンプトがないので、prompt にプロンプトのファイルを書いてください",
+                    c.name
+                )),
+                _ => {}
             }
             if c.review && c.on != [Target::PullRequest] {
                 problems.push(format!(
@@ -529,7 +539,7 @@ timeout_minutes = 10
         assert_eq!(triage.on, vec![Target::Issue]);
         assert_eq!(triage.max_rounds, DEFAULT_MAX_ROUNDS);
         assert_eq!(triage.timeout_minutes, DEFAULT_TIMEOUT_MINUTES);
-        assert_eq!(triage.prompt, dir.path().join("cells/triage.md"));
+        assert_eq!(triage.prompt, Some(dir.path().join("cells/triage.md")));
 
         let review = config.cell("review").unwrap();
         assert_eq!(review.on, vec![Target::PullRequest]);
@@ -591,6 +601,31 @@ timeout_minutes = 10
     fn rejects_system_labels_for_cells() {
         let text = VALID.replace("label = \"ac:review\"", "label = \"ac:working\"");
         assert!(problems_of(&text).contains("agentcellsが使うラベル"));
+    }
+
+    #[test]
+    fn builtin_cells_need_no_prompt_but_custom_cells_do() {
+        let text = VALID
+            .replace("prompt = \"cells/triage.md\"\n", "")
+            .replace("prompt = \"cells/review.md\"\n", "");
+        let dir = base_with_prompts(&[]);
+        let config = Config::parse(&text, dir.path()).unwrap();
+        assert_eq!(config.cell("triage").unwrap().prompt, None);
+
+        let custom = text
+            .replace("name = \"review\"", "name = \"design\"")
+            .replace("\"review\", \"done\"", "\"design\", \"done\"")
+            .replace(
+                "cells = [\"triage\", \"review\"]",
+                "cells = [\"triage\", \"design\"]",
+            );
+        let err = Config::parse(&custom, dir.path()).unwrap_err();
+        assert!(
+            err.message
+                .contains("cell「design」には標準のプロンプトがない"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
