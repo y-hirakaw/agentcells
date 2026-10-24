@@ -5,4 +5,6 @@ pub mod files;
 pub mod home;
 pub mod labels;
 pub mod probe;
+pub mod settings;
 pub mod setup;
+pub mod transition;

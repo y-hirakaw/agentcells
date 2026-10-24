@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::home::RepoName;
 use crate::labels;
+use crate::transition;
 
 /// `agentcells setup` が、設定ファイルがないときに置く雛形。
 pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://github.com/y-hirakaw/agentcells を見てください。
@@ -27,9 +28,10 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 #
 # [[cell]]
 # name = "triage"
-# on = "issue"                       # issue か pull_request
+# on = "issue"                       # issue か pull_request（両方なら ["issue", "pull_request"]）
 # label = "ac:triage"                # 拾うラベル（ac: で始める）
 # prompt = "cells/triage.md"         # プロンプトのファイル（このファイルからの相対パス）
+# next = ["implement", "done"]       # 進めてよい先（cellの名前か done）。needs-human はいつでも選べる
 # max_rounds = 3                     # 往復の上限（省略すると3）
 # timeout_minutes = 30               # 1回の実行の上限（省略すると30）
 "#;
@@ -62,11 +64,16 @@ pub struct Product {
 #[serde(deny_unknown_fields)]
 pub struct Cell {
     pub name: String,
-    pub on: Target,
+    /// 扱うもの。`"issue"` のように1つでも、`["issue", "pull_request"]` のようにリストでも書ける
+    #[serde(deserialize_with = "one_or_many")]
+    pub on: Vec<Target>,
     /// 拾うラベル
     pub label: String,
     /// プロンプトのファイル。読み込んだあとは絶対パスになっている
     pub prompt: PathBuf,
+    /// 進めてよい先（cellの名前か `done`）。`needs-human` は書かなくても選べる
+    #[serde(default)]
+    pub next: Vec<String>,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
     #[serde(default = "default_timeout_minutes")]
@@ -78,6 +85,31 @@ pub struct Cell {
 pub enum Target {
     Issue,
     PullRequest,
+}
+
+impl Target {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Target::Issue => "issue",
+            Target::PullRequest => "pull_request",
+        }
+    }
+}
+
+fn one_or_many<'de, D>(deserializer: D) -> std::result::Result<Vec<Target>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Target),
+        Many(Vec<Target>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(t) => vec![t],
+        OneOrMany::Many(ts) => ts,
+    })
 }
 
 fn default_max_rounds() -> u32 {
@@ -158,11 +190,21 @@ impl Config {
                 ));
             }
             for name in &p.cells {
-                if self.cell(name).is_none() {
+                let Some(cell) = self.cell(name) else {
                     problems.push(format!(
                         "product「{}」のcell「{name}」が [[cell]] に定義されていません",
                         p.name
                     ));
+                    continue;
+                };
+                // 遷移先のcellも、同じproductで動いていないと拾われない。
+                for next in &cell.next {
+                    if self.cell(next).is_some() && !p.cells.contains(next) {
+                        problems.push(format!(
+                            "product「{}」のcell「{name}」は「{next}」に進めますが、「{next}」がこのproductの cells にありません",
+                            p.name
+                        ));
+                    }
                 }
             }
         }
@@ -178,6 +220,23 @@ impl Config {
             }
             if !cell_names.insert(c.name.as_str()) {
                 problems.push(format!("cellの名前「{}」が重複しています", c.name));
+            }
+            if transition::is_reserved(&c.name) {
+                problems.push(format!(
+                    "cellの名前「{}」は遷移先として予約されています。別の名前にしてください",
+                    c.name
+                ));
+            }
+            for next in &c.next {
+                if next == &c.name {
+                    problems.push(format!("cell「{}」の next に自分自身があります", c.name));
+                } else if !transition::is_reserved(next) && self.cell(next).is_none() {
+                    problems.push(format!(
+                        "cell「{}」の next の「{next}」が [[cell]] に定義されていません（cellの名前か {} を書きます）",
+                        c.name,
+                        transition::DONE
+                    ));
+                }
             }
             if !c.label.starts_with(labels::PREFIX) || c.label.len() == labels::PREFIX.len() {
                 problems.push(format!(
@@ -204,6 +263,12 @@ impl Config {
                     "cell「{}」のプロンプト {} がありません",
                     c.name,
                     c.prompt.display()
+                ));
+            }
+            if c.on.is_empty() {
+                problems.push(format!(
+                    "cell「{}」の on が空です。issue か pull_request を書いてください",
+                    c.name
                 ));
             }
             if c.max_rounds == 0 {
@@ -246,6 +311,7 @@ name = "triage"
 on = "issue"
 label = "ac:triage"
 prompt = "cells/triage.md"
+next = ["review", "done"]
 
 [[cell]]
 name = "review"
@@ -255,6 +321,65 @@ prompt = "cells/review.md"
 max_rounds = 5
 timeout_minutes = 10
 "#;
+
+    #[test]
+    fn on_accepts_a_list() {
+        let text = VALID.replace(
+            "on = \"pull_request\"",
+            "on = [\"issue\", \"pull_request\"]",
+        );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(&text, dir.path()).unwrap();
+        assert_eq!(
+            config.cell("review").unwrap().on,
+            vec![Target::Issue, Target::PullRequest]
+        );
+        let empty = VALID.replace("on = \"pull_request\"", "on = []");
+        assert!(problems_of(&empty).contains("on が空"));
+    }
+
+    #[test]
+    fn next_defaults_to_empty() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(VALID, dir.path()).unwrap();
+        assert_eq!(config.cell("triage").unwrap().next, vec!["review", "done"]);
+        assert!(config.cell("review").unwrap().next.is_empty());
+    }
+
+    #[test]
+    fn rejects_bad_next() {
+        let text = VALID.replace(
+            "next = [\"review\", \"done\"]",
+            "next = [\"triage\", \"deploy\", \"done\", \"needs-human\"]",
+        );
+        let message = problems_of(&text);
+        assert!(message.contains("自分自身"), "{message}");
+        assert!(message.contains("「deploy」が [[cell]]"), "{message}");
+        assert!(!message.contains("「done」"), "{message}");
+        assert!(!message.contains("「needs-human」"), "{message}");
+    }
+
+    #[test]
+    fn rejects_next_outside_the_product() {
+        let text = VALID.replace("cells = [\"triage\", \"review\"]", "cells = [\"triage\"]");
+        let message = problems_of(&text);
+        assert!(
+            message.contains("「review」がこのproductの cells にありません"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_cell_names() {
+        let text = VALID
+            .replace("name = \"review\"", "name = \"done\"")
+            .replace("\"review\", \"done\"", "\"done\"")
+            .replace(
+                "cells = [\"triage\", \"review\"]",
+                "cells = [\"triage\", \"done\"]",
+            );
+        assert!(problems_of(&text).contains("予約されています"));
+    }
 
     fn base_with_prompts(names: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -280,13 +405,13 @@ timeout_minutes = 10
         assert_eq!(product.cells, vec!["triage", "review"]);
 
         let triage = config.cell("triage").unwrap();
-        assert_eq!(triage.on, Target::Issue);
+        assert_eq!(triage.on, vec![Target::Issue]);
         assert_eq!(triage.max_rounds, DEFAULT_MAX_ROUNDS);
         assert_eq!(triage.timeout_minutes, DEFAULT_TIMEOUT_MINUTES);
         assert_eq!(triage.prompt, dir.path().join("cells/triage.md"));
 
         let review = config.cell("review").unwrap();
-        assert_eq!(review.on, Target::PullRequest);
+        assert_eq!(review.on, vec![Target::PullRequest]);
         assert_eq!(review.max_rounds, 5);
     }
 

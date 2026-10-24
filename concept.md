@@ -33,27 +33,52 @@ cellは設定ファイル（`~/.agentcells/config.toml`、TOML）の `[[cell]]` 
 ```toml
 [[cell]]
 name = "review"
-on = "pull_request"          # issue か pull_request
+on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
 prompt = "cells/review.md"   # プロンプトのファイル
+next = ["implement", "done"] # 進めてよい先（cellの名前か done）
 max_rounds = 5               # 往復の上限（無限ループを防ぐ。省略すると3）
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 ```
 
 まだ決まっていないこと:
 
-- 出すもの（コメント、PR、ラベルの変更）をどう書くか
-- 止まって人間を呼ぶ条件をどう書くか
+- 出すもの（コメント、PR）をどう書くか
+
+### 遷移
+
+cellが終わったら、AIは「次はどこか」と、Issue/PRに残すコメントを返す。ラベルを付け替えるのはCLIだけで、許された遷移しかできないようにする。
+
+- 進めてよい先は、cellごとに `next` で決める。`needs-human`（人間に回す）は、迷ったら止まれるように、どのcellからでも選べる
+- `next` の先のcellは、同じproductの `cells` に入っていないと設定の確認でエラーになる
+- 選べる先は何重にも縛る
+  - B（`claude -p`）は `--json-schema` で `next` を選べる先の `enum` にする。許されていない先は出せない（出そうとすると結果が空になる）
+  - A（ルーティン）はAIが `agentcells finish --next <先>` を実行し、CLIが確かめる（予定）
+  - どちらも最後は同じ確認を通す。許されていない先、結果が空、往復の上限を超えた先は `ac:needs-human` に回し、理由をコメントする
+- AIにはラベルやIssue/PRの状態を変えさせない。`--settings` のdenyで `gh issue edit`、`gh pr edit`、`gh label`、`gh api` などを止める。実行の前後で `ac:` のラベルが変わっていたら、`ac:needs-human` に回す
+- 人間は自由にラベルを付け替えてよい。縛るのはAIの遷移だけ（`ac:needs-human` を外して `ac:implement` を付ければ再開できる）
+
+最小ループの遷移:
+
+| cell | 扱うもの | 進めてよい先 | 意味 |
+| --- | --- | --- | --- |
+| triage | Issue | implement, done | 着手する / 対応しない（Issueを閉じる） |
+| implement | Issue, PR | review | PRを作る（Issueから）か指摘を直して、レビューに回す |
+| review | PR | implement, done | 指摘を直してもらう / 問題なし |
+| （すべて） | | needs-human | 質問や検品を人間に頼む |
+
+- Issueを扱うcellから、PRを扱うcellに進むときは、実行の中で作られたPRにラベルを付ける。PRが作られていなければ人間に回す
+- `done` は、Issueなら閉じる。PRなら、自動マージの判断（dispatcher）ができるまでは `ac:needs-human` を付けて検品を頼む
 
 ### 2. 振り分け: dispatcher
 
 cellの外にいて、次の行き先を判断する。単に運ぶのではなく判断するところがコンベアとの違い。
 
-- 次にどのcellに回すか
+- 次にどのcellに回すか（今はcellのAIが `next` の中から選ぶ）
 - 人間に回すか（質問、検品）
 - 自動でマージしてよいか
 
-判断の基準をどこに書くか（設定ファイル、ラベル、AIの判断）は未定。
+自動マージの判断の基準をどこに書くかは未定。
 
 ### 3. 監視と改善: inspector / maintenance
 
@@ -149,6 +174,8 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - denyはallowに勝つ。projectのdenyと `--settings` のallowがぶつかると、読めなかった
 - 信頼していないディレクトリ（一度も対話で開いていないディレクトリ）では、projectの `settings.json` のallowが無視される。denyとhooksは効く。worktreeは毎回新しいパスなので、cellに必要なallowは `--settings` で渡す
 - `Read(//絶対パス)` の形でdenyを書ける。Readを禁止したファイルは、`Bash(cat:*)` を許していても `cat` で読めなかった（ただし、ほかのコマンドで読めないとまでは言えないので、秘密を守る仕組みの1つとして扱う）
+- `Bash(gh label:*)` や `Bash(gh api:*)` のdenyは、allowに同じものがあっても効いた（`gh repo view` のような許したコマンドは動く）
+- `--json-schema` の `enum` にない値は、AIに強く指示しても返せなかった。そのときは結果の `structured_output` が null になる
 - `--setting-sources project,local` でグローバル設定のhooksが止まるかは、まだ確かめていない
 
 ### gitignoreされたファイルの配置
@@ -201,7 +228,7 @@ CLIはRustで書く。
 
 ## 決まっていないこと
 
-- cellが終わったあと、次にどのラベルを付けるか（dispatcherの判断の書き方）
+- 往復の回数（cellがそのIssue/PRで何回動いたか）を、どこから数えるか
 - productの repos が複数あるとき、どのリポジトリで作業するか
 - 定期実行の間隔
 - Claude Desktopのルーティンで、作業フォルダや外のディレクトリへの権限をどう扱えるか（実機で確かめる）
