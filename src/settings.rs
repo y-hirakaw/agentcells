@@ -8,8 +8,11 @@ use crate::error::{Error, Result};
 
 /// AIにIssue/PRのラベルや状態を変えさせないためのdeny。ラベルの付け替えはCLIだけがする。
 /// コメントとレビューもCLIが目印（`[agentcells] <cell> round <n>`）を付けて投稿するので、AIには書かせない。
+/// ブランチのpushとPRの作成もCLIがするので、AIはworktreeの中でコミットするところまでにする。
 /// `gh api` は何でもできてしまうので、まとめて止める。
 pub const DENY_GH: &[&str] = &[
+    "Bash(git push:*)",
+    "Bash(gh pr create:*)",
     "Bash(gh issue comment:*)",
     "Bash(gh pr comment:*)",
     "Bash(gh pr review:*)",
@@ -58,15 +61,13 @@ mod tests {
             "Bash(gh api:*)",
             "Bash(gh pr comment:*)",
             "Bash(gh pr review:*)",
+            "Bash(gh pr create:*)",
+            "Bash(git push:*)",
         ] {
             assert!(deny.iter().any(|d| d == rule), "{rule} should be denied");
         }
-        // PRを作ることやコメントは止めない
-        assert!(
-            !deny
-                .iter()
-                .any(|d| d.as_str().unwrap().contains("pr create"))
-        );
+        // 読むだけのコマンドは止めない
+        assert!(!deny.iter().any(|d| d.as_str().unwrap().contains("pr view")));
     }
 
     #[test]

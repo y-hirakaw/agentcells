@@ -41,9 +41,13 @@ max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 ```
 
-まだ決まっていないこと:
+PRはCLIが作る。cellの中でPRができるときも、作るのはCLI:
 
-- PRをどう作るか（AIが `gh pr create` で作るか、CLIが作るか）
+- AIはworktreeの中でコミットするところまで。`git push` と `gh pr create` は使わせない
+- 実行が終わったら、CLIがベースブランチからのコミットがあるかを確かめ、あればブランチをpushしてPRを作る。なければ「PRが作られていない」として人間に回す
+- ブランチ名は `ac/<Issueのowner>-<Issueのrepo>-<Issue番号>`。Issueのリポジトリと作業するリポジトリが違ってもぶつからない
+- PRの本文は1行目に目印（`[agentcells] implement round 1`）、その下にAIのまとめと `Closes <owner>/<repo>#<番号>` を書く
+- PRのタイトルはIssueのタイトルにする
 
 ### 遷移
 

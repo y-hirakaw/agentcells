@@ -5,6 +5,7 @@ pub mod files;
 pub mod home;
 pub mod labels;
 pub mod marker;
+pub mod pr;
 pub mod probe;
 pub mod review;
 pub mod settings;
