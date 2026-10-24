@@ -125,74 +125,169 @@ fn gh_token_env<'a>(token: &'a str, gh_config: &'a Path) -> Result<Vec<(&'static
     ])
 }
 
-/// GitHub Appとして `gh api` を呼ぶ。JWTは環境変数で渡す（GitHubは `token` 方式で送ったJWTも受け付ける）。
-fn api_as_app(probe: &dyn Probe, jwt: &str, args: &[&str]) -> Result<serde_json::Value> {
-    api_as_app_or_not_found(probe, jwt, args)?.ok_or_else(|| {
-        let path = args.iter().find(|a| a.starts_with('/')).unwrap_or(&"");
+const API: &str = "https://api.github.com";
+
+/// GitHub Appとして、REST APIを呼ぶ。404のときは `None` を返す。
+///
+/// JWTは `Authorization: Bearer` で送らないと受け付けられない（`token` 方式では
+/// 「A JSON web token could not be decoded」になる）。ghは `GH_TOKEN` を `token` 方式で送るので、curlを使う。
+/// JWTは引数に書かず（`ps` で見えるため）、curlの設定として標準入力から渡す。
+/// `--disable` で `~/.curlrc` を読まない（AIも書けるため）。
+fn api_as_app_or_not_found(
+    probe: &dyn Probe,
+    jwt: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>> {
+    let args = curl_args(method, path, body);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let config = format!("header = \"Authorization: Bearer {jwt}\"\n");
+    let out = probe
+        .run_with_input("curl", &args, &[], Some(&config))
+        .ok_or_else(|| {
+            Error::new("curlが見つかりません")
+                .with_hint("GitHub Appを使うにはcurlが要ります。curlを入れてください")
+        })?;
+    if !out.success {
+        return Err(
+            Error::new(format!("GitHubに接続できません: {}", out.stderr.trim()))
+                .with_hint("ネットワークにつながっているか確かめてください"),
+        );
+    }
+    let (response, status) = out
+        .stdout
+        .rsplit_once('\n')
+        .and_then(|(body, code)| Some((body, code.trim().parse::<u16>().ok()?)))
+        .ok_or_else(|| Error::new("GitHubの応答を読めません"))?;
+    if status == 404 {
+        return Ok(None);
+    }
+    let json: serde_json::Value = serde_json::from_str(response).unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let message = json["message"].as_str().unwrap_or("").to_string();
+        return Err(ApiError { status, message }.into());
+    }
+    if json.is_null() {
+        return Err(Error::new("GitHubの応答を読めません"));
+    }
+    Ok(Some(json))
+}
+
+/// curlの引数。秘密は入れない。
+fn curl_args(method: &str, path: &str, body: Option<&serde_json::Value>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--config",
+        "-",
+        "--write-out",
+        "\n%{http_code}",
+        "--request",
+        method,
+        "--header",
+        "Accept: application/vnd.github+json",
+        "--header",
+        "X-GitHub-Api-Version: 2022-11-28",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(body) = body {
+        args.extend([
+            "--header".to_string(),
+            "Content-Type: application/json".to_string(),
+            "--data-binary".to_string(),
+            body.to_string(),
+        ]);
+    }
+    args.push(format!("{API}{path}"));
+    args
+}
+
+/// 404のときもエラーにする。
+fn api_as_app(
+    probe: &dyn Probe,
+    jwt: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value> {
+    api_as_app_or_not_found(probe, jwt, method, path, body)?.ok_or_else(|| {
         ApiError {
-            not_found: true,
-            message: format!("{path} が見つかりません (HTTP 404)"),
+            status: 404,
+            message: format!("{path} が見つかりません"),
         }
         .into()
     })
 }
 
-/// 404のときは `None` を返す。
-fn api_as_app_or_not_found(
-    probe: &dyn Probe,
-    jwt: &str,
-    args: &[&str],
-) -> Result<Option<serde_json::Value>> {
-    let args: Vec<&str> = std::iter::once("api").chain(args.iter().copied()).collect();
-    let gh_config = empty_gh_config()?;
-    let out = probe
-        .run_with_env("gh", &args, &gh_token_env(jwt, gh_config.path())?)
-        .ok_or_else(|| {
-            Error::new("ghが見つかりません").with_hint("`agentcells doctor` で確かめてください")
-        })?;
-    if !out.success {
-        let err = ApiError::from_stderr(&out.stderr);
-        return if err.not_found {
-            Ok(None)
-        } else {
-            Err(err.into())
-        };
-    }
-    serde_json::from_str(&out.stdout)
-        .map(Some)
-        .map_err(|e| Error::new(format!("GitHubの応答を読めません: {e}")))
-}
-
-/// `gh api` の失敗。404は「ない」として扱いたいので見分ける。
+/// GitHub APIの失敗。
 struct ApiError {
-    not_found: bool,
+    status: u16,
     message: String,
-}
-
-impl ApiError {
-    fn from_stderr(stderr: &str) -> Self {
-        let message = stderr.lines().last().unwrap_or("").trim().to_string();
-        Self {
-            not_found: message.contains("HTTP 404"),
-            message,
-        }
-    }
 }
 
 impl From<ApiError> for Error {
     fn from(e: ApiError) -> Self {
-        let hint = if e.message.contains("HTTP 401") {
-            "config.toml の [github_app] の id と秘密鍵が、同じGitHub Appのものか確かめてください"
-        } else if e.message.contains("HTTP 422") {
-            "GitHub Appの設定画面の Permissions で、Contents・Issues・Pull requests を Read and write にしてください"
-        } else {
-            "時間をおいてもう一度実行し、続くようならエラーの内容を確かめてください"
+        let hint = match e.status {
+            401 => {
+                "config.toml の [github_app] の id と秘密鍵が、同じGitHub Appのものか確かめてください"
+            }
+            422 => {
+                "GitHub Appの設定画面の Permissions で、Contents・Issues・Pull requests を Read and write にしてください"
+            }
+            _ => "時間をおいてもう一度実行し、続くようならエラーの内容を確かめてください",
         };
         Error::new(format!(
-            "GitHub Appとしての呼び出しに失敗しました: {}",
-            e.message
+            "GitHub Appとしての呼び出しに失敗しました: {} (HTTP {})",
+            e.message, e.status
         ))
         .with_hint(hint)
+    }
+}
+
+/// テストで、curlの呼び出しに決まった応答を返すためのキーと出力。
+#[cfg(test)]
+pub(crate) mod fake {
+    pub fn key(method: &str, path: &str, body: Option<&serde_json::Value>) -> String {
+        std::iter::once("curl".to_string())
+            .chain(super::curl_args(method, path, body))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn response(status: u16, body: &str) -> crate::probe::Output {
+        crate::probe::Output {
+            success: true,
+            stdout: format!("{body}\n{status}"),
+            stderr: String::new(),
+        }
+    }
+
+    /// リポジトリにAppがインストールされていて、トークンを作れるようにする。
+    pub fn with_installation(
+        probe: crate::probe::fake::FakeProbe,
+        repo: &str,
+        id: u64,
+        purpose: super::Purpose,
+        token: &str,
+    ) -> crate::probe::fake::FakeProbe {
+        let name = crate::home::RepoName::parse(repo).unwrap();
+        probe
+            .with_output(
+                key("GET", &format!("/repos/{repo}/installation"), None),
+                response(200, &format!(r#"{{"id":{id}}}"#)),
+            )
+            .with_output(
+                key(
+                    "POST",
+                    &format!("/app/installations/{id}/access_tokens"),
+                    Some(&super::token_request(&name, purpose)),
+                ),
+                response(201, &format!(r#"{{"token":"{token}"}}"#)),
+            )
     }
 }
 
@@ -219,7 +314,7 @@ impl AppInfo {
 }
 
 pub fn app_info(probe: &dyn Probe, jwt: &str) -> Result<AppInfo> {
-    let app = api_as_app(probe, jwt, &["/app"])?;
+    let app = api_as_app(probe, jwt, "GET", "/app", None)?;
     let slug = app["slug"]
         .as_str()
         .map(str::to_string)
@@ -238,7 +333,7 @@ pub fn app_info(probe: &dyn Probe, jwt: &str) -> Result<AppInfo> {
 /// リポジトリに入っているGitHub AppのインストールのID。入っていなければ `None`。
 pub fn installation_id(probe: &dyn Probe, jwt: &str, repo: &RepoName) -> Result<Option<u64>> {
     let path = format!("/repos/{repo}/installation");
-    let Some(installation) = api_as_app_or_not_found(probe, jwt, &[&path])? else {
+    let Some(installation) = api_as_app_or_not_found(probe, jwt, "GET", &path, None)? else {
         return Ok(None);
     };
     installation["id"]
@@ -256,18 +351,13 @@ fn installation_token(
     purpose: Purpose,
 ) -> Result<String> {
     let path = format!("/app/installations/{installation}/access_tokens");
-    let mut fields = vec![format!("repositories[]={}", repo.name)];
-    fields.extend(
-        purpose
-            .permissions()
-            .iter()
-            .map(|(name, level)| format!("permissions[{name}]={level}")),
-    );
-    let mut args = vec!["-X", "POST", path.as_str()];
-    for field in &fields {
-        args.extend(["-f", field.as_str()]);
-    }
-    let token = api_as_app(probe, jwt, &args)?;
+    let token = api_as_app(
+        probe,
+        jwt,
+        "POST",
+        &path,
+        Some(&token_request(repo, purpose)),
+    )?;
     token["token"]
         .as_str()
         .map(str::to_string)
@@ -281,6 +371,16 @@ pub enum Source {
     App,
     /// ghにログインしているアカウント
     Gh,
+}
+
+/// installation tokenを作るときに送る内容。
+fn token_request(repo: &RepoName, purpose: Purpose) -> serde_json::Value {
+    let permissions: serde_json::Map<String, serde_json::Value> = purpose
+        .permissions()
+        .iter()
+        .map(|(name, level)| (name.to_string(), serde_json::json!(level)))
+        .collect();
+    serde_json::json!({ "repositories": [repo.name], "permissions": permissions })
 }
 
 /// 書き込みに使う認証。どちらのアカウントでも、トークンを1つ持ち、ghとgitに環境変数で渡す。
@@ -402,6 +502,7 @@ fn gh_account_token(probe: &dyn Probe) -> Result<String> {
 mod tests {
     use super::*;
     use crate::probe::fake::FakeProbe;
+    use fake::with_installation;
     use jsonwebtoken::{DecodingKey, Validation, decode};
     use std::path::{Path, PathBuf};
 
@@ -458,23 +559,27 @@ mod tests {
     }
 
     #[test]
-    fn app_calls_pass_the_jwt_in_env_with_an_empty_gh_config() {
-        let probe = FakeProbe::default().with(
-            "gh api /app",
-            true,
-            r#"{"slug":"agentcells-bot","permissions":{"contents":"write","metadata":"read"}}"#,
+    fn app_calls_send_the_jwt_as_bearer_through_stdin() {
+        let probe = FakeProbe::default().with_output(
+            fake::key("GET", "/app", None),
+            fake::response(
+                200,
+                r#"{"slug":"agentcells-bot","permissions":{"contents":"write","metadata":"read"}}"#,
+            ),
         );
         let info = app_info(&probe, "JWT").unwrap();
         assert_eq!(info.slug, "agentcells-bot");
         assert_eq!(info.permissions["contents"], "write");
-        assert!(!probe.calls.borrow()[0].contains("JWT"));
 
-        let env: BTreeMap<String, String> = probe.envs.borrow()[0].iter().cloned().collect();
-        assert_eq!(env["GH_TOKEN"], "JWT");
-        assert_eq!(env["GH_HOST"], "github.com");
-        // AIが書けるghの設定（~/.config/gh）は読ませない。使い終わった一時ディレクトリは消えている
-        assert!(env["GH_CONFIG_DIR"].contains("agentcells-gh-"));
-        assert!(!Path::new(&env["GH_CONFIG_DIR"]).exists());
+        // JWTは引数にも環境変数にも入れず、curlの設定として標準入力で渡す
+        let call = &probe.calls.borrow()[0];
+        assert!(call.starts_with("curl --disable "), "{call}");
+        assert!(!call.contains("JWT"), "{call}");
+        assert!(probe.envs.borrow()[0].is_empty());
+        assert_eq!(
+            probe.inputs.borrow()[0].as_deref(),
+            Some("header = \"Authorization: Bearer JWT\"\n")
+        );
     }
 
     #[test]
@@ -498,14 +603,9 @@ mod tests {
 
     #[test]
     fn installation_is_none_when_not_installed() {
-        let mut probe = FakeProbe::default();
-        probe.outputs.insert(
-            "gh api /repos/octo/app/installation".to_string(),
-            crate::probe::Output {
-                success: false,
-                stdout: String::new(),
-                stderr: "gh: Not Found (HTTP 404)\n".to_string(),
-            },
+        let probe = FakeProbe::default().with_output(
+            fake::key("GET", "/repos/octo/app/installation", None),
+            fake::response(404, r#"{"message":"Not Found"}"#),
         );
         assert_eq!(
             installation_id(&probe, "JWT", &repo("octo/app")).unwrap(),
@@ -515,14 +615,12 @@ mod tests {
 
     #[test]
     fn bad_credentials_point_to_the_app_settings() {
-        let mut probe = FakeProbe::default();
-        probe.outputs.insert(
-            "gh api /app".to_string(),
-            crate::probe::Output {
-                success: false,
-                stdout: String::new(),
-                stderr: "gh: A JSON web token could not be decoded (HTTP 401)\n".to_string(),
-            },
+        let probe = FakeProbe::default().with_output(
+            fake::key("GET", "/app", None),
+            fake::response(
+                401,
+                r#"{"message":"A JSON web token could not be decoded"}"#,
+            ),
         );
         let err = app_info(&probe, "JWT").unwrap_err();
         assert!(err.message.contains("HTTP 401"), "{}", err.message);
@@ -554,15 +652,13 @@ mod tests {
 
     #[test]
     fn credentials_with_an_app_are_scoped_to_the_repo() {
-        let probe = FakeProbe::default()
-            .with("gh api /repos/octo/app/installation", true, r#"{"id":42}"#)
-            .with(
-                "gh api -X POST /app/installations/42/access_tokens -f repositories[]=app \
-                 -f permissions[contents]=write -f permissions[issues]=write \
-                 -f permissions[pull_requests]=write",
-                true,
-                r#"{"token":"ghs_secret"}"#,
-            );
+        let probe = with_installation(
+            FakeProbe::default(),
+            "octo/app",
+            42,
+            Purpose::Work,
+            "ghs_secret",
+        );
         let config = Config {
             github_app: Some(app()),
             ..Config::default()
@@ -582,31 +678,30 @@ mod tests {
 
     #[test]
     fn label_tokens_only_get_issue_permissions() {
-        let probe = FakeProbe::default()
-            .with("gh api /repos/octo/app/installation", true, r#"{"id":42}"#)
-            .with(
-                "gh api -X POST /app/installations/42/access_tokens -f repositories[]=app \
-                 -f permissions[issues]=write",
-                true,
-                r#"{"token":"ghs_labels"}"#,
-            );
+        let probe = with_installation(
+            FakeProbe::default(),
+            "octo/app",
+            42,
+            Purpose::Labels,
+            "ghs_labels",
+        );
         let config = Config {
             github_app: Some(app()),
             ..Config::default()
         };
         credentials(&config, &probe, &repo("octo/app"), Purpose::Labels).unwrap();
+        let call = probe.calls.borrow().last().unwrap().clone();
+        assert!(
+            call.contains(r#"{"permissions":{"issues":"write"},"repositories":["app"]}"#),
+            "{call}"
+        );
     }
 
     #[test]
     fn credentials_fail_when_the_app_is_not_installed() {
-        let mut probe = FakeProbe::default();
-        probe.outputs.insert(
-            "gh api /repos/octo/app/installation".to_string(),
-            crate::probe::Output {
-                success: false,
-                stdout: String::new(),
-                stderr: "gh: Not Found (HTTP 404)\n".to_string(),
-            },
+        let probe = FakeProbe::default().with_output(
+            fake::key("GET", "/repos/octo/app/installation", None),
+            fake::response(404, r#"{"message":"Not Found"}"#),
         );
         let config = Config {
             github_app: Some(app()),

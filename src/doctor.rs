@@ -211,6 +211,7 @@ fn check_path(home: &Home, path_env: Option<&OsStr>) -> Check {
 }
 
 /// 設定ファイルを確かめる。読めたら、ほかの確認に使えるように設定も返す。
+/// 中身に問題があっても、TOMLとして読めれば返す（プロンプトがなくても、GitHubの確認は進められるように）。
 fn check_config(home: &Home) -> (Check, Option<Config>) {
     const NAME: &str = "config";
     let path = home.config_path();
@@ -231,7 +232,7 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
                 err.hint
                     .unwrap_or_else(|| "設定ファイルを直してください".to_string()),
             );
-            return (check, None);
+            return (check, Config::load_unchecked(&path));
         }
     };
     let check = match &config {
@@ -366,6 +367,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::fake;
     use crate::probe::fake::FakeProbe;
     use std::ffi::OsString;
 
@@ -409,12 +411,17 @@ private_key = "github-app.pem"
     /// GitHub Appの呼び出しに答える。JWTは環境変数で渡るので、引数は毎回同じになる。
     fn with_app(probe: FakeProbe) -> FakeProbe {
         probe
-            .with(
-                "gh api /app",
-                true,
-                r#"{"slug":"agentcells-bot","permissions":{"contents":"write","issues":"write","pull_requests":"write","metadata":"read"}}"#,
+            .with_output(
+                fake::key("GET", "/app", None),
+                fake::response(
+                    200,
+                    r#"{"slug":"agentcells-bot","permissions":{"contents":"write","issues":"write","pull_requests":"write","metadata":"read"}}"#,
+                ),
             )
-            .with("gh api /repos/octo/app/installation", true, r#"{"id":42}"#)
+            .with_output(
+                fake::key("GET", "/repos/octo/app/installation", None),
+                fake::response(200, r#"{"id":42}"#),
+            )
     }
 
     /// PATHに入っていて、GitHub Appを使う正しい設定ファイルがある置き場所を作る。
@@ -542,26 +549,38 @@ private_key = "github-app.pem"
         let _ = (path, mode);
     }
 
-    fn failing(stderr: &str) -> crate::probe::Output {
-        crate::probe::Output {
-            success: false,
-            stdout: String::new(),
-            stderr: stderr.to_string(),
-        }
+    fn installation(repo: &str) -> String {
+        fake::key("GET", &format!("/repos/{repo}/installation"), None)
+    }
+
+    fn not_found() -> crate::probe::Output {
+        fake::response(404, r#"{"message":"Not Found"}"#)
     }
 
     #[test]
     fn github_app_without_needed_permissions_fails() {
         let (_dir, home, path) = setup_home();
-        let probe = healthy().with(
-            "gh api /app",
-            true,
-            r#"{"slug":"agentcells-bot","permissions":{"contents":"write","metadata":"read"}}"#,
+        let probe = healthy().with_output(
+            fake::key("GET", "/app", None),
+            fake::response(
+                200,
+                r#"{"slug":"agentcells-bot","permissions":{"contents":"write","metadata":"read"}}"#,
+            ),
         );
         let check = find(&run(&home, Some(&path), &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("issues: write"), "{}", check.detail);
         assert!(check.fix.unwrap().contains("/permissions"));
+    }
+
+    #[test]
+    fn github_is_checked_even_when_prompts_are_missing() {
+        let (_dir, home, path) = setup_home();
+        std::fs::remove_file(home.root().join("triage.md")).unwrap();
+        let checks = run(&home, Some(&path), &healthy());
+        assert_eq!(find(&checks, "config").status, Status::Fail);
+        let github = find(&checks, "github");
+        assert_eq!(github.status, Status::Ok, "{}", github.detail);
     }
 
     #[test]
@@ -585,7 +604,7 @@ private_key = "github-app.pem"
             "{}",
             check.detail
         );
-        assert!(!probe.calls.borrow().iter().any(|c| c.starts_with("gh api")));
+        assert!(!probe.calls.borrow().iter().any(|c| c.starts_with("curl")));
     }
 
     #[test]
@@ -596,15 +615,10 @@ private_key = "github-app.pem"
             "repos = [\"octo/app\", \"octo/web\", \"octo/api\"]",
         );
         std::fs::write(home.config_path(), format!("{config}{GITHUB_APP}")).unwrap();
-        let mut probe = healthy().with("gh api /repos/octo/web/installation", true, r#"{"id":7}"#);
-        probe.outputs.insert(
-            "gh api /repos/octo/api/installation".to_string(),
-            failing("gh: Not Found (HTTP 404)\n"),
-        );
-        probe.outputs.insert(
-            "gh api /repos/octo/app/installation".to_string(),
-            failing("gh: Not Found (HTTP 404)\n"),
-        );
+        let probe = healthy()
+            .with_output(installation("octo/web"), fake::response(200, r#"{"id":7}"#))
+            .with_output(installation("octo/api"), not_found())
+            .with_output(installation("octo/app"), not_found());
         let check = find(&run(&home, Some(&path), &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(
@@ -617,10 +631,9 @@ private_key = "github-app.pem"
     #[test]
     fn server_errors_are_not_reported_as_missing_installations() {
         let (_dir, home, path) = setup_home();
-        let mut probe = healthy();
-        probe.outputs.insert(
-            "gh api /repos/octo/app/installation".to_string(),
-            failing("gh: Server Error (HTTP 500)\n"),
+        let probe = healthy().with_output(
+            installation("octo/app"),
+            fake::response(500, r#"{"message":"Server Error"}"#),
         );
         let check = find(&run(&home, Some(&path), &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
@@ -645,15 +658,7 @@ private_key = "github-app.pem"
     #[test]
     fn github_app_not_installed_fails_with_install_url() {
         let (_dir, home, path) = setup_home();
-        let mut probe = healthy();
-        probe.outputs.insert(
-            "gh api /repos/octo/app/installation".to_string(),
-            crate::probe::Output {
-                success: false,
-                stdout: String::new(),
-                stderr: "gh: Not Found (HTTP 404)\n".to_string(),
-            },
-        );
+        let probe = healthy().with_output(installation("octo/app"), not_found());
         let check = find(&run(&home, Some(&path), &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("octo/app"), "{}", check.detail);
@@ -668,14 +673,12 @@ private_key = "github-app.pem"
     #[test]
     fn github_app_with_wrong_key_fails() {
         let (_dir, home, path) = setup_home();
-        let mut probe = healthy();
-        probe.outputs.insert(
-            "gh api /app".to_string(),
-            crate::probe::Output {
-                success: false,
-                stdout: String::new(),
-                stderr: "gh: A JSON web token could not be decoded (HTTP 401)\n".to_string(),
-            },
+        let probe = healthy().with_output(
+            fake::key("GET", "/app", None),
+            fake::response(
+                401,
+                r#"{"message":"A JSON web token could not be decoded"}"#,
+            ),
         );
         let check = find(&run(&home, Some(&path), &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
@@ -697,11 +700,7 @@ private_key = "github-app.pem"
     fn readable_private_key_is_reported_even_when_another_check_fails() {
         let (_dir, home, path) = setup_home();
         set_mode(&home.root().join("github-app.pem"), 0o644);
-        let mut probe = healthy();
-        probe.outputs.insert(
-            "gh api /repos/octo/app/installation".to_string(),
-            failing("gh: Not Found (HTTP 404)\n"),
-        );
+        let probe = healthy().with_output(installation("octo/app"), not_found());
         let check = find(&run(&home, Some(&path), &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("chmod 600"));

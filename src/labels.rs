@@ -314,20 +314,13 @@ prompt = "review.md"
         );
         for (i, repo) in ["octo/app", "octo/issues", "octo/web"].iter().enumerate() {
             let name = repo.split('/').nth(1).unwrap();
-            probe = probe
-                .with(
-                    &format!("gh api /repos/{repo}/installation"),
-                    true,
-                    &format!(r#"{{"id":{i}}}"#),
-                )
-                .with(
-                    &format!(
-                        "gh api -X POST /app/installations/{i}/access_tokens -f repositories[]={name} \
-                         -f permissions[issues]=write"
-                    ),
-                    true,
-                    &format!(r#"{{"token":"ghs_{name}"}}"#),
-                );
+            probe = crate::github::fake::with_installation(
+                probe,
+                repo,
+                i as u64,
+                Purpose::Labels,
+                &format!("ghs_{name}"),
+            );
         }
 
         sync(&config, &probe, false).unwrap();

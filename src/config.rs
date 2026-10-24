@@ -179,8 +179,14 @@ impl Config {
         })
     }
 
-    /// 設定を読んで確かめる。プロンプトのパスは `base` からの相対パスとして解決する。
-    pub fn parse(text: &str, base: &Path) -> Result<Self> {
+    /// 設定を読むが、中身は確かめない。設定に問題があっても、ほかの確認（`doctor` のGitHubの確認など）を進めるために使う。
+    pub fn load_unchecked(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        Self::read(&text, path.parent().unwrap_or(Path::new("."))).ok()
+    }
+
+    /// TOMLを読み、ファイルのパスを `base` からの相対パスとして解決する。
+    fn read(text: &str, base: &Path) -> Result<Self> {
         let mut config: Config = toml::from_str(text).map_err(|e| {
             Error::new(e.to_string().trim_end().to_string())
                 .with_hint("TOMLの書き方と項目名を確かめてください")
@@ -191,6 +197,12 @@ impl Config {
         if let Some(app) = &mut config.github_app {
             app.private_key = base.join(&app.private_key);
         }
+        Ok(config)
+    }
+
+    /// 設定を読んで確かめる。プロンプトのパスは `base` からの相対パスとして解決する。
+    pub fn parse(text: &str, base: &Path) -> Result<Self> {
+        let config = Self::read(text, base)?;
         let problems = config.problems();
         if problems.is_empty() {
             Ok(config)

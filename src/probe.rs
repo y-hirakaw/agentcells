@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// 外部コマンドを実行した結果。
 #[derive(Debug, Clone, Default)]
@@ -16,18 +17,47 @@ pub trait Probe {
     }
 
     /// 環境変数を足して実行する。トークンは引数ではなく環境変数で渡す。
-    fn run_with_env(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Option<Output>;
+    fn run_with_env(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Option<Output> {
+        self.run_with_input(program, args, env, None)
+    }
+
+    /// 環境変数と標準入力を渡して実行する。引数や環境変数で渡せない秘密（curlのヘッダーなど）は標準入力で渡す。
+    fn run_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        input: Option<&str>,
+    ) -> Option<Output>;
 }
 
 pub struct SystemProbe;
 
 impl Probe for SystemProbe {
-    fn run_with_env(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Option<Output> {
-        let out = Command::new(program)
+    fn run_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        input: Option<&str>,
+    ) -> Option<Output> {
+        let mut child = Command::new(program)
             .args(args)
             .envs(env.iter().copied())
-            .output()
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .ok()?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // 読まずに終わるコマンドもあるので、書けなくてもエラーにしない
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        let out = child.wait_with_output().ok()?;
         Some(Output {
             success: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -43,7 +73,7 @@ pub(crate) mod fake {
     use std::collections::HashMap;
 
     /// コマンドと引数の組に、決まった結果を返す。呼ばれたコマンドは `calls` に、
-    /// 渡された環境変数は `envs` に残る。
+    /// 渡された環境変数は `envs` に、標準入力は `inputs` に残る。
     /// 登録していないコマンドは、`fallback` があればそれを、なければ見つからない扱いにする。
     #[derive(Default)]
     pub struct FakeProbe {
@@ -51,6 +81,7 @@ pub(crate) mod fake {
         pub fallback: Option<Output>,
         pub calls: RefCell<Vec<String>>,
         pub envs: RefCell<Vec<Vec<(String, String)>>>,
+        pub inputs: RefCell<Vec<Option<String>>>,
     }
 
     impl FakeProbe {
@@ -66,6 +97,11 @@ pub(crate) mod fake {
             self
         }
 
+        pub fn with_output(mut self, command: String, output: Output) -> Self {
+            self.outputs.insert(command, output);
+            self
+        }
+
         pub fn with_fallback(mut self, success: bool) -> Self {
             self.fallback = Some(Output {
                 success,
@@ -76,11 +112,12 @@ pub(crate) mod fake {
     }
 
     impl Probe for FakeProbe {
-        fn run_with_env(
+        fn run_with_input(
             &self,
             program: &str,
             args: &[&str],
             env: &[(&str, &str)],
+            input: Option<&str>,
         ) -> Option<Output> {
             let key = std::iter::once(program)
                 .chain(args.iter().copied())
@@ -92,6 +129,7 @@ pub(crate) mod fake {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
             );
+            self.inputs.borrow_mut().push(input.map(str::to_string));
             self.outputs
                 .get(&key)
                 .cloned()
