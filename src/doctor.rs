@@ -258,6 +258,15 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
         );
         return (check, Some(config));
     }
+    let warnings = settings::sandbox_warnings(&config);
+    if !warnings.is_empty() {
+        let check = Check::warn(
+            NAME,
+            warnings.join("\n"),
+            "開けた場所の秘密は、AIが書き換えたビルドを通して読まれたり、外へ送られたりしえます",
+        );
+        return (check, Some(config));
+    }
     let check = match &config {
         config if config.products.is_empty() => Check::warn(
             NAME,
@@ -779,6 +788,19 @@ private_key = "github-app.pem"
         let check = find(&run(&home, Some(&path), &healthy()), "PATH").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("export PATH="));
+    }
+
+    #[test]
+    fn wide_sandbox_reads_warn() {
+        let (_dir, home, path) = setup_home();
+        let text = CONFIG.replace(
+            "cells = [\"triage\"]",
+            "cells = [\"triage\"]\n\n[product.sandbox]\nread = [\"~\"]",
+        );
+        std::fs::write(home.config_path(), format!("{text}{GITHUB_APP}")).unwrap();
+        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("広すぎます"), "{}", check.detail);
     }
 
     #[test]

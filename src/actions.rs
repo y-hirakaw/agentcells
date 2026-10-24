@@ -39,6 +39,9 @@ pub struct Context {
     /// 秘密を探すbetterleaks（絶対パス）。`tick` がsandboxの外で探して渡す。
     /// AIは環境変数を変えて呼べないが、PATHで探すと別のものを動かされうるので、場所を決めておく
     pub scanner: PathBuf,
+    /// ビルドやテストの一時ディレクトリ（仕事ごと）。Claude Codeがsandboxの中で使わせる `/tmp/claude-<uid>` は、
+    /// 使う人のほかのセッションと共有なので、`run` のコマンドにはこちらを `TMPDIR` で渡す
+    pub tmp: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,10 +419,15 @@ fn scan_secrets(context: &Context) -> Result<()> {
     let diff = git_output(
         &context.worktree,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff",
             "--cached",
             "--no-color",
             "--no-ext-diff",
+            // AIが書ける .git/config で、見出しの形を変えさせない（変わっても調べる中身は同じで、出す名前だけがずれる）
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "--no-textconv",
             "--text",
             "--no-renames",
@@ -598,6 +606,7 @@ pub fn run(context: &Context, name: &str) -> Result<i32> {
         .arg("-c")
         .arg(command)
         .current_dir(&context.worktree)
+        .env("TMPDIR", &context.tmp)
         .status()
         .map_err(|e| Error::new(format!("「{command}」を実行できません: {e}")))?;
     Ok(status.code().unwrap_or(1))
@@ -632,11 +641,13 @@ mod tests {
         git(&work, &["commit", "-q", "-m", "base"]);
         std::fs::write(dir.path().join("outside.txt"), "keep").unwrap();
         let scanner = fake_scanner(dir.path());
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
         let context = Context {
             worktree: work,
             commands: [(
                 "hello".to_string(),
-                "echo hi > made.txt; exit 3".to_string(),
+                "echo \"$TMPDIR\" > made.txt; exit 3".to_string(),
             )]
             .into_iter()
             .collect(),
@@ -647,6 +658,7 @@ mod tests {
                 email: "t@example.com".to_string(),
             },
             scanner,
+            tmp,
         };
         (dir, context)
     }
@@ -862,7 +874,9 @@ echo "[]"
     fn run_executes_only_configured_commands_in_the_worktree() {
         let (_dir, ctx) = setup();
         assert_eq!(run(&ctx, "hello").unwrap(), 3);
-        assert!(ctx.worktree.join("made.txt").exists());
+        // 一時ディレクトリは、ほかのセッションと共有しない仕事ごとの場所にする
+        let made = std::fs::read_to_string(ctx.worktree.join("made.txt")).unwrap();
+        assert_eq!(made.trim(), ctx.tmp.display().to_string());
         let err = run(&ctx, "rm-everything").unwrap_err();
         assert!(err.hint.unwrap().contains("hello"));
     }

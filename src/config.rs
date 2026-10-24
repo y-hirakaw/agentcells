@@ -31,8 +31,9 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 #
 # [product.sandbox]                  # AIが動かすコマンドに開ける場所。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない
 # read = ["~/.npm", "~/.nvm"]        # ホームの下で読ませる場所（ツールチェーンやキャッシュ）。開けた場所の秘密は読まれうる
-# network = ["registry.npmjs.org"]   # 通信してよい先（*.example.com も書ける）
+# network = ["registry.npmjs.org"]   # 通信してよい先。取得元のホストを具体的に書く（*.amazonaws.com のような広いワイルドカードは、外へ送る道になる）
 # read_placed = []                   # files/ から置いたファイルのうち、ビルドに読ませるもの（リポジトリからの相対パス）
+# bind_localhost = false             # テストが localhost でサーバーを開けるようにする
 #
 # cell: どのラベルが付いたIssue/PRを拾い、どのプロンプトで動くか
 #
@@ -113,9 +114,13 @@ pub struct Sandbox {
     /// 読ませると、AIが書き換えたビルドを通して中身を取り出せるので、要るものだけにする
     #[serde(default)]
     pub read_placed: Vec<PathBuf>,
-    /// 通信してよい先（`registry.npmjs.org` や `*.gradle.org` のようなドメイン）
+    /// 通信してよい先（`registry.npmjs.org` のようなドメイン）。取得元のホストを具体的に書く。
+    /// `*.amazonaws.com` のようなワイルドカードは、誰でも書ける置き場所を含み、外へ送れてしまう
     #[serde(default)]
     pub network: Vec<String>,
+    /// テストが手元（localhost）でサーバーを開けるようにする
+    #[serde(default)]
+    pub bind_localhost: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

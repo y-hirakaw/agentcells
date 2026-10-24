@@ -194,7 +194,10 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 
 sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
 
-- 書けるのは、作業場所と、その `.git` の実体（`gitdirs/` の下の、その仕事の分）だけ。`repos/` の元のリポジトリには書けない
+- 書けるのは、作業場所と、その `.git` の実体（`gitdirs/` の下の、その仕事の分）と、その仕事の一時ディレクトリだけ。`repos/` の元のリポジトリには書けない
+- 例外として、Claude Codeが使わせる一時ディレクトリ（`/tmp/claude-<uid>`）は読み書きできる。そこは使う人のほかのClaude Codeのセッション（scratchpadなど）と共有なので、cellのビルドから、対話で動かしているセッションの一時ファイルを読んだり書き換えたりできる（残る危険）。Claude Codeは、sandboxの中のシェルにそこを使わせ、読み書きを止めるとすべてのコマンドが失敗する。設定の `env` の `TMPDIR` も `CLAUDE_CODE_TMPDIR` も、シェルの使う場所を変えない（2.1.310で確かめた）。cellを専用のOSのユーザーで動かすと分けられる（「まだ決めていないこと」）
+- ビルドとテストには、`agentcells cell run` が仕事ごとの一時ディレクトリを `TMPDIR` で渡す
+- macOSの本当の一時ディレクトリ（`/var/folders/.../T`）は読める。xcrunやJavaがそこを使い、読ませないとビルドが止まるため。ほかのアプリの一時ファイルが読める（残る危険）
 - 使う人のホームの下は、読ませない。読めるのは、今の仕事の作業場所と `.git` の実体、共有している元のリポジトリのオブジェクト、今の仕事のファイル、sandboxで動かすプログラム（agentcellsとbetterleaks）、productの `[product.sandbox]` の `read` に書いた場所だけ。ホームの外（`/usr`、`/opt/homebrew` など）は読める
   - 「読ませない場所」を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまう。読ませる場所を並べる形にし、足りなければビルドが失敗して人間に回るので、何を足せばよいかがわかる。開けた場所の秘密は読まれうるので、何を開けるかは使う人が決める
 - `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は、`read` で広い場所（`~` や `~/.config`）を開けても読ませない。sandboxは、より細かく書いた決まりを優先するため。これらの中を `read` に書くと、`doctor` と実行の前に断る（細かく書くと、開ける側が優先されてしまうため）
@@ -213,6 +216,8 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
 - sandboxは、作業ディレクトリの直下の `.git` には、`allowWrite` に入れても書かせない。`--separate-git-dir` で外に置いた `.git` の実体を `allowWrite` に入れると、コミットできる。元のリポジトリの `.git/config` には書けず、オブジェクトだけ読める
 - 置いた秘密のファイルは、大文字・小文字を変えた名前でも、Readが止まる
 - sandboxの中では `TMPDIR` が `/tmp/claude-<uid>` になり、そこには書ける。`/tmp` そのものには書けない。worktreeを一時ディレクトリに置かない
+- `/tmp/claude-<uid>` は、同じ人のほかのセッションと共有で、sandboxの中から、ほかのセッションのscratchpadを読み書きできた。`denyWrite` に入れると、Claude Code自身がコマンドを動かせなくなる（`/tmp/claude-<uid>/cwd-...` に書けない）。設定の `env` の `TMPDIR` は効かない。`denyRead` に `/tmp` を入れても、Claude Codeがコマンドの出力やcwdを `/tmp/claude-<uid>` に書けず、すべてのコマンドが終了コード1になる（`cat` は標準出力に書けない）。起動するときの `CLAUDE_CODE_TMPDIR` は、Claude Code自身の一部のファイルを動かすが、シェルの `/tmp/claude-<uid>/cwd-...` は動かない
+- テストが `127.0.0.1` でサーバーを開くには、`network.allowLocalBinding` が要る
 - `permissions.blockReadsOutsideWorkingDirectories` は、`agentcells cell` が今の仕事のファイルを読めなくなり、ホームの下のツールチェーンも読めなくなるので使わない
 - sandboxは `GIT_CONFIG_*` の環境変数で `safe.directory` などを足す。作者の名前は足さない
 
@@ -244,9 +249,12 @@ productごとに、AIが動かすコマンド（ビルドやテストを含む�
 ```toml
 [product.sandbox]
 read = ["~/.gradle", "~/Library/Android/sdk"]          # ホームの下で読ませる場所（`~/` で始めるか絶対パス）
-network = ["services.gradle.org", "dl.google.com"]    # 通信してよい先（*.example.com も書ける）
+network = ["services.gradle.org", "dl.google.com"]    # 通信してよい先。取得元のホストを具体的に書く
 read_placed = ["app/google-services.json"]            # files/ から置いたファイルのうち、ビルドに読ませるもの
+bind_localhost = false                                # テストが localhost でサーバーを開けるようにする
 ```
+
+- 通信先は、取得元のホスト（`repo.maven.apache.org`、`dl.google.com` など）を具体的に書く。`*.amazonaws.com`、`*.googleapis.com`、`*.blob.core.windows.net`、`*.cloudfront.net` のようなワイルドカードは、攻撃者が用意した誰でも書ける置き場所を含み、外へ送れてしまう。`doctor` は、ワイルドカードと、広すぎる `read`（`~`、`~/.config`、`~/Library`、`~/Documents` など）を知らせる
 
 - 開けた場所の秘密は、AIが書き換えたビルドを通して読まれうる。何を開けるかは使う人が決める
 - `read` に、読ませない場所（`~/.agentcells`、ghの設定、`~/.ssh` など）の中を書くと、`doctor` と実行の前に断る
@@ -254,7 +262,14 @@ read_placed = ["app/google-services.json"]            # files/ から置いた�
 
 ### 秘密を探す
 
-`agentcells cell commit` は、コミットに足す行を [betterleaks](https://github.com/betterleaks/betterleaks) で調べ、秘密らしいものがあればコミットせずに、ファイルと行と種類を出す。base64などで包んだものも、betterleaksが開いて調べる。
+`agentcells cell commit` は、コミットに足す行を [betterleaks](https://github.com/betterleaks/betterleaks) で調べ、秘密らしいものがあればコミットせずに、ファイルと行と種類を出す。base64をそのまま使ったものは、betterleaksが開いて調べる。
+
+- 重ねた守りの1つで、すべては防げない。gzipしてからbase64にする、hexにする、文字を逆に並べる、行を分けるといった加工はすり抜ける。`read_placed` のファイルの中身（DBのパスワードなど）は、既定の決まりにそもそも当たらないことが多い
+- `agentcells cell run` のビルドからは、sandboxの中で、その仕事の `.git` の実体に直接コミットできる。そのコミットは `agentcells cell commit` の確かめを通らない。そのため、pushの前に、CLIがsandboxの外でブランチ全体を確かめる（予定）
+  - `git rev-list --objects <base>..<branch>` に含まれるすべてのblobを、置いた秘密のファイルの中身のハッシュと比べる
+  - `betterleaks git` を、そのコミットの範囲（`--log-opts=<base>..<branch>`）だけ、既定の決まりで、worktreeの設定を読ませずに動かす
+  - `agentcells cell commit` での確かめは、AIにすぐ結果を返すための、重ねた守りとして残す
+- AIが書いた文章（PRの本文、コメント、レビュー、行コメント）は、コミットを通らずにGitHubに出る。CLIは、投稿する前に本文を同じ決まりのbetterleaksで調べ、見つかったら投稿せずに人間に回す（予定。tickに投稿を入れるときに作る）
 
 - betterleaksは、調べる場所の `.betterleaks.toml`・`.gitleaks.toml`・`.betterleaksignore` と、行の `betterleaks:allow` のコメントで見逃すものを決められる。どれもAIが書けるので、既定の決まりだけで調べる。足した行を標準入力で渡し、AIが書けない `/` で動かし、設定を選ぶ環境変数を消し、`--ignore-gitleaks-allow` を付ける
 - betterleaksの場所は、`tick` がsandboxの外で探して今の仕事のファイルに書く。PATHで探すと、別のものを動かされうるため

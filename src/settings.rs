@@ -78,6 +78,8 @@ pub struct RunPaths<'a> {
     pub placed: &'a [PathBuf],
     /// sandboxの中で動かすプログラム（agentcellsとbetterleaks）。ホームの下にあっても動かせるようにする
     pub programs: &'a [PathBuf],
+    /// ビルドやテストの一時ディレクトリ（仕事ごと）。`agentcells cell run` が `TMPDIR` で渡す
+    pub tmp: &'a Path,
 }
 
 /// 1回の実行で渡す設定を作る。2つの守りを重ねる。
@@ -140,10 +142,14 @@ pub fn runtime_settings(
             deny_read.extend(forms(path)?);
         }
     }
+    // Claude Codeは、sandboxの中のシェルに `/tmp/claude-<uid>` を使わせる。そこは使う人のほかのセッションと共有だが、
+    // 読み書きを止めると、Claude Code自身がコマンドの出力やcwdを扱えず、すべてのコマンドが失敗する（2.1.310で確かめた）。
+    // 止められないので、ビルドやテストには、仕事ごとの一時ディレクトリを渡すだけにする（docs/design.mdの残る危険）
     let mut allow_read = forms(worktree)?;
     allow_read.extend(forms(run.git_dir)?);
     allow_read.extend(forms(run.shared_objects)?);
     allow_read.extend(forms(run.context)?);
+    allow_read.extend(forms(run.tmp)?);
     for program in run.programs {
         allow_read.extend(forms(program)?);
     }
@@ -157,6 +163,8 @@ pub fn runtime_settings(
         .map(|(k, v)| (k.to_string(), json!(v)))
         .collect();
 
+    let allow_write = [forms(run.git_dir)?, forms(run.tmp)?].concat();
+
     Ok(json!({
         "env": env,
         "permissions": { "allow": allow, "deny": deny },
@@ -164,13 +172,14 @@ pub fn runtime_settings(
             "enabled": true,
             "allowUnsandboxedCommands": false,
             "filesystem": {
-                "allowWrite": forms(run.git_dir)?,
+                "allowWrite": allow_write,
                 "denyRead": dedup(deny_read),
                 "allowRead": dedup(allow_read),
             },
             "network": {
                 "allowedDomains": product.sandbox.network,
                 "strictAllowlist": true,
+                "allowLocalBinding": product.sandbox.bind_localhost,
             }
         }
     }))
@@ -209,6 +218,53 @@ pub fn sandbox_problems(home: &Home, config: &Config) -> Vec<String> {
     problems
 }
 
+/// 書けるが、勧めない `[product.sandbox]` の書き方。`doctor` が知らせる。
+pub fn sandbox_warnings(config: &Config) -> Vec<String> {
+    let Ok(user_home) = user_home() else {
+        return Vec::new();
+    };
+    // 開けると、読ませる場所を並べる形の意味がなくなる広い場所
+    let wide: Vec<PathBuf> = [
+        "",
+        ".config",
+        "Library",
+        "Documents",
+        "Desktop",
+        "Downloads",
+    ]
+    .iter()
+    .map(|p| user_home.join(p))
+    .collect();
+    let mut warnings = Vec::new();
+    for product in &config.products {
+        for path in &product.sandbox.read {
+            if wide.iter().any(|w| same_path(w, path)) {
+                warnings.push(format!(
+                    "product「{}」の sandbox.read の {} は広すぎます。並べ忘れた場所の秘密も読めるようになります。要る場所だけを書いてください",
+                    product.name,
+                    path.display()
+                ));
+            }
+        }
+        for domain in &product.sandbox.network {
+            if domain.starts_with("*.") {
+                warnings.push(format!(
+                    "product「{}」の sandbox.network の「{domain}」はワイルドカードです。誰でも書ける置き場所（クラウドのストレージなど）を含むと、外へ送る道になります。取得元のホストを具体的に書いてください",
+                    product.name
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+/// 同じ場所か。大文字・小文字は問わない。
+fn same_path(a: &Path, b: &Path) -> bool {
+    let a = a.to_string_lossy().to_lowercase();
+    let b = b.to_string_lossy().to_lowercase();
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 /// 開けた場所の中にあっても読ませない場所。
 fn protected_places(home: &Home, config: &Config) -> Result<Vec<PathBuf>> {
     let mut places = vec![home.root().to_path_buf()];
@@ -236,17 +292,26 @@ fn user_home() -> Result<PathBuf> {
 }
 
 /// 置いたファイルを、productの `sandbox.read_placed` でビルドに読ませるか。
-/// 大文字・小文字を区別しないファイルシステムがあるので、大文字・小文字を問わず比べる。
+/// macOSの標準のファイルシステムは大文字・小文字を区別しないので、macOSでは大文字・小文字を問わず比べる。
+/// 区別するファイルシステムで問わずに比べると、書いたものとは別のファイルまで開けてしまう。
 fn reads_placed(product: &Product, worktree: &Path, placed: &Path) -> bool {
     let Ok(relative) = placed.strip_prefix(worktree) else {
         return false;
     };
-    let relative = relative.to_string_lossy().to_lowercase();
+    let fold = |p: &Path| {
+        let s = p.to_string_lossy().into_owned();
+        if cfg!(target_os = "macos") {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    let relative = fold(relative);
     product
         .sandbox
         .read_placed
         .iter()
-        .any(|p| p.to_string_lossy().to_lowercase() == relative)
+        .any(|p| fold(p) == relative)
 }
 
 /// `path` が `base` か、その中か。大文字・小文字は問わない（macOSの標準のファイルシステムでは同じ場所を指す）。
@@ -353,6 +418,7 @@ mod tests {
             context: Path::new("/home/me/.agentcells/runs/1/context.json"),
             placed,
             programs: &programs,
+            tmp: Path::new("/home/me/.agentcells/tmp/12"),
         };
         runtime_settings(&home(), config, product, &run).unwrap()
     }
@@ -421,10 +487,13 @@ mod tests {
         // sandboxの外でコマンドを動かさせない
         assert_eq!(sandbox["allowUnsandboxedCommands"], false);
         let fs = &sandbox["filesystem"];
-        // 書けるのは、この仕事の .git の実体だけ。元のリポジトリには書けない
+        // 書けるのは、この仕事の .git の実体と一時ディレクトリだけ。元のリポジトリには書けない
         assert_eq!(
             strings(&fs["allowWrite"]),
-            vec!["/home/me/.agentcells/gitdirs/octo/app/12"]
+            vec![
+                "/home/me/.agentcells/gitdirs/octo/app/12",
+                "/home/me/.agentcells/tmp/12"
+            ]
         );
         let deny_read = strings(&fs["denyRead"]);
         for path in [
@@ -506,6 +575,7 @@ mod tests {
             context: &link,
             placed: &[],
             programs: &[],
+            tmp: Path::new("/t"),
         };
         let settings =
             runtime_settings(&home, &config, &product(Sandbox::default()), &run).unwrap();
@@ -559,6 +629,7 @@ mod tests {
             context: Path::new("/c.json"),
             placed: &placed,
             programs: &[],
+            tmp: Path::new("/t"),
         };
         assert!(
             runtime_settings(
@@ -577,6 +648,7 @@ mod tests {
             read: vec![PathBuf::from("/opt/sdk"), user_home().join(".cargo")],
             read_placed: vec![],
             network: vec!["registry.npmjs.org".to_string()],
+            bind_localhost: false,
         });
         let settings = settings_with(&Config::default(), &product, &[]);
         let fs = &settings["sandbox"]["filesystem"];
@@ -605,6 +677,10 @@ mod tests {
         assert_eq!(network["strictAllowlist"], true);
         // sandboxの中では ~/.gitconfig が読めないので、gitに使う人の設定を読ませない
         assert_eq!(settings["env"]["GIT_CONFIG_GLOBAL"], "/dev/null");
+        assert_eq!(network["allowLocalBinding"], false);
+        // ビルドやテストには、仕事ごとの一時ディレクトリを使わせる
+        assert!(allow_read.contains(&"/home/me/.agentcells/tmp/12".to_string()));
+        assert!(strings(&fs["allowWrite"]).contains(&"/home/me/.agentcells/tmp/12".to_string()));
 
         // 書かなければ、どこへも通信できない
         let settings = settings_of(&Config::default(), &[]);
@@ -614,8 +690,14 @@ mod tests {
 
     #[test]
     fn read_placed_files_are_open_to_builds_and_the_read_tool_but_not_to_edits() {
+        // macOSでは大文字・小文字を問わずに比べる
+        let written = if cfg!(target_os = "macos") {
+            "App/Google-Services.json"
+        } else {
+            "app/google-services.json"
+        };
         let product = product(Sandbox {
-            read_placed: vec![PathBuf::from("App/Google-Services.json")],
+            read_placed: vec![PathBuf::from(written)],
             ..Sandbox::default()
         });
         let placed = [
@@ -664,7 +746,31 @@ mod tests {
             context: Path::new("/c.json"),
             placed: &[],
             programs: &[],
+            tmp: Path::new("/t"),
         };
         assert!(runtime_settings(&home(), &bad, &bad.products[0], &run).is_err());
+    }
+
+    #[test]
+    fn warns_about_wide_reads_and_wildcard_hosts() {
+        let config = Config {
+            products: vec![product(Sandbox {
+                read: vec![
+                    user_home(),
+                    user_home().join(".config"),
+                    user_home().join(".cargo"),
+                ],
+                network: vec![
+                    "*.amazonaws.com".to_string(),
+                    "registry.npmjs.org".to_string(),
+                ],
+                ..Sandbox::default()
+            })],
+            ..Config::default()
+        };
+        let warnings = sandbox_warnings(&config);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("広すぎます"));
+        assert!(warnings[2].contains("「*.amazonaws.com」"));
     }
 }

@@ -18,9 +18,11 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
   - 書けるのは、仕事ごとの作業場所（`git clone --shared --separate-git-dir` で作る）と、その `.git` の実体だけ。元のリポジトリの `.git/config` やhooksを書き換えて、CLIがsandboxの外で動かすgitに任意のコードを動かさせないため
   - 使う人のホームの下は読ませず、productの `[product.sandbox]` の `read` に書いた場所だけを開ける。読ませない場所を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまうため。`~/.agentcells`、ghの設定、`~/.ssh` などは、広く開けても読ませない
   - 外への通信は、`[product.sandbox]` の `network` に書いた先だけにし、ほかは聞かずに止める。WebFetchも使わせない。読めた秘密を、コミットを通さずに外へ送らせないため。止めた先はAIに見えるので、AIは足すとよい設定を書いて人間に回す
+  - 一時ディレクトリ: Claude Codeがsandboxで使わせる `/tmp/claude-<uid>` は、使う人のほかのセッションと共有なので、ビルドとテストには、`agentcells cell run` が仕事ごとの一時ディレクトリを渡す（`/tmp/claude-<uid>` そのものは、Claude Codeの都合で塞げない。残る危険）
+  - `bind_localhost` を書くと、テストがlocalhostでサーバーを開ける
   - 置いた秘密のファイル（keystoreなど）は、ビルドにも読ませない。`read_placed` に書いたものだけ読ませる。読ませると、AIが書き換えたビルドを通して取り出せるため、要るものだけを明示する
 - **コミットの前に秘密を探す**（[betterleaks](https://github.com/betterleaks/betterleaks)）
-  - `agentcells cell commit` は、足した行をbetterleaksで調べ、秘密らしいものがあればコミットしない。worktreeに置かれた設定や `betterleaks:allow` のコメントでは見逃させない。置いた秘密のファイルの中身を、包み直して（base64など）コミットされることも防ぐため
+  - `agentcells cell commit` は、足した行をbetterleaksで調べ、秘密らしいものがあればコミットしない。worktreeに置かれた設定や `betterleaks:allow` のコメントでは見逃させない。AIがうっかり、あるいはIssueに仕込まれた指示で、秘密をコミットしたときに見つけるため（加工されたものは防げない、重ねた守りの1つ）
   - `doctor` は、betterleaksがあるかを確かめる
   - このリポジトリの開発でも、pre-commitのフック（`.githooks/`）とCIで調べる
 - **`agentcells cell`**（cellとして動くAIが使う）
