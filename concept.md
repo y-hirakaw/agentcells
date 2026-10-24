@@ -43,7 +43,7 @@ timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 
 まだ決まっていないこと:
 
-- 出すもの（コメント、PR）をどう書くか
+- PRをどう作るか（AIが `gh pr create` で作るか、CLIが作るか）
 
 ### 遷移
 
@@ -70,6 +70,18 @@ cellが終わったら、AIは「次はどこか」と、Issue/PRに残すコメ
 - Issueを扱うcellから、PRを扱うcellに進むときは、実行の中で作られたPRにラベルを付ける。PRが作られていなければ人間に回す
 - `done` は、Issueなら閉じる。PRなら、自動マージの判断（dispatcher）ができるまでは `ac:needs-human` を付けて検品を頼む
 - 往復は最大3回（`max_rounds` は1〜3）。進む先のcellが、そのIssue/PRですでに上限の回数動いていたら人間に回す。implementの最初の実装はIssueの上で数え、PRでは指摘を直した回数を数えるので、review → implement の差し戻しは最大3回になる
+
+### コメントとレビュー
+
+Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容を返すだけで、`gh issue comment`、`gh pr comment`、`gh pr review` は使わせない。
+
+- CLIが投稿するコメントは、1行目を `[agentcells] <cell> round <n>` にする（例: `[agentcells] review round 1`）
+- 往復の回数は、この目印を数える。そのIssue/PRで、そのcellの目印にあるroundの最大値が、動いた回数になる
+- PRへのレビュー（`review = true` のcell）は、GitHubのPRレビューとして投稿する
+  - レビュー本文の1行目に目印を書き、その下にまとめを書く
+  - コードへの指摘は1件につき1コメントで、コードの行に付ける。行コメントはそのレビューに付くので、GitHubの画面でもレビューの下にまとまる
+  - 差分の外の行にはGitHubが行コメントを付けられないので、そうした指摘はレビュー本文にまとめて書く
+  - 自分のPRには「変更を要求」も「承認」もできないので、レビューの種類はCOMMENTにする
 
 ### 2. 振り分け: dispatcher
 
@@ -229,7 +241,6 @@ CLIはRustで書く。
 
 ## 決まっていないこと
 
-- 往復の回数（cellがそのIssue/PRで何回動いたか）を、どこから数えるか
 - productの repos が複数あるとき、どのリポジトリで作業するか
 - 定期実行の間隔
 - Claude Desktopのルーティンで、作業フォルダや外のディレクトリへの権限をどう扱えるか（実機で確かめる）

@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::config::{Cell, Config, Product, Target};
 use crate::labels;
+use crate::review::{self, Finding};
 
 /// このcellの仕事で終わり。
 pub const DONE: &str = "done";
@@ -44,6 +45,9 @@ pub fn choices(cell: &Cell) -> Vec<String> {
 pub struct Outcome {
     pub next: String,
     pub comment: String,
+    /// レビューのcell（`review = true`）が返す、コードへの指摘
+    #[serde(default)]
+    pub findings: Vec<Finding>,
 }
 
 impl Outcome {
@@ -67,8 +71,9 @@ impl Outcome {
 }
 
 /// `claude -p --json-schema` に渡すスキーマ。`next` は選べる先しか出せないようにする。
+/// レビューのcellには、コードへの指摘（`findings`）も返させる。
 pub fn output_schema(cell: &Cell) -> serde_json::Value {
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "next": {
@@ -83,7 +88,12 @@ pub fn output_schema(cell: &Cell) -> serde_json::Value {
         },
         "required": ["next", "comment"],
         "additionalProperties": false
-    })
+    });
+    if cell.review {
+        schema["properties"]["findings"] = review::findings_schema();
+        schema["required"] = json!(["next", "comment", "findings"]);
+    }
+    schema
 }
 
 /// 終わったcellの実行。
@@ -324,6 +334,28 @@ max_rounds = 2
         );
         assert_eq!(schema["required"], json!(["next", "comment"]));
         assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(schema["properties"].get("findings").is_none());
+    }
+
+    #[test]
+    fn review_cells_also_return_findings() {
+        let (_dir, config) = config();
+        let mut cell = config.cell("review").unwrap().clone();
+        cell.review = true;
+        let schema = output_schema(&cell);
+        assert_eq!(schema["required"], json!(["next", "comment", "findings"]));
+        assert_eq!(schema["properties"]["findings"]["type"], "array");
+
+        let outcome = Outcome::from_result(&json!({
+            "is_error": false,
+            "structured_output": {
+                "next": "implement",
+                "comment": "指摘は1件です",
+                "findings": [{"path": "src/main.rs", "line": 3, "body": "名前が分かりにくい"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(outcome.findings.len(), 1);
     }
 
     #[test]

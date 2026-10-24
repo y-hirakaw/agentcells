@@ -32,6 +32,7 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # label = "ac:triage"                # 拾うラベル（ac: で始める）
 # prompt = "cells/triage.md"         # プロンプトのファイル（このファイルからの相対パス）
 # next = ["implement", "done"]       # 進めてよい先（cellの名前か done）。needs-human はいつでも選べる
+# review = false                     # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
 # max_rounds = 3                     # 往復の上限（1〜3。省略すると3）
 # timeout_minutes = 30               # 1回の実行の上限（省略すると30）
 "#;
@@ -76,6 +77,9 @@ pub struct Cell {
     /// 進めてよい先（cellの名前か `done`）。`needs-human` は書かなくても選べる
     #[serde(default)]
     pub next: Vec<String>,
+    /// PRへのレビューとして、指摘をコードの行ごとに投稿する
+    #[serde(default)]
+    pub review: bool,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
     #[serde(default = "default_timeout_minutes")]
@@ -267,6 +271,12 @@ impl Config {
                     c.prompt.display()
                 ));
             }
+            if c.review && c.on != [Target::PullRequest] {
+                problems.push(format!(
+                    "cell「{}」は review = true なので、on は \"pull_request\" だけにしてください",
+                    c.name
+                ));
+            }
             if c.on.is_empty() {
                 problems.push(format!(
                     "cell「{}」の on が空です。issue か pull_request を書いてください",
@@ -346,6 +356,32 @@ timeout_minutes = 10
         let config = Config::parse(VALID, dir.path()).unwrap();
         assert_eq!(config.cell("triage").unwrap().next, vec!["review", "done"]);
         assert!(config.cell("review").unwrap().next.is_empty());
+    }
+
+    #[test]
+    fn review_cells_must_be_on_pull_requests_only() {
+        let ok = VALID.replace("max_rounds = 2", "max_rounds = 2\nreview = true");
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        assert!(
+            Config::parse(&ok, dir.path())
+                .unwrap()
+                .cell("review")
+                .unwrap()
+                .review
+        );
+        assert!(
+            !Config::parse(&ok, dir.path())
+                .unwrap()
+                .cell("triage")
+                .unwrap()
+                .review
+        );
+
+        let bad = VALID.replace(
+            "next = [\"review\", \"done\"]",
+            "next = [\"review\", \"done\"]\nreview = true",
+        );
+        assert!(problems_of(&bad).contains("review = true"));
     }
 
     #[test]

@@ -7,8 +7,12 @@ use serde_json::json;
 use crate::error::{Error, Result};
 
 /// AIにIssue/PRのラベルや状態を変えさせないためのdeny。ラベルの付け替えはCLIだけがする。
+/// コメントとレビューもCLIが目印（`[agentcells] <cell> round <n>`）を付けて投稿するので、AIには書かせない。
 /// `gh api` は何でもできてしまうので、まとめて止める。
 pub const DENY_GH: &[&str] = &[
+    "Bash(gh issue comment:*)",
+    "Bash(gh pr comment:*)",
+    "Bash(gh pr review:*)",
     "Bash(gh issue edit:*)",
     "Bash(gh issue close:*)",
     "Bash(gh issue reopen:*)",
@@ -52,6 +56,8 @@ mod tests {
             "Bash(gh pr edit:*)",
             "Bash(gh label:*)",
             "Bash(gh api:*)",
+            "Bash(gh pr comment:*)",
+            "Bash(gh pr review:*)",
         ] {
             assert!(deny.iter().any(|d| d == rule), "{rule} should be denied");
         }
