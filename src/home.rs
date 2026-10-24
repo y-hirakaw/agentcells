@@ -58,6 +58,10 @@ impl Home {
         self.root.join("logs")
     }
 
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join("config.toml")
+    }
+
     /// worktreeに置くファイルの原本を置く場所。
     pub fn files_for(&self, repo: &RepoName) -> PathBuf {
         self.files_dir().join(&repo.owner).join(&repo.name)
@@ -65,7 +69,8 @@ impl Home {
 }
 
 /// `owner/repo` 形式のリポジトリ名。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize)]
+#[serde(try_from = "String")]
 pub struct RepoName {
     pub owner: String,
     pub name: String,
@@ -85,6 +90,14 @@ impl RepoName {
             owner: owner.to_string(),
             name: name.to_string(),
         })
+    }
+}
+
+impl TryFrom<String> for RepoName {
+    type Error = Error;
+
+    fn try_from(s: String) -> Result<Self> {
+        Self::parse(&s)
     }
 }
 

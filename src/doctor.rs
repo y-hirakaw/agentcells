@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
+use crate::config::Config;
 use crate::home::Home;
 use crate::probe::Probe;
 
@@ -62,6 +63,7 @@ pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Chec
     checks.push(check_claude_auth(probe, claude_found));
     checks.push(check_home(home));
     checks.push(check_path(home, path_env));
+    checks.push(check_config(home));
     checks
 }
 
@@ -205,6 +207,42 @@ fn check_path(home: &Home, path_env: Option<&OsStr>) -> Check {
     }
 }
 
+fn check_config(home: &Home) -> Check {
+    const NAME: &str = "config";
+    let path = home.config_path();
+    if !path.exists() {
+        return Check::warn(
+            NAME,
+            format!("{} がありません", path.display()),
+            "`agentcells setup` を実行すると雛形が置かれます",
+        );
+    }
+    match Config::load(&path) {
+        Err(err) => Check::fail(
+            NAME,
+            err.message,
+            err.hint
+                .unwrap_or_else(|| "設定ファイルを直してください".to_string()),
+        ),
+        Ok(config) if config.products.is_empty() => Check::warn(
+            NAME,
+            "productがまだありません",
+            format!(
+                "{} に [[product]] と [[cell]] を書いてください（雛形のコメントに例があります）",
+                path.display()
+            ),
+        ),
+        Ok(config) => Check::ok(
+            NAME,
+            format!(
+                "product {}件、cell {}件",
+                config.products.len(),
+                config.cells.len()
+            ),
+        ),
+    }
+}
+
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
@@ -212,69 +250,82 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probe::Output;
-    use std::collections::HashMap;
+    use crate::probe::fake::FakeProbe;
     use std::ffi::OsString;
 
-    /// コマンドと引数の組に、決まった結果を返す。登録していないコマンドは見つからない扱い。
-    #[derive(Default)]
-    struct FakeProbe {
-        outputs: HashMap<String, Output>,
-    }
-
-    impl FakeProbe {
-        fn with(mut self, command: &str, success: bool, stdout: &str) -> Self {
-            self.outputs.insert(
-                command.to_string(),
-                Output {
-                    success,
-                    stdout: stdout.to_string(),
-                    stderr: String::new(),
-                },
-            );
-            self
-        }
-
-        fn healthy() -> Self {
-            Self::default()
-                .with("git --version", true, "git version 2.50.1\n")
-                .with("gh --version", true, "gh version 2.87.2\n")
-                .with("gh auth status", true, "")
-                .with("claude --version", true, "2.1.310 (Claude Code)\n")
-                .with(
-                    "claude auth status",
-                    true,
-                    r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"pro"}"#,
-                )
-        }
-    }
-
-    impl Probe for FakeProbe {
-        fn run(&self, program: &str, args: &[&str]) -> Option<Output> {
-            let key = std::iter::once(program)
-                .chain(args.iter().copied())
-                .collect::<Vec<_>>()
-                .join(" ");
-            self.outputs.get(&key).cloned()
-        }
+    fn healthy() -> FakeProbe {
+        FakeProbe::default()
+            .with("git --version", true, "git version 2.50.1\n")
+            .with("gh --version", true, "gh version 2.87.2\n")
+            .with("gh auth status", true, "")
+            .with("claude --version", true, "2.1.310 (Claude Code)\n")
+            .with(
+                "claude auth status",
+                true,
+                r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"pro"}"#,
+            )
     }
 
     fn find<'a>(checks: &'a [Check], name: &str) -> &'a Check {
         checks.iter().find(|c| c.name == name).unwrap()
     }
 
+    const CONFIG: &str = r#"
+[[product]]
+name = "app"
+issues = "octo/app"
+repos = ["octo/app"]
+cells = ["triage"]
+
+[[cell]]
+name = "triage"
+on = "issue"
+label = "ac:triage"
+prompt = "triage.md"
+"#;
+
+    /// PATHに入っていて、正しい設定ファイルがある置き場所を作る。
     fn setup_home() -> (tempfile::TempDir, Home, OsString) {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::new(dir.path().join(".agentcells"));
         std::fs::create_dir_all(home.bin_dir()).unwrap();
+        std::fs::write(home.config_path(), CONFIG).unwrap();
+        std::fs::write(home.root().join("triage.md"), "prompt").unwrap();
         let path = std::env::join_paths([home.bin_dir(), "/usr/bin".into()]).unwrap();
         (dir, home, path)
     }
 
     #[test]
+    fn missing_config_warns_and_points_to_setup() {
+        let (_dir, home, path) = setup_home();
+        std::fs::remove_file(home.config_path()).unwrap();
+        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.fix.unwrap().contains("agentcells setup"));
+    }
+
+    #[test]
+    fn invalid_config_fails_with_problems() {
+        let (_dir, home, path) = setup_home();
+        std::fs::remove_file(home.root().join("triage.md")).unwrap();
+        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("triage.md"), "{}", check.detail);
+    }
+
+    #[test]
+    fn config_without_products_warns() {
+        let (_dir, home, path) = setup_home();
+        std::fs::write(home.config_path(), crate::config::TEMPLATE).unwrap();
+        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.fix.unwrap().contains("[[product]]"));
+    }
+
+    #[test]
     fn all_ok_when_everything_is_ready() {
         let (_dir, home, path) = setup_home();
-        let checks = run(&home, Some(&path), &FakeProbe::healthy());
+        let checks = run(&home, Some(&path), &healthy());
         for c in &checks {
             assert_eq!(c.status, Status::Ok, "{}: {}", c.name, c.detail);
         }
@@ -284,7 +335,7 @@ mod tests {
     #[test]
     fn missing_gh_also_fails_auth_with_fix() {
         let (_dir, home, path) = setup_home();
-        let mut probe = FakeProbe::healthy();
+        let mut probe = healthy();
         probe.outputs.remove("gh --version");
         let checks = run(&home, Some(&path), &probe);
         assert_eq!(find(&checks, "gh").status, Status::Fail);
@@ -296,7 +347,7 @@ mod tests {
     #[test]
     fn gh_not_logged_in_fails() {
         let (_dir, home, path) = setup_home();
-        let probe = FakeProbe::healthy().with("gh auth status", false, "");
+        let probe = healthy().with("gh auth status", false, "");
         let check = find(&run(&home, Some(&path), &probe), "gh auth").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("gh auth login"));
@@ -305,7 +356,7 @@ mod tests {
     #[test]
     fn claude_not_logged_in_fails() {
         let (_dir, home, path) = setup_home();
-        let probe = FakeProbe::healthy().with("claude auth status", false, r#"{"loggedIn":false}"#);
+        let probe = healthy().with("claude auth status", false, r#"{"loggedIn":false}"#);
         let check = find(&run(&home, Some(&path), &probe), "claude auth").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("claude auth login"));
@@ -314,7 +365,7 @@ mod tests {
     #[test]
     fn claude_with_api_key_warns_about_billing() {
         let (_dir, home, path) = setup_home();
-        let probe = FakeProbe::healthy().with(
+        let probe = healthy().with(
             "claude auth status",
             true,
             r#"{"loggedIn":true,"authMethod":"api_key"}"#,
@@ -327,7 +378,7 @@ mod tests {
     #[test]
     fn unreadable_claude_auth_output_warns() {
         let (_dir, home, path) = setup_home();
-        let probe = FakeProbe::healthy().with("claude auth status", true, "Logged in");
+        let probe = healthy().with("claude auth status", true, "Logged in");
         let check = find(&run(&home, Some(&path), &probe), "claude auth").clone();
         assert_eq!(check.status, Status::Warn);
     }
@@ -336,7 +387,7 @@ mod tests {
     fn missing_home_fails_and_points_to_setup() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::new(dir.path().join("missing"));
-        let check = find(&run(&home, None, &FakeProbe::healthy()), "home").clone();
+        let check = find(&run(&home, None, &healthy()), "home").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("agentcells setup"));
     }
@@ -345,7 +396,7 @@ mod tests {
     fn bin_outside_path_warns_with_export_line() {
         let (_dir, home, _path) = setup_home();
         let path = OsString::from("/usr/bin:/bin");
-        let check = find(&run(&home, Some(&path), &FakeProbe::healthy()), "PATH").clone();
+        let check = find(&run(&home, Some(&path), &healthy()), "PATH").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("export PATH="));
     }

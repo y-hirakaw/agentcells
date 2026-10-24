@@ -3,10 +3,12 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use agentcells::config::Config;
 use agentcells::doctor::{self, Status};
 use agentcells::error::{Error, Result};
 use agentcells::files;
 use agentcells::home::{Home, RepoName};
+use agentcells::labels;
 use agentcells::probe::SystemProbe;
 use agentcells::setup;
 
@@ -27,6 +29,21 @@ enum Commands {
     Files {
         #[command(subcommand)]
         command: FilesCommands,
+    },
+    /// GitHubのラベルを扱う
+    Labels {
+        #[command(subcommand)]
+        command: LabelsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum LabelsCommands {
+    /// 設定ファイルのproductとcellに必要なラベルのうち、足りないものを作る（あるものは触らない）
+    Sync {
+        /// 作らずに、作る予定のラベルだけを表示する
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -90,6 +107,25 @@ fn run(command: Commands) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Labels {
+            command: LabelsCommands::Sync { dry_run },
+        } => {
+            let config = Config::load(&home.config_path())?;
+            let result = labels::sync(&config, &SystemProbe, dry_run)?;
+            if result.is_empty() {
+                println!("productがないので、作るラベルはありません");
+            }
+            let verb = if dry_run { "作る予定" } else { "作成" };
+            for (repo, created) in result {
+                if created.is_empty() {
+                    println!("{repo}: そろっています");
+                }
+                for label in created {
+                    println!("{repo}: {verb} {}", label.name);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -102,7 +138,9 @@ fn print_doctor(home: &Home) -> ExitCode {
             Status::Warn => "!",
             Status::Fail => "✗",
         };
-        println!("{mark} {:<12} {}", check.name, check.detail);
+        // 複数行の説明は、2行目以降を説明の列にそろえる。
+        let detail = check.detail.replace('\n', &format!("\n  {:<12} ", ""));
+        println!("{mark} {:<12} {detail}", check.name);
         if let Some(fix) = &check.fix {
             println!("  {:<12} 直し方: {fix}", "");
         }

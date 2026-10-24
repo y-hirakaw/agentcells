@@ -43,6 +43,18 @@ pub fn run(home: &Home) -> Result<Report> {
     }
     // 秘密のファイルの原本を置くので、本人だけが読めるようにする。
     set_owner_only(&home.files_dir(), 0o700)?;
+
+    // 設定ファイルは人が書き換えるものなので、あれば触らない。
+    let config = home.config_path();
+    if config.exists() {
+        report.existing.push(config);
+    } else {
+        fs::write(&config, crate::config::TEMPLATE).map_err(|e| {
+            Error::new(format!("{} を作れません: {e}", config.display()))
+                .with_hint("親ディレクトリの権限を確かめてください")
+        })?;
+        report.created.push(config);
+    }
     Ok(report)
 }
 
@@ -56,13 +68,28 @@ mod tests {
         let home = Home::new(dir.path().join(".agentcells"));
 
         let first = run(&home).unwrap();
-        assert_eq!(first.created.len(), 6);
+        assert_eq!(first.created.len(), 7);
         assert!(first.existing.is_empty());
         assert!(home.worktrees_dir().is_dir());
+        assert_eq!(
+            fs::read_to_string(home.config_path()).unwrap(),
+            crate::config::TEMPLATE
+        );
 
         let second = run(&home).unwrap();
         assert!(second.created.is_empty());
-        assert_eq!(second.existing.len(), 6);
+        assert_eq!(second.existing.len(), 7);
+    }
+
+    #[test]
+    fn keeps_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join(".agentcells"));
+        fs::create_dir_all(home.root()).unwrap();
+        fs::write(home.config_path(), "# mine\n").unwrap();
+
+        run(&home).unwrap();
+        assert_eq!(fs::read_to_string(home.config_path()).unwrap(), "# mine\n");
     }
 
     #[test]
@@ -76,7 +103,7 @@ mod tests {
             report.existing,
             vec![home.root().to_path_buf(), home.bin_dir()]
         );
-        assert_eq!(report.created.len(), 4);
+        assert_eq!(report.created.len(), 5);
     }
 
     #[cfg(unix)]

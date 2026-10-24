@@ -28,12 +28,22 @@ AIが働いている工場に、人間がときどき呼ばれるイメージ。
 - implement cell: 実装してPRを作る
 - review cell: PRをレビューして指摘する。implement cellが指摘を直すまで往復する
 
-cellが共通で持つもの（未定）:
+cellは設定ファイル（`~/.agentcells/config.toml`、TOML）の `[[cell]]` に書く。
 
-- 受け取る条件（どのラベルや状態のIssue/PRを拾うか）
-- 出すもの（コメント、PR、ラベルの変更）
-- 止まって人間を呼ぶ条件
-- 往復の上限（無限ループを防ぐ）
+```toml
+[[cell]]
+name = "review"
+on = "pull_request"          # issue か pull_request
+label = "ac:review"          # 拾うラベル
+prompt = "cells/review.md"   # プロンプトのファイル
+max_rounds = 5               # 往復の上限（無限ループを防ぐ。省略すると3）
+timeout_minutes = 30         # 1回の実行の上限（省略すると30）
+```
+
+まだ決まっていないこと:
+
+- 出すもの（コメント、PR、ラベルの変更）をどう書くか
+- 止まって人間を呼ぶ条件をどう書くか
 
 ### 2. 振り分け: dispatcher
 
@@ -59,7 +69,11 @@ cellの外にいて、次の行き先を判断する。単に運ぶのではな�
 ## 状態の持ち方
 
 - 状態はGitHubのIssue・PRのラベルとコメントで持つ（専用のデータベースは持たない）
-- 処理中のIssue/PRにはラベルを付け、同じ仕事を二重に拾わないようにする
+- agentcellsのラベルは `ac:` で始める
+  - `ac:<工程>`（`ac:triage` など）: そのcellが拾う。名前は設定ファイルで決める
+  - `ac:working`: 処理中。同じ仕事を二重に拾わないようにする
+  - `ac:needs-human`: 人間の回答や検品を待っている
+- `agentcells labels sync` で、足りないラベルをリポジトリに作る。すでにあるラベルは触らない
 - 起動はタイマー（定期実行）。GitHubのイベントで起動するかは未定
 
 ## 実行のしかた
@@ -86,7 +100,16 @@ cellの定義（拾う条件、プロンプト、止まる条件、往復の上�
 
 Issueがあるリポジトリと、実装を進めるリポジトリは同じとは限らない。
 
-- 仕事ごとに「Issueのリポジトリ」と「作業するリポジトリ」を持つ。どのIssueをどこで作業するかは、設定の対応づけかIssueのラベルで決める（未定）
+- どのIssueをどこで作業するかは、設定ファイルの `[[product]]` で決める。productは「Aプロダクト」「Bプロダクト」のような、cellで回したい範囲の単位
+
+```toml
+[[product]]
+name = "agentcells"
+issues = "y-hirakaw/agentcells"    # Issueを置くリポジトリ
+repos = ["y-hirakaw/agentcells"]   # 作業するリポジトリ
+cells = ["triage", "implement", "review"]
+```
+
 - PRは作業するリポジトリに作り、Issueにリンクをコメントする
 - 作業は仕事ごとのworktreeで行う。人間がふだん使っているcloneとは別に、作業用のcloneを持つ
 - `claude -p` はworktreeの中で起動する。作業するリポジトリのCLAUDE.mdと設定がそのまま効く
@@ -119,7 +142,14 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 - このリポジトリの `.claude/` は、agentcellsを開発するエージェントのための設定。cellとして動くエージェントの設定とは分ける
 - B（`claude -p`）は、worktreeの中で `--settings` にagentcellsの設定を渡し、`--setting-sources project,local` でグローバル設定を外して起動する。作業するリポジトリ自身の設定とCLAUDE.mdの上に、agentcellsの設定を重ねる形になる
 - A（ルーティン）は、作業フォルダを `~/.agentcells` にする。そこの `.claude/settings.json` とCLAUDE.mdが効く
-- `--settings` とproject/localの設定が重なったときの優先順位や、hooksの合わさり方は実機で確かめる
+
+Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
+
+- hooksは上書きされずに合わさる。project・local・`--settings` のSessionStart hookが3つとも動いた
+- denyはallowに勝つ。projectのdenyと `--settings` のallowがぶつかると、読めなかった
+- 信頼していないディレクトリ（一度も対話で開いていないディレクトリ）では、projectの `settings.json` のallowが無視される。denyとhooksは効く。worktreeは毎回新しいパスなので、cellに必要なallowは `--settings` で渡す
+- `Read(//絶対パス)` の形でdenyを書ける。Readを禁止したファイルは、`Bash(cat:*)` を許していても `cat` で読めなかった（ただし、ほかのコマンドで読めないとまでは言えないので、秘密を守る仕組みの1つとして扱う）
+- `--setting-sources project,local` でグローバル設定のhooksが止まるかは、まだ確かめていない
 
 ### gitignoreされたファイルの配置
 
@@ -128,7 +158,7 @@ keystore（Android）やapplication.yml（Spring Boot）のように、gitignore
 - `files/<owner>/<repo>/` の下に、worktreeに置くのと同じパスでファイルを置いておく
 - 置く前に `git check-ignore` で、そのパスがgitignoreされているか確かめる。されていなければ置かずに知らせる（秘密のファイルをコミットさせない）
 - シンボリックリンクではなくコピーで置き、権限は600にする（元のファイルを書き換えさせない）
-- 置いたファイルは、worktreeの `.claude/settings.local.json` でReadを禁止する。ビルドツールは読めるが、AIは中身を読まないので、プロンプトや実行の記録に入らない
+- 置いたファイルは、`--settings` で渡す設定に `Read(//絶対パス)` のdenyを足して読めなくする。ビルドツールは読めるが、AIは中身を読まないので、プロンプトや実行の記録に入らない。worktreeに設定ファイルを書かないので、それをコミットしてしまう心配もない（Aのルーティンでの渡し方は未定）
 - `doctor` で、登録しているリポジトリに必要なファイルがそろっているかを確かめ、足りなければ置き場所を案内する
 - あとで、リポジトリごとの準備コマンド（`npm ci` など）も足せるようにしておく
 
@@ -171,8 +201,12 @@ CLIはRustで書く。
 
 ## 決まっていないこと
 
-- cellの定義の書き方（設定ファイルの形式）
+- cellが終わったあと、次にどのラベルを付けるか（dispatcherの判断の書き方）
+- productの repos が複数あるとき、どのリポジトリで作業するか
 - 定期実行の間隔
 - Claude Desktopのルーティンで、作業フォルダや外のディレクトリへの権限をどう扱えるか（実機で確かめる）
 - 権限（どのトークンで何をさせるか。できることは最小限にする）
-- ライセンス
+
+## ライセンス
+
+MIT

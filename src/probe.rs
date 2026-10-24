@@ -26,3 +26,55 @@ impl Probe for SystemProbe {
         })
     }
 }
+
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::{Output, Probe};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// コマンドと引数の組に、決まった結果を返す。呼ばれたコマンドは `calls` に残る。
+    /// 登録していないコマンドは、`fallback` があればそれを、なければ見つからない扱いにする。
+    #[derive(Default)]
+    pub struct FakeProbe {
+        pub outputs: HashMap<String, Output>,
+        pub fallback: Option<Output>,
+        pub calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeProbe {
+        pub fn with(mut self, command: &str, success: bool, stdout: &str) -> Self {
+            self.outputs.insert(
+                command.to_string(),
+                Output {
+                    success,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                },
+            );
+            self
+        }
+
+        pub fn with_fallback(mut self, success: bool) -> Self {
+            self.fallback = Some(Output {
+                success,
+                ..Output::default()
+            });
+            self
+        }
+    }
+
+    impl Probe for FakeProbe {
+        fn run(&self, program: &str, args: &[&str]) -> Option<Output> {
+            let key = std::iter::once(program)
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.calls.borrow_mut().push(key.clone());
+            self.outputs
+                .get(&key)
+                .cloned()
+                .or_else(|| self.fallback.clone())
+        }
+    }
+}

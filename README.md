@@ -41,8 +41,11 @@ cd agentcells
 | コマンド | 何をするか |
 | --- | --- |
 | `agentcells doctor` | 動かすのに必要なものがそろっているかを確かめ、だめなら直し方を出す |
-| `agentcells setup` | 作業データの置き場所を用意する（何度実行してもよい） |
+| `agentcells setup` | 作業データの置き場所と、設定ファイルの雛形（`config.toml`）を用意する（何度実行してもよい） |
+| `agentcells labels sync [--dry-run]` | 設定ファイルのproductとcellに必要な `ac:` ラベルのうち、足りないものをGitHubに作る |
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
+
+設定ファイル `~/.agentcells/config.toml` には、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [concept.md](concept.md) と、雛形のコメントを見てください。
 
 ## 開発
 
@@ -60,4 +63,4 @@ cargo test
 
 ## ライセンス
 
-未定
+MIT（[LICENSE](LICENSE)）
