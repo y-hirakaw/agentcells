@@ -2,7 +2,7 @@
 
 Issueを作ると、AIエージェントのcellが仕事を進めます。次の工程に回すか人間に回すかはdispatcherが振り分け、質問や検品の依頼はIssueとPRで人間に届きます。グラフエンジニアリング／ソフトウェアファクトリーのような仕組みです。
 
-> **実験的なプロジェクトで、作成中です。** 仕様は予告なく変わります。設計は [concept.md](concept.md) にまとめています。
+> **実験的なプロジェクトで、作成中です。** 仕様は予告なく変わります。構想は [concept.md](concept.md)、作ったものの仕様は [docs/design.md](docs/design.md)、変更の履歴は [CHANGELOG.md](CHANGELOG.md) にあります。
 
 ## できるようにしたいこと
 
@@ -45,7 +45,7 @@ cd agentcells
 | `agentcells labels sync [--dry-run]` | 設定ファイルのproductとcellに必要な `ac:` ラベルのうち、足りないものをGitHubに作る |
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
 
-設定ファイル `~/.agentcells/config.toml` には、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [concept.md](concept.md) と、雛形のコメントを見てください。
+設定ファイル `~/.agentcells/config.toml` には、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [docs/design.md](docs/design.md) と、雛形のコメントを見てください。
 
 ### GitHub App（推奨）
 
