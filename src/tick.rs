@@ -474,6 +474,15 @@ next = ["done"]
         assert!(first.is_some());
         assert!(lock(&home).unwrap().is_none());
         drop(first);
-        assert!(lock(&home).unwrap().is_some());
+        // ほかのテストが同時に子のプロセスを作ると、forkしてからexecするまでの間、子もこのファイルを
+        // 開いたままになり、ロックがすぐには外れないことがある。少し待って確かめる
+        let again = (0..50).find_map(|_| {
+            let lock = lock(&home).unwrap();
+            if lock.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            lock
+        });
+        assert!(again.is_some());
     }
 }
