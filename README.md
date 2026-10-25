@@ -30,7 +30,7 @@ Create an Issue in this repository, and a PR is opened, reviewed by AI, and upda
 
 ## Install (work in progress)
 
-For now, build from source. If Rust is not installed, install it first by following https://rustup.rs.
+For now, build from source. If Rust is not installed, install it first by following https://rustup.rs. agentcells also needs git 2.38 or later (`agentcells doctor` checks it).
 
 ```sh
 git clone https://github.com/y-hirakaw/agentcells.git

@@ -158,30 +158,47 @@ impl Refusal {
     }
 }
 
-const NEXT_MERGE: &str = "ベースのブランチとぶつかっていると、AIはmainなどを取り込むマージで解消しようとします。agentcellsはマージコミットをpushしないので、ぶつかりを手で解消してPRのブランチ（PRがまだなければ ac/ で始まるブランチ）にpushしてから、ここにコメントしてください。AIの解消のしかたは、下の作業から読めます";
+const NEXT_MERGE: &str = "agentcellsは、ベースのブランチ（mainなど）を取り込むマージだけをpushします。ほかのブランチを取り込んだマージは、中身を確かめきれないためです。ぶつかりを手で解消してPRのブランチ（PRがまだなければ ac/ で始まるブランチ）にpushしてから、ここにコメントしてください。AIの作業は、下の作業から読めます";
 const NEXT_GUARDED: &str = "この変更が本当に要るなら、人が中身を確かめて、手で入れてください。要らないなら、それを入れずに進めるよう、ここにコメントで頼んでください";
 const NEXT_SECRET: &str = "秘密が入らないように直すよう、ここにコメントで頼んでください。秘密ではない（見誤り）なら、agentcellsを動かしている人が中身を確かめてから、手で入れてください";
 
-/// pushする前に、ブランチに足したコミット（`base` から `branch` まで）をすべて確かめる。
+/// pushする前に、ブランチに足したコミット（`base` から `branch` まで。ベースのブランチ `upstream` から
+/// 取り込んだものは除く）をすべて確かめる。
 /// AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る。
 /// 問題があれば、その理由（秘密そのものは書かない）。
 ///
 /// - 置いた秘密のファイルと同じ中身のファイル（名前を変えたり、途中のコミットだけに入れたりしても）
+/// - ベースのブランチ以外を取り込んだマージ
 /// - 人が開いたときに自動で動くファイル（`AUTORUN_PATHS`）の変更
 /// - betterleaksが見つけた秘密らしいもの（足した行。途中のコミットで足して消したものも）
+///
+/// マージは、ぶつかりを解消するために、ベースのブランチを取り込むものだけを通す。マージの中身は、
+/// 両方の親を自動でマージした結果からの差分（`--remerge-diff`）で確かめる。ぶつかりの直しと、マージに
+/// 紛れ込ませた変更は、そこに出る。ベースのブランチのコミットは確かめない（書き込みの権限を持つ人が
+/// pushしたもので、AIが足したものではないため）
 pub fn verify(
     probe: &dyn Probe,
     staging: &Path,
     base: &str,
+    upstream: &str,
     branch: &str,
     placed_blobs: &[String],
     scanner: &Path,
 ) -> Result<Option<Refusal>> {
     let staging_path = path_str(staging)?;
-    let range = format!("{base}..refs/heads/{branch}");
+    let tip = format!("refs/heads/{branch}");
+    let not_base = format!("^{base}");
+    let not_upstream = format!("^{upstream}");
+    let revs = [tip.as_str(), not_base.as_str(), not_upstream.as_str()];
+    let with_revs = |args: &[&'static str]| -> Vec<&str> {
+        let mut all = vec!["-C", staging_path];
+        all.extend_from_slice(args);
+        all.extend_from_slice(&revs);
+        all
+    };
     let objects = git_out(
         probe,
-        &["-C", staging_path, "rev-list", "--objects", &range],
+        &with_revs(&["rev-list", "--objects"]),
         ISOLATED_GIT_ENV,
     )?;
     for line in objects.lines() {
@@ -199,33 +216,53 @@ pub fn verify(
             )));
         }
     }
-    // マージコミットの差分は、既定の `git log` に出ないので、その分の確かめをすり抜けられる。
-    // AIがマージを作る必要はないので、断る
+    // ベースのブランチ以外を取り込んだマージは、何を持ち込んだのかを確かめきれないので、断る
     let merges = git_out(
         probe,
-        &["-C", staging_path, "rev-list", "--merges", &range],
+        &with_revs(&["rev-list", "--merges", "--parents"]),
         ISOLATED_GIT_ENV,
     )?;
-    if !merges.trim().is_empty() {
-        return Ok(Some(Refusal::new(
-            "マージコミットがあります（中身を確かめきれないので、pushしません）".to_string(),
-            NEXT_MERGE,
-        )));
+    for line in merges.lines() {
+        let commits: Vec<&str> = line.split_whitespace().collect();
+        let from_base = match commits.as_slice() {
+            [_, _, other] => probe
+                .run_with_env(
+                    "git",
+                    &[
+                        "-C",
+                        staging_path,
+                        "merge-base",
+                        "--is-ancestor",
+                        other,
+                        upstream,
+                    ],
+                    ISOLATED_GIT_ENV,
+                )
+                .is_some_and(|out| out.success),
+            _ => false,
+        };
+        if !from_base {
+            return Ok(Some(Refusal::new(
+                format!(
+                    "ベースのブランチ以外を取り込んだマージコミットがあります: {}",
+                    commits.first().copied().unwrap_or("?")
+                ),
+                NEXT_MERGE,
+            )));
+        }
     }
     // シンボリックリンクで、守るパスを別の場所に向けられる（`.vscode` → `tools/v` など）ので、足させない
     let raw = git_out(
         probe,
-        &[
-            "-C",
-            staging_path,
+        &with_revs(&[
             "-c",
             "core.quotePath=false",
             "log",
             "--raw",
             "--no-renames",
+            "--remerge-diff",
             "--format=",
-            &range,
-        ],
+        ]),
         ISOLATED_GIT_ENV,
     )?;
     for line in raw.lines() {
@@ -249,17 +286,15 @@ pub fn verify(
     }
     let changed = git_out(
         probe,
-        &[
-            "-C",
-            staging_path,
+        &with_revs(&[
             "-c",
             "core.quotePath=false",
             "log",
             "--no-renames",
+            "--remerge-diff",
             "--name-only",
             "--format=",
-            &range,
-        ],
+        ]),
         ISOLATED_GIT_ENV,
     )?;
     for path in changed.lines().filter(|l| !l.is_empty()) {
@@ -283,9 +318,7 @@ pub fn verify(
     }
     let patches = git_out(
         probe,
-        &[
-            "-C",
-            staging_path,
+        &with_revs(&[
             "-c",
             "core.quotePath=false",
             "log",
@@ -295,12 +328,12 @@ pub fn verify(
             "--no-textconv",
             "--text",
             "--no-renames",
+            "--remerge-diff",
             "--unified=0",
             "--src-prefix=a/",
             "--dst-prefix=b/",
             "--format=",
-            &range,
-        ],
+        ]),
         ISOLATED_GIT_ENV,
     )?;
     let lines = crate::actions::added_lines(&patches);
@@ -555,12 +588,30 @@ mod tests {
             }
             git_in(&work, &["add", "-A"]);
             git_in(&work, &["commit", "-q", "-m", "change"]);
-            (stage(&SystemProbe, &work, "ac/x").unwrap(), base)
+            (stage_main(&work), base)
+        }
+
+        /// 確かめに使う、ベースのブランチ。pushの前に、CLIがbareリポジトリに移しておく。
+        const MAIN: &str = "refs/heads/main";
+
+        /// 仕事のブランチと、ベースのブランチ（main）を、bareリポジトリに移す。
+        fn stage_main(work: &Path) -> TempDir {
+            let staging = stage(&SystemProbe, work, "ac/x").unwrap();
+            git_in(
+                staging.path(),
+                &[
+                    "fetch",
+                    "-q",
+                    work.to_str().unwrap(),
+                    "+refs/heads/main:refs/heads/main",
+                ],
+            );
+            staging
         }
 
         #[test]
         fn verify_refuses_merges_and_symlinks() {
-            // マージのときに足したものは、既定の git log に出ない
+            // ベース以外のブランチを取り込んだマージは、断る
             let dir = tempfile::tempdir().unwrap();
             let scanner = fake_scanner(dir.path());
             let work = dir.path().join("work");
@@ -580,10 +631,18 @@ mod tests {
             std::fs::write(work.join(".claude/settings.json"), "{}").unwrap();
             git_in(&work, &["add", "-A"]);
             git_in(&work, &["commit", "-q", "-m", "merge"]);
-            let staging = stage(&SystemProbe, &work, "ac/x").unwrap();
-            let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
-                .unwrap()
-                .unwrap();
+            let staging = stage_main(&work);
+            let reason = verify(
+                &SystemProbe,
+                staging.path(),
+                &base,
+                MAIN,
+                "ac/x",
+                &[],
+                &scanner,
+            )
+            .unwrap()
+            .unwrap();
             assert!(reason.reason.contains("マージコミット"), "{reason:?}");
 
             // シンボリックリンクで、守るパスを別の場所に向ける
@@ -596,11 +655,93 @@ mod tests {
             git_in(&work, &["add", "-A"]);
             git_in(&work, &["commit", "-q", "-m", "link"]);
             drop(staging);
-            let staging = stage(&SystemProbe, &work, "ac/x").unwrap();
-            let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
+            let staging = stage_main(&work);
+            let reason = verify(
+                &SystemProbe,
+                staging.path(),
+                &base,
+                MAIN,
+                "ac/x",
+                &[],
+                &scanner,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(reason.reason.contains("シンボリックリンク"), "{reason:?}");
+        }
+
+        #[test]
+        fn verify_checks_what_a_merge_of_the_base_adds() {
+            // ベースとぶつかったところを、ベースを取り込むマージで直す
+            let setup = |dir: &Path, resolved: &str, extra: Option<(&str, &str)>| {
+                let work = dir.join("work");
+                std::fs::create_dir_all(&work).unwrap();
+                git_in(&work, &["init", "-q", "-b", "main"]);
+                std::fs::write(work.join("a.txt"), "a\n").unwrap();
+                git_in(&work, &["add", "-A"]);
+                git_in(&work, &["commit", "-q", "-m", "base"]);
+                git_in(&work, &["checkout", "-q", "-b", "ac/x"]);
+                std::fs::write(work.join("a.txt"), "pr\n").unwrap();
+                git_in(&work, &["commit", "-q", "-am", "pr"]);
+                let start = git_in(&work, &["rev-parse", "HEAD"]);
+                git_in(&work, &["checkout", "-q", "main"]);
+                // ベースには、人が入れた守るパスの変更もある（確かめない）
+                std::fs::write(work.join("a.txt"), "main\n").unwrap();
+                std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
+                std::fs::write(work.join(".github/workflows/ci.yml"), "on: push").unwrap();
+                git_in(&work, &["add", "-A"]);
+                git_in(&work, &["commit", "-q", "-m", "main"]);
+                git_in(&work, &["checkout", "-q", "ac/x"]);
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&work)
+                    .args(["merge", "-q", "main"])
+                    .output();
+                std::fs::write(work.join("a.txt"), resolved).unwrap();
+                if let Some((path, content)) = extra {
+                    let full = work.join(path);
+                    std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+                    std::fs::write(full, content).unwrap();
+                }
+                git_in(&work, &["add", "-A"]);
+                git_in(&work, &["commit", "-q", "--no-edit"]);
+                (stage_main(&work), start)
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let scanner = fake_scanner(dir.path());
+            let (staging, start) = setup(dir.path(), "pr and main\n", None);
+            let found = verify(
+                &SystemProbe,
+                staging.path(),
+                &start,
+                MAIN,
+                "ac/x",
+                &[],
+                &scanner,
+            );
+            assert_eq!(found.unwrap(), None);
+
+            // ぶつかりの直しに入れた秘密と、マージに紛れ込ませた守るパスの変更は、断る
+            for (resolved, extra, expect) in [
+                ("token = FAKE-SECRET\n", None, "fake"),
+                ("pr\n", Some((".claude/settings.json", "{}")), ".claude"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let scanner = fake_scanner(dir.path());
+                let (staging, start) = setup(dir.path(), resolved, extra);
+                let reason = verify(
+                    &SystemProbe,
+                    staging.path(),
+                    &start,
+                    MAIN,
+                    "ac/x",
+                    &[],
+                    &scanner,
+                )
                 .unwrap()
                 .unwrap();
-            assert!(reason.reason.contains("シンボリックリンク"), "{reason:?}");
+                assert!(reason.reason.contains(expect), "{reason:?}");
+            }
         }
 
         #[test]
@@ -608,7 +749,16 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let scanner = fake_scanner(dir.path());
             let (staging, base) = staged(dir.path(), &[("src/b.txt", "hello")]);
-            let found = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner).unwrap();
+            let found = verify(
+                &SystemProbe,
+                staging.path(),
+                &base,
+                MAIN,
+                "ac/x",
+                &[],
+                &scanner,
+            )
+            .unwrap();
             assert_eq!(found, None);
         }
 
@@ -636,6 +786,7 @@ mod tests {
                 &SystemProbe,
                 staging.path(),
                 &base,
+                MAIN,
                 "ac/x",
                 &[hash],
                 &scanner,
@@ -654,9 +805,17 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let scanner = fake_scanner(dir.path());
                 let (staging, base) = staged(dir.path(), &[(path, content)]);
-                let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
-                    .unwrap()
-                    .unwrap();
+                let reason = verify(
+                    &SystemProbe,
+                    staging.path(),
+                    &base,
+                    MAIN,
+                    "ac/x",
+                    &[],
+                    &scanner,
+                )
+                .unwrap()
+                .unwrap();
                 assert!(reason.reason.contains(expect), "{path}: {reason:?}");
             }
         }

@@ -113,6 +113,12 @@ enum CellCommands {
     },
     /// 設定（product.commands）に書いたコマンドを実行する
     Run { name: String },
+    /// ベースのブランチ（origin/<ベース>）を取り込む。ぶつかったら、直してから commit する
+    Merge {
+        /// 途中のマージをやめて、取り込む前に戻す
+        #[arg(long)]
+        abort: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -710,6 +716,27 @@ fn run_cell(command: CellCommands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         CellCommands::Run { name } => Ok(code(actions::run(&context, &name)?)),
+        CellCommands::Merge { abort: true } => {
+            actions::merge_abort(&context)?;
+            println!("マージをやめて、取り込む前に戻しました");
+            Ok(ExitCode::SUCCESS)
+        }
+        CellCommands::Merge { abort: false } => match actions::merge(&context)? {
+            actions::Merged::Clean => {
+                println!("ベースのブランチを取り込みました（ぶつかりはありません）");
+                Ok(ExitCode::SUCCESS)
+            }
+            actions::Merged::Conflicts(files) => {
+                println!("ぶつかりました:");
+                for file in files {
+                    println!("  {}", agentcells::display::printable(&file));
+                }
+                println!(
+                    "ぶつかったところを直してから `agentcells cell commit -m <メッセージ>` でマージのコミットを作ってください。やめるときは `agentcells cell merge --abort` です"
+                );
+                Ok(ExitCode::from(1))
+            }
+        },
     }
 }
 

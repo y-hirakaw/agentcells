@@ -35,6 +35,8 @@ pub struct Work {
     pub title: String,
     /// 人間を待っていたところから、cellを使う人の返事で動くなら、その状態
     pub waiting: Option<Waiting>,
+    /// 人間の検品を待っていたPRが、ベースのブランチとぶつかったので、返事がなくても直しに動く
+    pub conflict: bool,
 }
 
 impl Work {
@@ -43,7 +45,9 @@ impl Work {
             Target::Issue => "Issue",
             Target::PullRequest => "PR",
         };
-        let reply = if self.waiting.is_some() {
+        let reply = if self.conflict {
+            "（ぶつかりを受けて）"
+        } else if self.waiting.is_some() {
             "（返事を受けて）"
         } else {
             ""
@@ -176,6 +180,25 @@ struct Listed {
     body: String,
     #[serde(default, rename = "updatedAt")]
     updated_at: String,
+    /// PRがベースのブランチとぶつかっているか（`MERGEABLE`、`CONFLICTING`、`UNKNOWN`）
+    #[serde(default)]
+    mergeable: Option<String>,
+    /// PRのブランチの先
+    #[serde(default, rename = "headRefOid")]
+    head_ref_oid: String,
+    /// PRのベースのブランチ（消されていれば `None`）
+    #[serde(default, rename = "baseRef")]
+    base_ref: Option<ListedRef>,
+}
+
+#[derive(Deserialize)]
+struct ListedRef {
+    target: Option<ListedTarget>,
+}
+
+#[derive(Deserialize)]
+struct ListedTarget {
+    oid: String,
 }
 
 impl Listed {
@@ -185,6 +208,14 @@ impl Listed {
             .nodes
             .iter()
             .any(|l| l.name.eq_ignore_ascii_case(label))
+    }
+
+    /// ベースのブランチの先。
+    fn base_oid(&self) -> &str {
+        self.base_ref
+            .as_ref()
+            .and_then(|r| r.target.as_ref())
+            .map_or("", |t| t.oid.as_str())
     }
 
     fn is_assigned(&self, actors: &Actors) -> bool {
@@ -293,6 +324,7 @@ pub fn find(
                             number: i.number,
                             title: i.title.clone(),
                             waiting: None,
+                            conflict: false,
                         };
                         checker.check(&mut found, work, &i, &cell.label)?;
                     }
@@ -327,19 +359,37 @@ pub fn find(
                             number: i.number,
                             title: i.title.clone(),
                             waiting: Some(waiting),
+                            conflict: false,
                         };
-                        // 前のtickで返事がなく、そのあと何も変わっていなければ、読み直さない
+                        // 検品を待つPRが、ほかのPRのマージなどでベースとぶつかったら、返事がなくても直しに動く。
+                        // 直すcellは、返事だけをして検品待ちに戻すことを選べないので、くり返さない
+                        // 手元でぶつからないと分かったもの（GitHubの判定が古いなど）は、PRかベースの先が変わるまで動かさない
                         let key = format!("{repo}#{}", i.number);
-                        if quiet.still_quiet(&key, &i.updated_at) {
+                        let conflicting = waiting == Waiting::InReview
+                            && i.mergeable.as_deref() == Some(CONFLICTING)
+                            && !quiet.no_conflict(&key, &i.head_ref_oid, i.base_oid());
+                        // 前のtickで返事がなく、そのあと何も変わっていなければ、読み直さない
+                        if !conflicting && quiet.still_quiet(&key, &i.updated_at) {
                             continue;
                         }
                         let resumed = discussion::fetch(probe, &env, item, repo, i.number)
                             .map_err(|e| format!("やり取りを読めません: {}", e.message))
-                            .and_then(|d| resumed_cell(config, product, item, waiting, &d, actors));
+                            .and_then(|d| {
+                                resumed_cell(
+                                    config,
+                                    product,
+                                    item,
+                                    waiting,
+                                    &d,
+                                    actors,
+                                    conflicting,
+                                )
+                            });
                         match resumed {
                             Ok(None) => quiet.remember(key, &i.updated_at),
-                            Ok(Some(cell)) => {
-                                work.cell = cell;
+                            Ok(Some(resumed)) => {
+                                work.cell = resumed.cell;
+                                work.conflict = !resumed.replied;
                                 checker.check(&mut replied, work, &i, waiting.label())?;
                             }
                             Err(reason) => replied.skipped.push((work, reason)),
@@ -437,7 +487,15 @@ fn product_handles(config: &Config, product: &Product, item: Target) -> bool {
         .any(|c| c.on.contains(&item))
 }
 
-/// 人間を待っていたIssue/PRで、また動かすcell。cellを使う人が、cellが読んだあとに何も書いていなければ `None`。
+/// また動かすcell。
+struct Resumed {
+    cell: String,
+    /// cellを使う人の返事があったか（なければ、ぶつかりを直しに動く）
+    replied: bool,
+}
+
+/// 人間を待っていたIssue/PRで、また動かすcell。cellを使う人が、cellが読んだあとに何も書いておらず、
+/// ベースとぶつかってもいなければ（`conflicting`）`None`。
 ///
 /// - `ac:needs-human`: 最後に目印を書いたcell（質問したcellや、動かせなかったcell）
 /// - `ac:in-review`: 最後に目印を書いたのがレビューのcellなら、その `next` のうち、PRを直すcell。
@@ -449,11 +507,12 @@ fn resumed_cell(
     waiting: Waiting,
     d: &discussion::Discussion,
     actors: &Actors,
-) -> std::result::Result<Option<String>, String> {
+    conflicting: bool,
+) -> std::result::Result<Option<Resumed>, String> {
     let replied = discussion::unread(&d.posts, &actors.writer)
         .iter()
         .any(|p| p.author.eq_ignore_ascii_case(&actors.operator));
-    if !replied {
+    if !replied && !conflicting {
         return Ok(None);
     }
     let in_product = |name: &str| {
@@ -488,7 +547,10 @@ fn resumed_cell(
             item.as_str()
         ));
     }
-    Ok(Some(cell.name.clone()))
+    Ok(Some(Resumed {
+        cell: cell.name.clone(),
+        replied,
+    }))
 }
 
 /// 見つけた仕事を、[`guard::check`] で確かめる。
@@ -561,6 +623,13 @@ impl Checker<'_> {
 /// 一覧で読む項目。
 const FIELDS: &str = "number title body updatedAt author { __typename login } labels(first: 100) { nodes { name } } assignees(first: 100) { nodes { login } }";
 
+/// PRだけで読む項目。ベースのブランチとぶつかっているか（GitHubが調べ終わっていなければ `UNKNOWN`）と、
+/// PRとベースのブランチの先。
+const PR_FIELDS: &str = "mergeable headRefOid baseRef { target { oid } }";
+
+/// ベースのブランチとぶつかっているときの `mergeable`。
+const CONFLICTING: &str = "CONFLICTING";
+
 /// 1回に読む件数。ラベルで絞った、開いているものだけなので、足りなくなることはまずない。
 const LIST_LIMIT: u32 = 100;
 
@@ -570,12 +639,12 @@ const LIST_LIMIT: u32 = 100;
 /// しばらくは、前のままで見つかる（cellが進めた直後に、同じtickで前のcellの仕事として拾い直し、
 /// 同じcellが2回動いた）。そのため、検索を使わずに、リポジトリのIssue/PRをラベルで絞って読む。
 fn list_query(item: Target) -> String {
-    let connection = match item {
-        Target::Issue => "issues",
-        Target::PullRequest => "pullRequests",
+    let (connection, extra) = match item {
+        Target::Issue => ("issues", ""),
+        Target::PullRequest => ("pullRequests", PR_FIELDS),
     };
     format!(
-        "query($owner: String!, $name: String!, $label: String!) {{ repository(owner: $owner, name: $name) {{ {connection}(states: OPEN, labels: [$label], first: {LIST_LIMIT}) {{ nodes {{ {FIELDS} }} }} }} }}"
+        "query($owner: String!, $name: String!, $label: String!) {{ repository(owner: $owner, name: $name) {{ {connection}(states: OPEN, labels: [$label], first: {LIST_LIMIT}) {{ nodes {{ {FIELDS} {extra} }} }} }} }}"
     )
 }
 
@@ -612,6 +681,51 @@ pub struct Quiet {
     next: BTreeMap<String, Checked>,
     /// 今の時刻（UNIXの秒）
     now: u64,
+    /// 手元で調べて、ベースとぶつからないと分かったPR（[`remember_no_conflict`]）
+    clean: BTreeMap<String, NoConflict>,
+}
+
+/// GitHubはぶつかっているとしたが、手元で調べるとぶつからなかったPR（`~/.agentcells/no-conflict.json`。
+/// `owner/repo#番号` → そのときのPRとベースの先）。どちらかが変わるまで、ぶつかりで動かし直さない。
+/// 覚えないと、tickのたびに、ラベルの付け外しと作業場所の用意をくり返すため。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoConflict {
+    head: String,
+    base: String,
+    /// 覚えた時刻（UNIXの秒）。[`NO_CONFLICT_DAYS`] たったものは、次に覚えるときに消す
+    at: u64,
+}
+
+/// ぶつからないと分かったことを覚えておく日数。
+const NO_CONFLICT_DAYS: u64 = 30;
+
+fn no_conflict_path(home: &Home) -> std::path::PathBuf {
+    home.root().join("no-conflict.json")
+}
+
+fn load_no_conflict(home: &Home) -> BTreeMap<String, NoConflict> {
+    std::fs::read_to_string(no_conflict_path(home))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// 手元で調べて、PR（`key` は `owner/repo#番号`）がベースとぶつからないと分かった。書けなくても、
+/// 次のtickでまた調べるだけなので、エラーにしない。
+pub fn remember_no_conflict(home: &Home, key: &str, head: &str, base: &str, now: u64) {
+    let mut clean = load_no_conflict(home);
+    clean.retain(|_, c| now.saturating_sub(c.at) < NO_CONFLICT_DAYS * 24 * 3600);
+    clean.insert(
+        key.to_string(),
+        NoConflict {
+            head: head.to_string(),
+            base: base.to_string(),
+            at: now,
+        },
+    );
+    if let Ok(text) = serde_json::to_string_pretty(&clean) {
+        let _ = std::fs::write(no_conflict_path(home), text);
+    }
 }
 
 /// 返事がないと読んだときのこと。
@@ -644,7 +758,15 @@ impl Quiet {
             checked,
             next: BTreeMap::new(),
             now,
+            clean: load_no_conflict(home),
         }
+    }
+
+    /// 手元で、今のPRとベースの先ではぶつからないと分かっているか。
+    fn no_conflict(&self, key: &str, head: &str, base: &str) -> bool {
+        self.clean
+            .get(key)
+            .is_some_and(|c| !head.is_empty() && c.head == head && c.base == base)
     }
 
     /// このtickで覚えたものを書く。書けなくても、次のtickで読み直すだけなので、エラーにしない。
@@ -1047,7 +1169,8 @@ next = ["implement", "done"]
             )
             .with_list("pr", "octo/app", "ac:needs-human", "[]")
             .with_list("pr", "octo/app", "ac:in-review", &format!(
-                    r#"[{{"number":30,"title":"検品","labels":[{{"name":"ac:in-review"}}],{ME},"author":{{"login":"me"}}}}]"#
+                    r#"[{{"number":30,"title":"検品","labels":[{{"name":"ac:in-review"}}],{ME},"author":{{"login":"me"}}}},
+                    {{"number":31,"title":"ぶつかり","labels":[{{"name":"ac:in-review"}}],{ME},"author":{{"login":"me"}},"mergeable":"CONFLICTING"}}]"#
                 ),
             );
         // #23: 一覧に返っても、待っているラベルが付いていないので読まない
@@ -1120,6 +1243,30 @@ next = ["implement", "done"]
             labeled("bot[bot]", "ac:in-review", "2026-10-25T04:05:00Z"),
         ];
         let probe = with_history(probe, "octo/app", 30, &pr_events, NO_EDITS);
+        // #31: 返事はないが、ベースとぶつかった
+        let probe = discussion::fake::with_item(
+            probe,
+            "octo/app",
+            31,
+            r#"{"title":"ぶつかり","user":{"login":"me"}}"#,
+        )
+        .with(
+            "gh api /repos/octo/app/pulls/31",
+            true,
+            r#"{"base":{"ref":"main"},"head":{"ref":"fix2"}}"#,
+        );
+        let probe = discussion::fake::with_list(probe, "/repos/octo/app/issues/31/comments", &[]);
+        let probe = discussion::fake::with_list(
+            probe,
+            "/repos/octo/app/pulls/31/reviews",
+            &[&review(
+                "bot[bot]",
+                "[agentcells] review round 1\n\n問題なし\n\n<!-- agentcells read-until 2026-10-25T04:00:00Z -->",
+                "2026-10-25T04:05:00Z",
+            )],
+        );
+        let probe = discussion::fake::with_list(probe, "/repos/octo/app/pulls/31/comments", &[]);
+        let probe = with_history(probe, "octo/app", 31, &pr_events, NO_EDITS);
 
         let found = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap();
         let work: Vec<String> = found.work.iter().map(Work::describe).collect();
@@ -1128,12 +1275,16 @@ next = ["implement", "done"]
             vec![
                 "triage（返事を受けて） Issue octo/issues#20「質問」",
                 "implement（返事を受けて） PR octo/app#30「検品」",
+                "implement（ぶつかりを受けて） PR octo/app#31「ぶつかり」",
             ],
             "{:?}",
             found.skipped
         );
         assert_eq!(found.work[0].waiting, Some(Waiting::NeedsHuman));
         assert_eq!(found.work[1].waiting, Some(Waiting::InReview));
+        assert!(!found.work[1].conflict);
+        assert_eq!(found.work[2].waiting, Some(Waiting::InReview));
+        assert!(found.work[2].conflict);
         assert!(found.skipped.is_empty(), "{:?}", found.skipped);
     }
 
@@ -1180,6 +1331,23 @@ next = ["implement", "done"]
             "{:?}",
             found.skipped
         );
+    }
+
+    #[test]
+    fn prs_found_clean_are_not_fixed_until_either_tip_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().to_path_buf());
+        let day = 24 * 3600;
+        remember_no_conflict(&home, "octo/app#1", "h1", "b1", 100 * day);
+        remember_no_conflict(&home, "octo/app#2", "h2", "b2", 140 * day);
+        let quiet = Quiet::load(&home);
+        assert!(quiet.no_conflict("octo/app#2", "h2", "b2"));
+        // PRかベースの先が変われば、また動かす
+        assert!(!quiet.no_conflict("octo/app#2", "h3", "b2"));
+        assert!(!quiet.no_conflict("octo/app#2", "h2", "b3"));
+        assert!(!quiet.no_conflict("octo/app#2", "", "b2"));
+        // 30日たったものは、次に覚えるときに消す
+        assert!(!quiet.clean.contains_key("octo/app#1"));
     }
 
     #[test]
@@ -1326,6 +1494,7 @@ next = ["implement", "done"]
             number,
             title: String::new(),
             waiting: None,
+            conflict: false,
         };
         let mut work = vec![
             w("triage", Target::Issue, 1),
@@ -1357,6 +1526,7 @@ next = ["implement", "done"]
             number,
             title: String::new(),
             waiting: None,
+            conflict: false,
         }
     }
 

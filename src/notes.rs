@@ -533,6 +533,7 @@ mod tests {
             number: 3,
             title: String::new(),
             waiting: None,
+            conflict: false,
         };
         let log = crate::run::claude_log(&home, &work.repo, 3);
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();

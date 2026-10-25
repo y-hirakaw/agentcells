@@ -272,6 +272,7 @@ mod tests {
             number: 4,
             title: "書かない題".into(),
             waiting: Some(Waiting::InReview),
+            conflict: false,
         };
         let report = Report {
             destination: "review".into(),

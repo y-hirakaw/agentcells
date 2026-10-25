@@ -30,7 +30,7 @@ Issueを作ると、AIエージェントのcellが仕事を進めます。次の
 
 ## インストール（作成中）
 
-今はソースからビルドします。Rustが入っていなければ、先に https://rustup.rs の手順で入れてください。
+今はソースからビルドします。Rustが入っていなければ、先に https://rustup.rs の手順で入れてください。gitは2.38以上が要ります（`agentcells doctor` が確かめます）。
 
 ```sh
 git clone https://github.com/y-hirakaw/agentcells.git

@@ -80,6 +80,16 @@ pub struct Task {
     pub operator: String,
     /// 作業するworktree（あれば）
     pub worktree: Option<PathBuf>,
+    /// ブランチが、ベースのブランチとぶつかっていれば、その中身（CLIが動かす前に調べる）
+    pub conflict: Option<Conflict>,
+}
+
+/// ベースのブランチとのぶつかり。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub base: String,
+    /// ぶつかっているファイル
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +282,23 @@ fn task_section(cell: &Cell, task: &Task) -> String {
     if let Some(base) = &d.base {
         out.push(format!(
             "- ベースブランチ: {base}（差分は `git diff origin/{base}...HEAD` で見られます）"
+        ));
+    }
+    if let Some(conflict) = &task.conflict {
+        // ファイル名は、ほかの人が入れたコミットから来るので、制御文字を置き換える
+        let files: Vec<String> = conflict
+            .files
+            .iter()
+            .map(|f| format!("`{}`", crate::display::printable(f)))
+            .collect();
+        let files = if files.is_empty() {
+            "（調べられませんでした。`agentcells cell merge` で分かります）".to_string()
+        } else {
+            files.join("、")
+        };
+        out.push(format!(
+            "- **このブランチは、ベースブランチ（origin/{}）とぶつかっています。** ぶつかっているファイル: {files}",
+            conflict.base,
         ));
     }
     out.push(String::new());
@@ -494,6 +521,7 @@ pub fn fetch_task(
         writer,
         operator,
         worktree: None,
+        conflict: None,
     })
 }
 
@@ -655,6 +683,7 @@ mod tests {
             writer: writer.to_string(),
             operator: "alice".to_string(),
             worktree: Some(PathBuf::from("/w/octo/app/12")),
+            conflict: None,
         }
     }
 
@@ -727,6 +756,21 @@ mod tests {
         assert!(prompt.contains("alice さんのコメント:\n<github>\nBでお願いします\n</github>"));
         assert!(!prompt.contains("最初の報告"));
         assert!(!prompt.contains("@alice"));
+        assert!(!prompt.contains("ぶつかって"));
+    }
+
+    #[test]
+    fn conflicts_with_the_base_are_told() {
+        let mut t = task(Vec::new(), "bot[bot]");
+        t.conflict = Some(Conflict {
+            base: "main".to_string(),
+            files: vec!["src/a.rs".to_string(), "b\u{1b}.rs".to_string()],
+        });
+        let prompt = user_prompt(&cell("implement", &["review"]), None, Some(&t));
+        assert!(prompt.contains(
+            "ベースブランチ（origin/main）とぶつかっています。** ぶつかっているファイル: `src/a.rs`、`b"
+        ));
+        assert!(!prompt.contains('\u{1b}'));
     }
 
     #[test]

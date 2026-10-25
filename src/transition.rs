@@ -145,10 +145,25 @@ pub struct Finished<'a> {
     pub created_pr: bool,
     /// AIが選んだ先
     pub requested: &'a str,
-    /// 人間を待っていたところから、コメントで動いたなら、その状態
+    /// 人間を待っていたところから動いたなら、その状態（終わったら、そのラベルを外す）
     pub waiting: Option<Waiting>,
+    /// 返事ではなく、ベースのブランチとのぶつかりを直しに動いたか
+    pub conflict: bool,
     /// 最後の目印が、このcellが自分で人間に確かめたものか（[`choices`]）
     pub asked: bool,
+}
+
+impl Finished<'_> {
+    /// cellを使う人の返事で動いたなら、待っていた状態（[`choices`] に渡す）。
+    pub fn replied_in(&self) -> Option<Waiting> {
+        replied_in(self.waiting, self.conflict)
+    }
+}
+
+/// cellを使う人の返事で動いたなら、待っていた状態。ぶつかりを直しに動いたときは、返事ではないので
+/// `None`（返事だけをして検品待ちに戻す `done` を選ばせない。ぶつかったまま戻ると、また動いてしまうため）。
+pub fn replied_in(waiting: Option<Waiting>, conflict: bool) -> Option<Waiting> {
+    waiting.filter(|_| !conflict)
 }
 
 /// 遷移のためにCLIがすること。
@@ -209,7 +224,7 @@ fn plan_labels(
     };
 
     let requested = finished.requested;
-    let choices = choices(cell, finished.waiting, finished.asked);
+    let choices = choices(cell, finished.replied_in(), finished.asked);
     if !choices.iter().any(|c| c == requested) {
         return to_human(Some(format!(
             "cell「{}」から「{requested}」には進めません（選べる先: {}）。続けるなら、進める先のcellのラベルを付けるか、ここにコメントで指示してください",
@@ -391,6 +406,7 @@ max_rounds = 2
             created_pr,
             requested,
             waiting,
+            conflict: false,
             asked: false,
         };
         plan(config, &config.products[0], &finished, &|_| runs)
@@ -689,6 +705,31 @@ max_rounds = 2
             0,
             Some(Waiting::InReview),
         );
+        assert_eq!(plan.add, strings(&["ac:review"]));
+        assert_eq!(
+            plan.remove,
+            strings(&["ac:implement", labels::WORKING, labels::IN_REVIEW])
+        );
+    }
+
+    #[test]
+    fn fixing_a_conflict_cannot_go_back_to_waiting() {
+        let (_dir, config) = config();
+        // 返事ではなく、ぶつかりで動いたときは、返事だけをして検品待ちに戻せない（ぶつかったまま戻ると、また動くため）
+        assert_eq!(replied_in(Some(Waiting::InReview), true), None);
+        let finished = |requested| Finished {
+            cell: config.cell("implement").unwrap(),
+            item: Target::PullRequest,
+            created_pr: false,
+            requested,
+            waiting: Some(Waiting::InReview),
+            conflict: true,
+            asked: false,
+        };
+        let to_human = plan(&config, &config.products[0], &finished(DONE), &|_| 0);
+        assert_eq!(to_human.destination, Destination::NeedsHuman);
+        // 直したら、レビューに回し、検品待ちのラベルは外す
+        let plan = plan(&config, &config.products[0], &finished("review"), &|_| 0);
         assert_eq!(plan.add, strings(&["ac:review"]));
         assert_eq!(
             plan.remove,

@@ -105,9 +105,35 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
 }
 
+/// 要るgitの版。ベースとのぶつかりを調べる `git merge-tree --write-tree` が2.38から、pushの前に
+/// マージの中身を確かめる `--remerge-diff` が2.36から。
+const GIT_MIN: (u32, u32) = (2, 38);
+
+/// `git version 2.50.1 (Apple Git-155)` から、(2, 50) を読む。
+fn git_version(text: &str) -> Option<(u32, u32)> {
+    let version = text.split_whitespace().nth(2)?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 fn check_git(probe: &dyn Probe) -> Check {
     match probe.run("git", &["--version"]) {
-        Some(out) if out.success => Check::ok("git", first_line(&out.stdout)),
+        Some(out) if out.success => {
+            let line = first_line(&out.stdout);
+            match git_version(&line) {
+                Some(version) if version < GIT_MIN => Check::fail(
+                    "git",
+                    format!(
+                        "{line}（{}.{} 以上が要ります。pushの前の確かめとベースとのぶつかりを調べるのに使います）",
+                        GIT_MIN.0, GIT_MIN.1
+                    ),
+                    "新しいgitを入れてください（Homebrewなら `brew install git`。ほかの環境は https://git-scm.com/downloads ）",
+                ),
+                _ => Check::ok("git", line),
+            }
+        }
         _ => Check::fail(
             "git",
             "gitが見つかりません",
@@ -496,6 +522,21 @@ mod tests {
     use crate::github::fake;
     use crate::probe::fake::FakeProbe;
     use std::ffi::OsString;
+
+    #[test]
+    fn old_git_fails() {
+        assert_eq!(
+            git_version("git version 2.50.1 (Apple Git-155)"),
+            Some((2, 50))
+        );
+        assert_eq!(git_version("git version 2.34.1"), Some((2, 34)));
+        let old = FakeProbe::default().with("git --version", true, "git version 2.34.1\n");
+        let check = check_git(&old);
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("2.38 以上"), "{}", check.detail);
+        let new = FakeProbe::default().with("git --version", true, "git version 2.38.0\n");
+        assert_eq!(check_git(&new).status, Status::Ok);
+    }
 
     fn healthy() -> FakeProbe {
         with_app(FakeProbe::default())

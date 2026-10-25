@@ -510,6 +510,29 @@ impl Runner<'_> {
         place.prepare(self.probe, work_read, self.home, &work_repo)?;
         let branch = self.checkout(work, &task, place)?;
         task.worktree = Some(place.worktree.clone());
+        if let Some(branch) = &branch {
+            match check_base(self.probe, &place.worktree, branch) {
+                BaseCheck::Conflict(conflict) => task.conflict = Some(conflict),
+                // ぶつかりを直すために動かすときに、もうぶつかっていなければ（GitHubの判定が古いなど）、動かさない。
+                // PRかベースの先が変わるまで、ぶつかりで動かし直さないように覚えておく
+                BaseCheck::Clean { base } if work.conflict => {
+                    let key = format!("{}#{}", work.repo, work.number);
+                    let now = crate::github::now().unwrap_or_default();
+                    crate::tick::remember_no_conflict(self.home, &key, &branch.start, &base, now);
+                    return Ok(Prepared::Skipped(
+                        "ベースのブランチとのぶつかりは、もうありません".to_string(),
+                    ));
+                }
+                // GitHubがぶつかっているとしたのに、手元で調べられなければ、ファイルは分からないまま、AIに任せる
+                BaseCheck::Unknown if work.conflict => {
+                    task.conflict = Some(prompt::Conflict {
+                        base: branch.base.clone(),
+                        files: Vec::new(),
+                    });
+                }
+                _ => {}
+            }
+        }
 
         // gitignoreされたファイルを置き、その中身のハッシュを、コミットさせないために覚えておく
         let placed = files::apply(self.home, &work_repo, &place.worktree)?;
@@ -535,6 +558,7 @@ impl Runner<'_> {
             scanner: self.scanner.to_path_buf(),
             tmp: place.tmp.clone(),
             caches: cache_dirs.clone(),
+            base: branch.as_ref().map(|b| b.base.clone()),
         };
         let context_path = place.run.join("context.json");
         context.save(&context_path)?;
@@ -564,10 +588,11 @@ impl Runner<'_> {
             None => None,
         };
         let asked = crate::discussion::asked_by(&task.discussion.posts, &task.writer, &cell.name);
+        let replied_in = transition::replied_in(work.waiting, work.conflict);
         Ok(Prepared::Ready(Box::new(Ready {
             user: prompt::user_prompt(cell, extra.as_deref(), Some(&task)),
-            system: prompt::system_prompt(cell, work.waiting, asked),
-            schema: transition::output_schema(cell, work.waiting, asked),
+            system: prompt::system_prompt(cell, replied_in, asked),
+            schema: transition::output_schema(cell, replied_in, asked),
             settings_path,
             context_path,
             labels_before: issue.labels(item_read)?,
@@ -796,6 +821,7 @@ impl Runner<'_> {
                     created_pr,
                     requested,
                     waiting: work.waiting,
+                    conflict: work.conflict,
                     asked,
                 },
                 &runs,
@@ -1011,6 +1037,7 @@ impl Runner<'_> {
             self.probe,
             staging.path(),
             &branch.start,
+            &format!("refs/heads/{}", branch.base),
             &branch.name,
             &ready.placed_blobs,
             self.scanner,
@@ -1499,6 +1526,67 @@ fn present<'a>(labels: &[String], remove: &[&'a str], add: &[&str]) -> Vec<&'a s
         }
     }
     out
+}
+
+/// ブランチが、ベースのブランチとぶつかるかを、手元で調べた結果。
+#[derive(Debug, PartialEq, Eq)]
+enum BaseCheck {
+    /// ぶつからない（`base` は、調べたときのベースのブランチの先）
+    Clean {
+        base: String,
+    },
+    Conflict(prompt::Conflict),
+    /// 調べられなかった（gitが古い、ベースのブランチを読めないなど）
+    Unknown,
+}
+
+/// ブランチが、ベースのブランチ（`origin/<base>`）とぶつかるかを、`git merge-tree` で調べる。
+fn check_base(probe: &dyn Probe, worktree: &Path, branch: &Branch) -> BaseCheck {
+    let Ok(wt) = path_str(worktree) else {
+        return BaseCheck::Unknown;
+    };
+    let base = format!("origin/{}", branch.base);
+    let Ok(tip) = git_out(probe, &["-C", &wt, "rev-parse", "--verify", &base]) else {
+        return BaseCheck::Unknown;
+    };
+    let Some(out) = probe.run_with_env(
+        "git",
+        &[
+            "-C",
+            &wt,
+            "merge-tree",
+            "--write-tree",
+            "-z",
+            "--name-only",
+            "--no-messages",
+            &base,
+            "HEAD",
+        ],
+        ISOLATED_GIT_ENV,
+    ) else {
+        return BaseCheck::Unknown;
+    };
+    // ぶつかりがなければ0、あれば1で終わる。木のあとに、ぶつかったファイルが並ぶ（NULで区切る。
+    // 区切らないと、日本語などの名前が引用符と8進数になる）
+    match out.code {
+        Some(0) => BaseCheck::Clean {
+            base: tip.trim().to_string(),
+        },
+        Some(1) => {
+            let files: Vec<String> = out
+                .stdout
+                .split('\0')
+                .skip(1)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            BaseCheck::Conflict(prompt::Conflict {
+                base: branch.base.clone(),
+                files,
+            })
+        }
+        _ => BaseCheck::Unknown,
+    }
 }
 
 /// gitを、使う人とシステムの設定を読まずに動かし、標準出力を返す。
@@ -2407,6 +2495,7 @@ mod tests {
             number: 3,
             title: "t".to_string(),
             waiting: None,
+            conflict: false,
         };
         // 止めきれなかったものとして、今動いているこのテストのプロセスを渡す
         let me = std::process::id();
@@ -2475,6 +2564,67 @@ mod tests {
                 .any(|c| c.contains("--add-label ac:needs-human")),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn finds_files_that_conflict_with_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("日本.txt"), "a").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "ac/x"]);
+        std::fs::write(repo.join("日本.txt"), "pr").unwrap();
+        git(&["commit", "-qam", "pr"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(repo.join("b.txt"), "b").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "main"]);
+        let main = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/main", &main]);
+        git(&["checkout", "-q", "ac/x"]);
+        let branch = Branch {
+            name: "ac/x".into(),
+            base: "main".into(),
+            start: String::new(),
+        };
+        let probe = crate::probe::SystemProbe;
+        // 別のファイルを変えただけなら、ぶつからない
+        assert_eq!(
+            check_base(&probe, &repo, &branch),
+            BaseCheck::Clean { base: main.clone() }
+        );
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(repo.join("日本.txt"), "main").unwrap();
+        git(&["commit", "-qam", "main2"]);
+        let main = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/main", &main]);
+        git(&["checkout", "-q", "ac/x"]);
+        assert_eq!(
+            check_base(&probe, &repo, &branch),
+            BaseCheck::Conflict(prompt::Conflict {
+                base: "main".into(),
+                files: vec!["日本.txt".into()],
+            })
+        );
+        // ベースのブランチを読めなければ、分からない
+        let gone = Branch {
+            base: "gone".into(),
+            ..branch
+        };
+        assert_eq!(check_base(&probe, &repo, &gone), BaseCheck::Unknown);
     }
 
     #[test]

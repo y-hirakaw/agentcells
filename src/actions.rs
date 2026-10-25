@@ -45,6 +45,9 @@ pub struct Context {
     /// ビルドツールのキャッシュ（`gradle` など）と、その場所（productごと、agentcellsが持つ）
     #[serde(default)]
     pub caches: BTreeMap<String, PathBuf>,
+    /// ベースのブランチ（PRのベース。Issueなら既定のブランチ）。`merge` が `origin/<base>` を取り込む
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +344,143 @@ fn git_output(worktree: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// `merge` の結果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Merged {
+    /// ぶつからずに取り込み、マージのコミットを作った（取り込むものがなかったときも）
+    Clean,
+    /// ぶつかった。直してから `commit` でマージのコミットを作る
+    Conflicts(Vec<String>),
+}
+
+/// ベースのブランチ（`origin/<base>`）を取り込む。ぶつかりを直すための、ただ1つのマージ。
+/// push の前の確かめ（[`crate::pr::verify`]）は、ベースのブランチ以外を取り込んだマージを断る。
+pub fn merge(context: &Context) -> Result<Merged> {
+    let base = context.base.as_deref().ok_or_else(|| {
+        Error::new("ベースのブランチが分かりません")
+            .with_hint("人間に回してください（needs-human）")
+    })?;
+    let wt = &context.worktree;
+    let upstream = format!("origin/{base}");
+    let name = format!("user.name={}", context.identity.name);
+    let email = format!("user.email={}", context.identity.email);
+    let args = [
+        "-c",
+        name.as_str(),
+        "-c",
+        email.as_str(),
+        "merge",
+        "--no-edit",
+        "--no-stat",
+        "-q",
+        upstream.as_str(),
+    ];
+    match git_output(wt, &args) {
+        Ok(_) => Ok(Merged::Clean),
+        Err(e) => {
+            let conflicts: Vec<String> =
+                git_output(wt, &["diff", "-z", "--name-only", "--diff-filter=U"])?
+                    .split('\0')
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            // ぶつかった以外の理由（コミットしていない変更があるなど）なら、そのまま返す
+            if conflicts.is_empty() {
+                return Err(e);
+            }
+            Ok(Merged::Conflicts(conflicts))
+        }
+    }
+}
+
+/// マージの途中なら、自動でマージした結果の木と、ぶつかったファイル。マージの途中でなければ `None`。
+///
+/// マージのコミットを調べるときは、1つ目の親（`HEAD`）ではなく、この木と比べる。`HEAD` と比べると、
+/// ベースのブランチで人が足した行まで「足した行」になり、それで断ってしまうため（pushの前の確かめ
+/// [`crate::pr::verify`] の `--remerge-diff` と同じ範囲にする）。
+fn auto_merge(worktree: &Path) -> Result<Option<(String, Vec<String>)>> {
+    if git_output(worktree, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_err() {
+        return Ok(None);
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "-z",
+            "--name-only",
+            "--no-messages",
+            "HEAD",
+            "MERGE_HEAD",
+        ])
+        .envs(ISOLATED_GIT_ENV.iter().copied())
+        .output()
+        .map_err(|e| Error::new(format!("gitを動かせません: {e}")))?;
+    // ぶつかりがなければ0、あれば1で終わる。木のあとに、ぶつかったファイルが並ぶ（どれもNULで区切る。
+    // 区切らないと、日本語などの名前が引用符と8進数になり、その名前ではファイルを読めない）
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        return Err(Error::new(format!(
+            "自動のマージを作れません: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.split('\0').filter(|l| !l.is_empty());
+    let tree = lines
+        .next()
+        .ok_or_else(|| Error::new("自動のマージを作れません"))?
+        .to_string();
+    Ok(Some((tree, lines.map(str::to_string).collect())))
+}
+
+/// ぶつかったファイルに、ぶつかりの印（`<<<<<<<`、`>>>>>>>`）が残っていないかを見る。残したまま
+/// コミットすると、壊れたファイルがマージのコミットに入るため。ほかのファイルは見ない（ベースの
+/// ブランチの文書やテストのデータに、同じ形の行がありうるため）。
+fn unresolved(worktree: &Path, conflicted: &[String]) -> Result<()> {
+    let mut left = Vec::new();
+    for path in conflicted {
+        let Ok(text) = git_output(worktree, &["show", &format!(":{path}")]) else {
+            // 消して直したファイルは、ステージにない。あるのに読めなければ、調べずに通さない
+            let staged = git_output(
+                worktree,
+                &["--literal-pathspecs", "ls-files", "-z", "--", path],
+            )?;
+            if staged.is_empty() {
+                continue;
+            }
+            return Err(Error::new(format!(
+                "ぶつかったファイル {path} を読めないので、コミットしませんでした"
+            ))
+            .with_hint("人間に回してください（needs-human）"));
+        };
+        for (i, line) in text.lines().enumerate() {
+            if line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> ") {
+                left.push(format!("  - {path}:{}", i + 1));
+            }
+        }
+    }
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "ぶつかりの印が残っているので、コミットしませんでした:\n{}",
+        left.join("\n")
+    ))
+    .with_hint("ぶつかったところを直してから、もう一度コミットしてください"))
+}
+
+/// 途中のマージをやめて、取り込む前に戻す。
+pub fn merge_abort(context: &Context) -> Result<()> {
+    git_output(&context.worktree, &["merge", "--abort"]).map(|_| ())
+}
+
 /// worktreeの変更をすべてコミットする。置いた秘密のファイルの中身が入っていたら、コミットせずに断る。
 /// 名前で比べると、名前を変えたり写したりしたものを見逃すので、中身（blobのハッシュ）で比べる。
 pub fn commit(context: &Context, message: &str) -> Result<String> {
@@ -377,7 +517,12 @@ pub fn commit(context: &Context, message: &str) -> Result<String> {
             leaked.join(", ")
         )));
     }
-    scan_secrets(context)?;
+    // マージの途中なら、自動でマージした結果と比べる（ぶつかりの直しと、足した変更だけを見る）
+    let merging = auto_merge(wt)?;
+    if let Some((_, conflicted)) = &merging {
+        unresolved(wt, conflicted)?;
+    }
+    scan_secrets(context, merging.as_ref().map(|(tree, _)| tree.as_str()))?;
     let mut args: Vec<String> = vec![
         "-c".to_string(),
         format!("user.name={}", context.identity.name),
@@ -418,7 +563,9 @@ struct Finding {
 /// 見逃すものを決められる。どれもAIが書けるので、既定の決まりだけで調べる:
 /// - 足した行だけを標準入力で渡し、AIが書けない `/` で動かす（設定と無視のファイルを読ませない）
 /// - 設定を選ぶ環境変数を消し、`betterleaks:allow` を無視させる
-fn scan_secrets(context: &Context) -> Result<()> {
+///
+/// `against` は比べる相手（マージの途中なら、自動でマージした結果の木）。なければ `HEAD`。
+fn scan_secrets(context: &Context, against: Option<&str>) -> Result<()> {
     let diff = git_output(
         &context.worktree,
         &[
@@ -426,6 +573,7 @@ fn scan_secrets(context: &Context) -> Result<()> {
             "core.quotePath=false",
             "diff",
             "--cached",
+            against.unwrap_or("HEAD"),
             "--no-color",
             "--no-ext-diff",
             // AIが書ける .git/config で、見出しの形を変えさせない（変わっても調べる中身は同じで、出す名前だけがずれる）
@@ -872,8 +1020,109 @@ mod tests {
             scanner,
             tmp,
             caches: BTreeMap::new(),
+            base: Some("main".to_string()),
         };
         (dir, context)
+    }
+
+    #[test]
+    fn merge_takes_in_the_base_and_reports_conflicts() {
+        let (_dir, ctx) = setup();
+        let wt = ctx.worktree.clone();
+        let start = git(&wt, &["rev-parse", "HEAD"]);
+        // ベースのブランチ（origin/main）が先に進んだ
+        let advance = |file: &str, content: &str| {
+            git(
+                &wt,
+                &["checkout", "-q", "--detach", "refs/remotes/origin/main"],
+            );
+            std::fs::write(wt.join(file), content).unwrap();
+            git(&wt, &["commit", "-qam", "main"]);
+            let tip = git(&wt, &["rev-parse", "HEAD"]);
+            git(&wt, &["update-ref", "refs/remotes/origin/main", &tip]);
+            git(&wt, &["checkout", "-q", "-"]);
+        };
+        git(&wt, &["update-ref", "refs/remotes/origin/main", &start]);
+        git(&wt, &["checkout", "-q", "-b", "ac/x"]);
+        std::fs::write(wt.join(".gitignore"), "local.properties\nmine\n").unwrap();
+        git(&wt, &["commit", "-qam", "pr"]);
+        advance("a.txt", "from main");
+        assert_eq!(merge(&ctx).unwrap(), Merged::Clean);
+        assert_eq!(
+            git(&wt, &["show", "-s", "--format=%P"]).split(' ').count(),
+            2
+        );
+
+        // 同じところを変えていれば、ぶつかる。直してコミットすると、マージのコミットになる。
+        // ベースで人が足した行（秘密らしいものや、ぶつかりの印に似たもの）では断らない
+        std::fs::write(wt.join("a.txt"), "from pr").unwrap();
+        git(&wt, &["commit", "-qam", "pr2"]);
+        std::fs::write(wt.join("doc.md"), "x").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "doc"]);
+        git(
+            &wt,
+            &["checkout", "-q", "--detach", "refs/remotes/origin/main"],
+        );
+        std::fs::write(
+            wt.join("fixture.txt"),
+            "token = FAKE-SECRET\n<<<<<<< example\n",
+        )
+        .unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "fixture"]);
+        let tip = git(&wt, &["rev-parse", "HEAD"]);
+        git(&wt, &["update-ref", "refs/remotes/origin/main", &tip]);
+        git(&wt, &["checkout", "-q", "-"]);
+        advance("a.txt", "from main again");
+        assert_eq!(
+            merge(&ctx).unwrap(),
+            Merged::Conflicts(vec!["a.txt".to_string()])
+        );
+        // ぶつかりの印を残したままでは、コミットしない
+        let err = commit(&ctx, "Merge main").unwrap_err();
+        assert!(err.message.contains("a.txt:1"), "{}", err.message);
+        // 直しに入れた秘密は断る
+        std::fs::write(wt.join("a.txt"), "both FAKE-SECRET").unwrap();
+        let err = commit(&ctx, "Merge main").unwrap_err();
+        assert!(err.message.contains("秘密"), "{}", err.message);
+        std::fs::write(wt.join("a.txt"), "both").unwrap();
+        commit(&ctx, "Merge main").unwrap();
+        assert_eq!(
+            git(&wt, &["show", "-s", "--format=%P"]).split(' ').count(),
+            2
+        );
+
+        // やめれば、取り込む前に戻る
+        std::fs::write(wt.join("a.txt"), "pr3").unwrap();
+        git(&wt, &["commit", "-qam", "pr3"]);
+        let before = git(&wt, &["rev-parse", "HEAD"]);
+        advance("a.txt", "main3");
+        assert!(matches!(merge(&ctx).unwrap(), Merged::Conflicts(_)));
+        merge_abort(&ctx).unwrap();
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git(&wt, &["status", "--porcelain"]), "");
+
+        // 日本語の名前のファイルも、ぶつかりの印を見る（a.txt は、やめたときのまま、またぶつかる）
+        std::fs::write(wt.join("日本.txt"), "pr").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "jp"]);
+        git(
+            &wt,
+            &["checkout", "-q", "--detach", "refs/remotes/origin/main"],
+        );
+        std::fs::write(wt.join("日本.txt"), "main").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "jp main"]);
+        let tip = git(&wt, &["rev-parse", "HEAD"]);
+        git(&wt, &["update-ref", "refs/remotes/origin/main", &tip]);
+        git(&wt, &["checkout", "-q", "-"]);
+        assert_eq!(
+            merge(&ctx).unwrap(),
+            Merged::Conflicts(vec!["a.txt".to_string(), "日本.txt".to_string()])
+        );
+        let err = commit(&ctx, "Merge main").unwrap_err();
+        assert!(err.message.contains("日本.txt:1"), "{}", err.message);
     }
 
     /// 偽のbetterleaks。「FAKE-SECRET」を含む行を見つけたことにし、動いた場所と引数を書き残す。
