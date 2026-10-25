@@ -461,7 +461,7 @@ mod tests {
             .with(
                 "gh label list --repo octo/app --json name --limit 1000",
                 true,
-                r#"[{"name":"ac:working"},{"name":"ac:needs-human"},{"name":"ac:triage"}]"#,
+                r#"[{"name":"ac:working"},{"name":"ac:needs-human"},{"name":"ac:in-review"},{"name":"ac:triage"}]"#,
             )
             .with(
                 "claude auth status",
@@ -861,7 +861,9 @@ private_key = "github-app.pem"
         let check = find(&run(&home, Some(&path), &probe), "labels").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(
-            check.detail.contains("octo/app: ac:needs-human, ac:triage"),
+            check
+                .detail
+                .contains("octo/app: ac:needs-human, ac:in-review, ac:triage"),
             "{}",
             check.detail
         );

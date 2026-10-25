@@ -8,6 +8,7 @@
 //!
 //! 使う人から標準のプロンプトが見えないと困るので、`agentcells prompt show` で組み立てた結果を表示できる。
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::config::{Cell, Config, Target};
@@ -17,7 +18,7 @@ use crate::github::{self, Credentials, Purpose};
 use crate::home::RepoName;
 use crate::marker;
 use crate::probe::Probe;
-use crate::transition::{self, DONE, NEEDS_HUMAN};
+use crate::transition::{self, DONE, NEEDS_HUMAN, Waiting};
 
 const COMMON: &str = include_str!("../prompts/common.md");
 
@@ -93,8 +94,38 @@ impl Task {
         ) + 1
     }
 
+    /// cellを使う人の最後のコメントから、このcellが何回動いたか。往復の上限は、これで数える
+    /// （人が返事をしたら、また上限まで動ける。上限は、人を挟まないAIどうしの往復を止めるためのもの）。
+    pub fn runs_since_operator(&self, cell: &str) -> u32 {
+        let posts = &self.discussion.posts;
+        let start = posts
+            .iter()
+            .rposition(|p| !self.is_marker(p) && p.author.eq_ignore_ascii_case(&self.operator))
+            .map_or(0, |i| i + 1);
+        let rounds: BTreeSet<u32> = posts[start..]
+            .iter()
+            .filter(|p| self.is_marker(p))
+            .filter_map(|p| marker::parse(&p.body))
+            .filter(|(c, round)| c == cell && *round > 0)
+            .map(|(_, round)| round)
+            .collect();
+        rounds.len() as u32
+    }
+
+    /// 読んだやり取りがどこまでか（GitHubの時刻）。目印の最後の行に書く。
+    pub fn read_until(&self) -> String {
+        let d = &self.discussion;
+        d.posts
+            .iter()
+            .map(|p| p.at.as_str())
+            .chain([d.created_at.as_str()])
+            .max()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     fn is_marker(&self, post: &Post) -> bool {
-        marker::parse(&post.body).is_some() && post.author == self.writer
+        discussion::is_marker(post, &self.writer)
     }
 
     fn marker_posts<'a>(&'a self, posts: &'a [Post]) -> impl Iterator<Item = &'a Post> + 'a {
@@ -103,12 +134,13 @@ impl Task {
 
     /// 最後の目印付きの投稿の位置。
     fn last_marker(&self, posts: &[Post]) -> Option<usize> {
-        posts.iter().rposition(|p| self.is_marker(p))
+        discussion::last_marker(posts, &self.writer)
     }
 }
 
 /// システムプロンプト（`--append-system-prompt` で渡す）。標準の決まり、cellの役割、指摘の返し方、進め先を書く。
-pub fn system_prompt(cell: &Cell) -> String {
+/// `waiting` は、人間を待っていたところから、cellを使う人のコメントで動いたときの、その状態。
+pub fn system_prompt(cell: &Cell, waiting: Option<Waiting>) -> String {
     let mut prompt = COMMON.replace("{cell}", &cell.name).trim_end().to_string();
     if let Some(role) = builtin(&cell.name) {
         prompt.push_str("\n\n");
@@ -125,8 +157,11 @@ pub fn system_prompt(cell: &Cell) -> String {
         );
     }
     prompt.push_str("\n\n## 進め先（next）\n\n次のどれかを選んでください。\n");
-    for choice in transition::choices(cell) {
+    for choice in transition::choices(cell, waiting) {
         let meaning = match choice.as_str() {
+            DONE if waiting == Some(Waiting::InReview) && !cell.review => {
+                "変更は要らない（コメントへの返事だけをして、人間の検品待ちに戻す）".to_string()
+            }
             DONE => "これ以上することがない（Issueなら閉じる。PRなら人間に検品を頼む）".to_string(),
             NEEDS_HUMAN => "人間の答えや作業が要る".to_string(),
             name => match builtin_summary(name) {
@@ -214,9 +249,10 @@ fn task_section(cell: &Cell, task: &Task) -> String {
         // タイトルも外部の人が書けるので、囲みの外には出さない（本文の囲みの1行目に入れる）
         format!("- 対象: {} {}#{}", kind(task.item), task.repo, task.number),
         format!(
-            "- この cell が動くのは {} 回目です（上限 {} 回）",
+            "- この cell が動くのは {} 回目です。cellを使う人のコメントを挟まずに続けて動けるのは {} 回までで、今回はその {} 回目です",
             task.round(&cell.name),
-            cell.max_rounds
+            cell.max_rounds,
+            task.runs_since_operator(&cell.name) + 1
         ),
     ];
     if let Some(worktree) = &task.worktree {
@@ -284,10 +320,8 @@ fn task_section(cell: &Cell, task: &Task) -> String {
         }
     }
 
-    let after: Vec<&Post> = posts[last.map(|i| i + 1).unwrap_or(0)..]
-        .iter()
-        .filter(|p| !task.is_marker(p))
-        .collect();
+    // 前のcellが動いている間に書かれたコメントも、読んでいないものとして入れる
+    let after = discussion::unread(posts, &task.writer);
     // 指示として扱うのは、cellを使う人のコメントだけ。ほかの人は、リポジトリのメンバーでも、
     // ラベルを付けずに指示を足せてしまうので、参考として分ける
     let (trusted, outside): (Vec<&Post>, Vec<&Post>) = after
@@ -545,7 +579,7 @@ pub fn show(
     };
     Ok(format!(
         "===== システムプロンプト（agentcellsの標準。`--append-system-prompt` で渡す） =====\n\n{}\n===== 指示（{extra_note}） =====\n\n{}",
-        system_prompt(cell),
+        system_prompt(cell, None),
         user_prompt(cell, extra.as_deref(), task.as_ref())
     ))
 }
@@ -610,7 +644,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_rules_role_and_choices() {
-        let prompt = system_prompt(&cell("triage", &["implement", "done"]));
+        let prompt = system_prompt(&cell("triage", &["implement", "done"]), None);
         assert!(prompt.contains("cell「triage」として動いています"));
         assert!(!prompt.contains("{cell}"));
         assert!(prompt.contains("GitHub への書き込み"));
@@ -625,16 +659,16 @@ mod tests {
     fn review_instructions_follow_the_output_schema() {
         let mut review = cell("review", &["implement", "done"]);
         review.review = true;
-        assert!(system_prompt(&review).contains("findings に1件ずつ"));
+        assert!(system_prompt(&review, None).contains("findings に1件ずつ"));
         review.review = false;
-        let prompt = system_prompt(&review);
+        let prompt = system_prompt(&review, None);
         assert!(!prompt.contains("findings に1件ずつ"));
         assert!(prompt.contains("comment に箇条書き"));
     }
 
     #[test]
     fn custom_cells_get_only_the_common_rules() {
-        let prompt = system_prompt(&cell("design", &["implement"]));
+        let prompt = system_prompt(&cell("design", &["implement"]), None);
         assert!(prompt.contains("cell「design」"));
         assert!(!prompt.contains("役割:"));
     }
@@ -658,7 +692,9 @@ mod tests {
         assert!(prompt.starts_with("## このプロダクトでの追加の指示\n\n質問は日本語で"));
         assert!(prompt.contains("- 対象: Issue octo/app#12\n"));
         assert!(prompt.contains("<github>\nタイトル: ログインできない\n\n本文です\n</github>"));
-        assert!(prompt.contains("2 回目です（上限 3 回）"));
+        assert!(prompt.contains(
+            "2 回目です。cellを使う人のコメントを挟まずに続けて動けるのは 3 回までで、今回はその 1 回目です"
+        ));
         assert!(prompt.contains("/w/octo/app/12"));
         // 何を聞いたかと、その答えの両方が渡る
         assert!(prompt.contains("前の cell からの引き継ぎ"));
@@ -666,6 +702,56 @@ mod tests {
         assert!(prompt.contains("alice さんのコメント:\n<github>\nBでお願いします\n</github>"));
         assert!(!prompt.contains("最初の報告"));
         assert!(!prompt.contains("@alice"));
+    }
+
+    #[test]
+    fn comments_written_while_the_cell_ran_are_passed_on() {
+        let t = task(
+            vec![
+                post("alice", true, "最初の報告", "1"),
+                post("alice", true, "動いている間に足したこと", "3"),
+                post(
+                    "bot[bot]",
+                    false,
+                    "[agentcells] triage round 1\n\nAとBのどちらですか\n\n<!-- agentcells read-until 2 -->",
+                    "4",
+                ),
+            ],
+            "bot[bot]",
+        );
+        let prompt = user_prompt(&cell("triage", &["done"]), None, Some(&t));
+        let after = prompt.split("そのあとの").nth(1).unwrap();
+        assert!(after.contains("動いている間に足したこと"), "{prompt}");
+        assert!(!after.contains("最初の報告"), "{prompt}");
+    }
+
+    #[test]
+    fn rounds_are_limited_between_the_operators_comments() {
+        let marker = |cell: &str, round: u32, at: &str| {
+            post(
+                "bot[bot]",
+                false,
+                &format!("[agentcells] {cell} round {round}"),
+                at,
+            )
+        };
+        let t = task(
+            vec![
+                marker("implement", 1, "1"),
+                marker("review", 1, "2"),
+                marker("implement", 2, "3"),
+                marker("review", 2, "4"),
+                post("alice", true, "ここも直して", "5"),
+                marker("implement", 3, "6"),
+                // 動かせなかったとき（round 0）は数えない
+                marker("implement", 0, "7"),
+            ],
+            "bot[bot]",
+        );
+        assert_eq!(t.round("implement"), 4);
+        assert_eq!(t.runs_since_operator("implement"), 1);
+        assert_eq!(t.runs_since_operator("review"), 0);
+        assert_eq!(t.read_until(), "7");
     }
 
     #[test]

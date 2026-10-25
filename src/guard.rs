@@ -15,6 +15,8 @@
 //! - Assigneesにoperatorがいて、operatorを最後に割り当てたのがoperator自身
 //! - 今のcellのラベルを最後に付けたのが、operatorか、agentcells自身（書き込みのアカウント）
 //! - operatorが承認していて、そのあとにほかの人がタイトル・本文・operatorのコメントを書き換えていない
+//! - agentcellsのコメントやレビュー（目印）を、ほかの人が書き換えていない。どのcellを動かすか、どこまで読んだか、
+//!   何回動いたかを目印から読むため
 //!
 //! PRの仕事:
 //! - agentcellsが作ったPR（作者が書き込みのアカウント）は、agentcellsがoperatorを割り当てる。
@@ -52,6 +54,21 @@ impl Actors {
         login.eq_ignore_ascii_case(&self.writer)
     }
 
+    /// GraphQLの `author` や `editor` が、書き込みのアカウントか。GraphQLは、Appを `[bot]` を付けずに
+    /// 返すので、`__typename` が `Bot` のときだけ、`[bot]` を外した名前と比べる
+    /// （同じ名前の人のアカウントと見分けるため）。
+    fn is_writer_user(&self, user: &Option<User>) -> bool {
+        let Some(user) = user else {
+            return false;
+        };
+        self.is_writer(&user.login)
+            || user.typename.as_deref() == Some("Bot")
+                && self
+                    .writer
+                    .strip_suffix("[bot]")
+                    .is_some_and(|slug| user.login.eq_ignore_ascii_case(slug))
+    }
+
     fn is_trusted(&self, login: &str) -> bool {
         self.is_operator(login) || self.is_writer(login)
     }
@@ -82,6 +99,9 @@ pub struct Request<'a> {
 #[derive(Deserialize)]
 struct User {
     login: String,
+    /// GraphQLの `__typename`（`User`、`Bot` など）。REST APIにはない
+    #[serde(rename = "__typename", default)]
+    typename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,7 +129,7 @@ fn login(user: &Option<User>) -> &str {
 /// - `userContentEdits` は新しい順に返るので（cli/cli#1 で確かめた）、`first` で新しいものから読む
 /// - コメントとレビューは古い順に返るので、`last` で新しいものから読む
 /// - どれも、読みきれなければ（`hasNextPage` / `hasPreviousPage`）動かさない
-pub const EDITS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { ... on Issue { state assignees(first: 20) { nodes { login } } userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } } ... on PullRequest { state assignees(first: 20) { nodes { login } } userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } reviews(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } comments(first: 100) { pageInfo { hasNextPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } } } } } } } fragment edits on UserContentEditConnection { pageInfo { hasNextPage } nodes { editedAt editor { login } } }";
+pub const EDITS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { ... on Issue { state assignees(first: 20) { nodes { login } } userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { __typename login } userContentEdits(first: 20) { ...edits } } } } ... on PullRequest { state assignees(first: 20) { nodes { login } } userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { __typename login } userContentEdits(first: 20) { ...edits } } } reviews(last: 100) { pageInfo { hasPreviousPage } nodes { author { __typename login } userContentEdits(first: 20) { ...edits } comments(first: 100) { pageInfo { hasNextPage } nodes { author { __typename login } userContentEdits(first: 20) { ...edits } } } } } } } } } fragment edits on UserContentEditConnection { pageInfo { hasNextPage } nodes { editedAt editor { __typename login } } }";
 
 #[derive(Deserialize)]
 struct EditsResponse {
@@ -274,6 +294,7 @@ impl History {
     }
 
     /// `since` 以後（同じ秒も含む）に、ほかの人がタイトル、本文、operatorのコメントやレビューを書き換えたか。
+    /// agentcellsのコメントやレビュー（目印）の書き換えも見る。
     /// `what` はIssue/PRの呼び方（理由に使う）。
     fn changed_by_others(&self, since: &str, actors: &Actors, what: &str) -> Option<String> {
         if let Some(e) = self.events.iter().find(|e| {
@@ -303,10 +324,18 @@ impl History {
                 ));
             }
             for item in connection.items() {
-                if actors.is_operator(login(&item.author))
+                // agentcellsの目印からは、どのcellが待っているか、どこまで読んだか、何回動いたかを読む
+                let whose = if actors.is_operator(login(&item.author)) {
+                    Some(actors.operator.as_str())
+                } else if actors.is_writer_user(&item.author) {
+                    Some("agentcells")
+                } else {
+                    None
+                };
+                if let Some(whose) = whose
                     && let Some(reason) = edited_by_others(&item.user_content_edits, since, actors)
                 {
-                    return Some(format!("{what}の {} の{kind}を、{reason}", actors.operator));
+                    return Some(format!("{what}の {whose} の{kind}を、{reason}"));
                 }
                 stack.push((&item.comments, "レビューのコメント"));
             }
@@ -322,10 +351,10 @@ fn edited_by_others(
     actors: &Actors,
 ) -> Option<String> {
     let edits = edits.as_ref()?;
-    if let Some(edit) = edits
-        .items()
-        .find(|e| e.edited_at.as_str() >= since && !actors.is_trusted(login(&e.editor)))
-    {
+    if let Some(edit) = edits.items().find(|e| {
+        e.edited_at.as_str() >= since
+            && !(actors.is_trusted(login(&e.editor)) || actors.is_writer_user(&e.editor))
+    }) {
         return Some(format!("{} が書き換えました", login(&edit.editor)));
     }
     edits
@@ -743,6 +772,49 @@ mod tests {
     }
 
     #[test]
+    fn skips_edits_of_agentcells_markers_after_the_approval() {
+        // 目印から、どのcellを動かすか、どこまで読んだか、何回動いたかを読む。GraphQLは、Appの作者を
+        // `[bot]` を付けずに返し、編集の履歴には、最初に書いたときの版（書いた本人）も入る
+        let marker_edit = |editor: &str, kind: &str, at: &str| {
+            format!(
+                r#"{{"userContentEdits":{{"nodes":[]}},"comments":{{"nodes":[{{"author":{{"__typename":"Bot","login":"agentcells-yh"}},"userContentEdits":{{"nodes":[{{"editedAt":"{at}","editor":{{"__typename":"{kind}","login":"{editor}"}}}},{{"editedAt":"{T2}","editor":{{"__typename":"Bot","login":"agentcells-yh"}}}}]}}}}]}}}}"#
+            )
+        };
+        let mut events = approved_issue();
+        events.push(labeled("agentcells-yh[bot]", "ac:needs-human", T3));
+        let reason = issue(&events, &marker_edit("eager", "User", T3), "ac:needs-human").unwrap();
+        assert!(
+            reason.contains("Issueの agentcells のコメントを、eager が書き換えました"),
+            "{reason}"
+        );
+        // Appと同じ名前の人のアカウントは、Appではない
+        assert!(
+            issue(
+                &events,
+                &marker_edit("agentcells-yh", "User", T3),
+                "ac:needs-human"
+            )
+            .is_some()
+        );
+        // operatorが直したのなら、operatorが決めたこと。最初に書いたときの版は、書き換えではない
+        assert_eq!(
+            issue(
+                &events,
+                &marker_edit("y-hirakaw", "User", T3),
+                "ac:needs-human"
+            ),
+            None
+        );
+        // 書き換えられたあとに、operatorが見直してラベルを付け直せば動く
+        let mut relabeled = events.clone();
+        relabeled.push(labeled("y-hirakaw", "ac:triage", T4));
+        assert_eq!(
+            issue(&relabeled, &marker_edit("eager", "User", T3), "ac:triage"),
+            None
+        );
+    }
+
+    #[test]
     fn skips_when_history_is_too_long_to_check() {
         let many = r#"{"userContentEdits":{"nodes":[]},"comments":{"pageInfo":{"hasPreviousPage":true},"nodes":[]}}"#;
         assert!(
@@ -790,6 +862,13 @@ mod tests {
                 NO_EDITS
             )
             .is_some()
+        );
+
+        // operatorがPRの本文を直した。編集の履歴には、最初に書いたときの版（App。GraphQLでは `[bot]` なし）も入る
+        let operator_fixed = r#"{"state":"OPEN","assignees":{"nodes":[{"login":"y-hirakaw"}]},"userContentEdits":{"nodes":[{"editedAt":"2026-10-25T04:00:00Z","editor":{"__typename":"User","login":"y-hirakaw"}},{"editedAt":"2026-10-25T03:00:00Z","editor":{"__typename":"Bot","login":"agentcells-yh"}}]},"comments":{"nodes":[]},"reviews":{"nodes":[]}}"#;
+        assert_eq!(
+            pr(&pr_events, operator_fixed, &approved_issue(), NO_EDITS),
+            None
         );
     }
 

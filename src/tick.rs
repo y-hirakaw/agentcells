@@ -1,7 +1,11 @@
 //! 定期実行で呼ぶ `agentcells tick`。仕事を探し、1件ずつcellを動かす。
 //!
-//! 仕事は、cellのラベルが付いていて、処理中（`ac:working`）でも人間待ち（`ac:needs-human`）でもない、
-//! 開いているIssue/PR。Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す。
+//! 仕事は、開いているIssue/PRのうち、処理中（`ac:working`）でないもので、次のどちらか。
+//! Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す。
+//! - cellのラベルが付いている
+//! - 人間を待っている（`ac:needs-human`、`ac:in-review`）ところに、cellを使う人が返事をした。
+//!   人に返事をするのと同じように、コメントするだけで続きが動く
+//!
 //! そのうち、cellを使う人（operator）が自分で決めたものだけを動かす（[`guard`]）。
 
 use std::collections::HashMap;
@@ -9,13 +13,15 @@ use std::fs::File;
 
 use serde::Deserialize;
 
-use crate::config::{Config, Target};
+use crate::config::{Config, Product, Target};
+use crate::discussion;
 use crate::error::{Error, Result};
 use crate::github::Credentials;
 use crate::guard::{self, Actors};
 use crate::home::{Home, RepoName};
-use crate::labels::{NEEDS_HUMAN, WORKING};
+use crate::labels::WORKING;
 use crate::probe::Probe;
+use crate::transition::Waiting;
 
 /// 1件の仕事。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +32,8 @@ pub struct Work {
     pub repo: RepoName,
     pub number: u64,
     pub title: String,
+    /// 人間を待っていたところから、cellを使う人の返事で動くなら、その状態
+    pub waiting: Option<Waiting>,
 }
 
 impl Work {
@@ -34,10 +42,23 @@ impl Work {
             Target::Issue => "Issue",
             Target::PullRequest => "PR",
         };
+        let reply = if self.waiting.is_some() {
+            "（返事を受けて）"
+        } else {
+            ""
+        };
         format!(
-            "{} {kind} {}#{}「{}」",
+            "{}{reply} {kind} {}#{}「{}」",
             self.cell, self.repo, self.number, self.title
         )
+    }
+
+    /// 仕事を拾ったラベル。動かす前にもう一度確かめ、終わったら外す。
+    pub fn label<'a>(&self, cell: &'a crate::config::Cell) -> &'a str {
+        match self.waiting {
+            Some(waiting) => waiting.label(),
+            None => &cell.label,
+        }
     }
 }
 
@@ -80,6 +101,21 @@ struct Listed {
     body: String,
 }
 
+impl Listed {
+    /// GitHubのラベル名は大文字・小文字を区別しない。
+    fn has_label(&self, label: &str) -> bool {
+        self.labels
+            .iter()
+            .any(|l| l.name.eq_ignore_ascii_case(label))
+    }
+
+    fn is_assigned(&self, actors: &Actors) -> bool {
+        self.assignees
+            .iter()
+            .any(|a| a.login.eq_ignore_ascii_case(&actors.operator))
+    }
+}
+
 #[derive(Deserialize)]
 struct ListedLabel {
     name: String,
@@ -90,7 +126,8 @@ struct ListedUser {
     login: String,
 }
 
-/// 仕事を探す。productとcellを設定の順に見て、同じcellの中では番号の小さい順に並べる。
+/// 仕事を探す。人間を待っていたもので、cellを使う人が返事をしたものを先に、そのあとに、productとcellを
+/// 設定の順に見て、同じcellの中では番号の小さい順に並べる。
 ///
 /// `credentials_for` は、リポジトリを読むための認証を返す（ghの設定はAIが書き換えられるので、
 /// 読むときもトークンと空の設定のghを使う）。
@@ -102,6 +139,7 @@ pub fn find(
     actors: &Actors,
 ) -> Result<Found> {
     let mut found = Found::default();
+    let mut replied = Found::default();
     // Appのトークンはリポジトリごとなので、1回のtickの中ではリポジトリごとに1つだけ作って使い回す
     let mut cache: HashMap<RepoName, Credentials> = HashMap::new();
     for product in &config.products {
@@ -117,25 +155,26 @@ pub fn find(
             .filter_map(|name| config.cell(name))
             .map(|c| c.label.clone())
             .collect();
+        let checker = Checker {
+            probe,
+            cache: &cache,
+            cell_labels: &cell_labels,
+            actors,
+        };
+
         for name in &product.cells {
             let Some(cell) = config.cell(name) else {
                 continue;
             };
             for &item in &cell.on {
-                let repos: Vec<&RepoName> = match item {
-                    Target::Issue => vec![&product.issues],
-                    Target::PullRequest => product.repos.iter().collect(),
-                };
-                for repo in repos {
+                for repo in repos_for(product, item) {
                     let env = cache[repo].gh_env()?;
                     let mut items = list(probe, &env, item, repo, &cell.label)?;
                     items.sort_by_key(|i| i.number);
                     for i in items {
-                        // GitHubのラベル名は大文字・小文字を区別しない
-                        if i.labels.iter().any(|l| {
-                            l.name.eq_ignore_ascii_case(WORKING)
-                                || l.name.eq_ignore_ascii_case(NEEDS_HUMAN)
-                        }) {
+                        // GitHubのラベル名は大文字・小文字を区別しない。人間を待っているものでも、
+                        // cellのラベルを付け直したなら、そのcellで動かす（待っていたラベルは、終わったら外す）
+                        if i.has_label(WORKING) {
                             continue;
                         }
                         let work = Work {
@@ -144,71 +183,205 @@ pub fn find(
                             item,
                             repo: repo.clone(),
                             number: i.number,
-                            title: i.title,
+                            title: i.title.clone(),
+                            waiting: None,
                         };
-                        if !i
-                            .assignees
-                            .iter()
-                            .any(|a| a.login.eq_ignore_ascii_case(&actors.operator))
-                        {
-                            let reason = format!("Assignees に {} がいません", actors.operator);
-                            found.skipped.push((work, reason));
+                        checker.check(&mut found, work, &i, &cell.label)?;
+                    }
+                }
+            }
+        }
+
+        // 人間を待っていたもので、cellを使う人が、cellが読んだあとに書いたもの（コメント、レビュー）があれば、また動かす
+        for waiting in Waiting::ALL {
+            for item in [Target::Issue, Target::PullRequest] {
+                if !waiting.applies_to(item) || !product_handles(config, product, item) {
+                    continue;
+                }
+                for repo in repos_for(product, item) {
+                    let env = cache[repo].gh_env()?;
+                    let mut items = list(probe, &env, item, repo, waiting.label())?;
+                    items.sort_by_key(|i| i.number);
+                    for i in items {
+                        // cellのラベルが付いていれば、上でそのcellの仕事として見ている
+                        if i.has_label(WORKING) || cell_labels.iter().any(|l| i.has_label(l)) {
                             continue;
                         }
-                        let author = i
-                            .author
-                            .as_ref()
-                            .map(|a| crate::pr::app_login(&a.login))
-                            .unwrap_or_else(|| "ghost".to_string());
-                        let original = match item {
-                            Target::PullRequest => crate::prompt::closes(&i.body, repo),
-                            Target::Issue => None,
+                        // 自分を外したものは、cellを使う人がやめたものなので、黙って飛ばす
+                        if !i.is_assigned(actors) {
+                            continue;
+                        }
+                        let mut work = Work {
+                            product: product.name.clone(),
+                            cell: String::new(),
+                            item,
+                            repo: repo.clone(),
+                            number: i.number,
+                            title: i.title.clone(),
+                            waiting: Some(waiting),
                         };
-                        let original_env = match &original {
-                            Some((original_repo, _)) => match cache.get(original_repo) {
-                                Some(c) => Some(c.gh_env()?),
-                                None => {
-                                    let reason = format!(
-                                        "元のIssueのリポジトリ {original_repo} が、このproductにありません"
-                                    );
-                                    found.skipped.push((work, reason));
-                                    continue;
-                                }
-                            },
-                            None => None,
-                        };
-                        let request = guard::Request {
-                            kind: item,
-                            subject: guard::Subject {
-                                repo,
-                                number: i.number,
-                                env: &env,
-                            },
-                            author: &author,
-                            label: &cell.label,
-                            cell_labels: &cell_labels,
-                            original: original.as_ref().zip(original_env.as_ref()).map(
-                                |((original_repo, number), env)| guard::Subject {
-                                    repo: original_repo,
-                                    number: *number,
-                                    env,
-                                },
-                            ),
-                        };
-                        // 1件の履歴を読めなくても、ほかの仕事は進める（読めなかったものは動かさない）
-                        match guard::check(probe, &request, actors) {
-                            Ok(None) => found.work.push(work),
-                            Ok(Some(reason)) => found.skipped.push((work, reason)),
-                            Err(e) => found
-                                .skipped
-                                .push((work, format!("履歴を読めません: {}", e.message))),
+                        let resumed = discussion::fetch(probe, &env, item, repo, i.number)
+                            .map_err(|e| format!("やり取りを読めません: {}", e.message))
+                            .and_then(|d| resumed_cell(config, product, item, waiting, &d, actors));
+                        match resumed {
+                            Ok(None) => {}
+                            Ok(Some(cell)) => {
+                                work.cell = cell;
+                                checker.check(&mut replied, work, &i, waiting.label())?;
+                            }
+                            Err(reason) => replied.skipped.push((work, reason)),
                         }
                     }
                 }
             }
         }
     }
-    Ok(found)
+    // 返事を待っていた人を、先に相手にする
+    replied.work.append(&mut found.work);
+    replied.skipped.append(&mut found.skipped);
+    Ok(replied)
+}
+
+/// 仕事を探すリポジトリ。Issueはproductの `issues`、PRは `repos`。
+fn repos_for(product: &Product, item: Target) -> Vec<&RepoName> {
+    match item {
+        Target::Issue => vec![&product.issues],
+        Target::PullRequest => product.repos.iter().collect(),
+    }
+}
+
+/// productのどれかのcellが、Issue（かPR）を扱うか。
+fn product_handles(config: &Config, product: &Product, item: Target) -> bool {
+    product
+        .cells
+        .iter()
+        .filter_map(|name| config.cell(name))
+        .any(|c| c.on.contains(&item))
+}
+
+/// 人間を待っていたIssue/PRで、また動かすcell。cellを使う人が、cellが読んだあとに何も書いていなければ `None`。
+///
+/// - `ac:needs-human`: 最後に目印を書いたcell（質問したcellや、動かせなかったcell）
+/// - `ac:in-review`: 最後に目印を書いたのがレビューのcellなら、その `next` のうち、PRを直すcell。
+///   直すcellが返事だけをして検品待ちに戻したのなら、そのcell
+fn resumed_cell(
+    config: &Config,
+    product: &Product,
+    item: Target,
+    waiting: Waiting,
+    d: &discussion::Discussion,
+    actors: &Actors,
+) -> std::result::Result<Option<String>, String> {
+    let replied = discussion::unread(&d.posts, &actors.writer)
+        .iter()
+        .any(|p| p.author.eq_ignore_ascii_case(&actors.operator));
+    if !replied {
+        return Ok(None);
+    }
+    let in_product = |name: &str| {
+        product
+            .cells
+            .iter()
+            .any(|c| c == name)
+            .then(|| config.cell(name))
+            .flatten()
+    };
+    let last = discussion::last_marker(&d.posts, &actors.writer)
+        .and_then(|i| crate::marker::parse(&d.posts[i].body))
+        .map(|(cell, _)| cell)
+        .ok_or_else(|| {
+            "どのcellが返事を待っていたのか分かりません（agentcellsのコメントがありません）"
+                .to_string()
+        })?;
+    let mut cell = in_product(&last)
+        .ok_or_else(|| format!("返事を待っていたcell「{last}」が、このproductにありません"))?;
+    if waiting == Waiting::InReview && cell.review {
+        cell = cell
+            .next
+            .iter()
+            .filter_map(|n| in_product(n))
+            .find(|c| !c.review && c.on.contains(&Target::PullRequest))
+            .ok_or_else(|| format!("cell「{}」の next に、PRを直すcellがありません", cell.name))?;
+    }
+    if !cell.on.contains(&item) {
+        return Err(format!(
+            "cell「{}」は{}を扱えません",
+            cell.name,
+            item.as_str()
+        ));
+    }
+    Ok(Some(cell.name.clone()))
+}
+
+/// 見つけた仕事を、[`guard::check`] で確かめる。
+struct Checker<'a> {
+    probe: &'a dyn Probe,
+    cache: &'a HashMap<RepoName, Credentials>,
+    cell_labels: &'a [String],
+    actors: &'a Actors,
+}
+
+impl Checker<'_> {
+    /// 動かしてよければ `found.work` に、だめなら理由を付けて `found.skipped` に入れる。
+    /// `label` は、仕事を拾ったラベル（cellのラベルか、人間を待っているラベル）。
+    fn check(&self, found: &mut Found, work: Work, i: &Listed, label: &str) -> Result<()> {
+        let actors = self.actors;
+        if !i.is_assigned(actors) {
+            let reason = format!("Assignees に {} がいません", actors.operator);
+            found.skipped.push((work, reason));
+            return Ok(());
+        }
+        let author = i
+            .author
+            .as_ref()
+            .map(|a| crate::pr::app_login(&a.login))
+            .unwrap_or_else(|| "ghost".to_string());
+        let original = match work.item {
+            Target::PullRequest => crate::prompt::closes(&i.body, &work.repo),
+            Target::Issue => None,
+        };
+        let original_env = match &original {
+            Some((original_repo, _)) => match self.cache.get(original_repo) {
+                Some(c) => Some(c.gh_env()?),
+                None => {
+                    let reason = format!(
+                        "元のIssueのリポジトリ {original_repo} が、このproductにありません"
+                    );
+                    found.skipped.push((work, reason));
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        let env = self.cache[&work.repo].gh_env()?;
+        let request = guard::Request {
+            kind: work.item,
+            subject: guard::Subject {
+                repo: &work.repo,
+                number: work.number,
+                env: &env,
+            },
+            author: &author,
+            label,
+            cell_labels: self.cell_labels,
+            original: original.as_ref().zip(original_env.as_ref()).map(
+                |((original_repo, number), env)| guard::Subject {
+                    repo: original_repo,
+                    number: *number,
+                    env,
+                },
+            ),
+        };
+        // 1件の履歴を読めなくても、ほかの仕事は進める（読めなかったものは動かさない）
+        match guard::check(self.probe, &request, actors) {
+            Ok(None) => found.work.push(work),
+            Ok(Some(reason)) => found.skipped.push((work, reason)),
+            Err(e) => found
+                .skipped
+                .push((work, format!("履歴を読めません: {}", e.message))),
+        }
+        Ok(())
+    }
 }
 
 fn list(
@@ -303,12 +476,31 @@ next = ["done"]
         (dir, config)
     }
 
+    fn list_command(kind: &str, repo: &str, label: &str) -> String {
+        format!(
+            "gh {kind} list --repo {repo} --label {label} --state open --json number,title,labels,assignees,author,body --limit 100"
+        )
+    }
+
+    /// 人間を待っているものはない。
+    fn nothing_waiting(mut probe: FakeProbe, issues: &[&str], prs: &[&str]) -> FakeProbe {
+        for repo in issues {
+            probe = probe.with(&list_command("issue", repo, "ac:needs-human"), true, "[]");
+        }
+        for repo in prs {
+            for label in ["ac:needs-human", "ac:in-review"] {
+                probe = probe.with(&list_command("pr", repo, label), true, "[]");
+            }
+        }
+        probe
+    }
+
     fn token(repo: &RepoName) -> Result<Credentials> {
         Credentials::new(Source::App, format!("ghs_{}", repo.name))
     }
 
     #[test]
-    fn finds_open_items_with_cell_labels_skipping_working_and_waiting() {
+    fn finds_open_items_with_cell_labels_skipping_working() {
         let (_dir, config) = config();
         let probe = FakeProbe::default()
             .with(
@@ -331,8 +523,11 @@ next = ["done"]
                 true,
                 "[]",
             );
+        let probe = nothing_waiting(probe, &["octo/issues"], &["octo/app", "octo/web"]);
         let probe = approved(probe, "octo/issues", 9, "ac:triage");
         let probe = approved(probe, "octo/issues", 3, "ac:triage");
+        // 人間を待っていても、cellのラベルを付け直したなら動かす
+        let probe = approved(probe, "octo/issues", 5, "ac:triage");
         let probe = approved(probe, "octo/app", 12, "ac:review");
         // ほかの人がラベルを付けた
         let eager = [
@@ -361,6 +556,7 @@ next = ["done"]
             described,
             vec![
                 "triage Issue octo/issues#3「先」",
+                "triage Issue octo/issues#5「人間待ち」",
                 "triage Issue octo/issues#9「後」",
                 "review PR octo/app#12「PR」",
             ]
@@ -401,6 +597,7 @@ next = ["done"]
                 "[]",
             );
         }
+        let probe = nothing_waiting(probe, &["octo/issues"], &["octo/issues"]);
         let made = std::cell::Cell::new(0);
         let counting = |repo: &RepoName| {
             made.set(made.get() + 1);
@@ -412,7 +609,8 @@ next = ["done"]
                 .work
                 .is_empty()
         );
-        assert_eq!(probe.calls.borrow().len(), 3);
+        // cellのラベルで3つと、人間を待っているもので3つ
+        assert_eq!(probe.calls.borrow().len(), 6);
         assert_eq!(made.get(), 1);
     }
 
@@ -438,6 +636,7 @@ next = ["done"]
                 ),
             )
             .with(&list("pr", "octo/web", "ac:review"), true, "[]");
+        let probe = nothing_waiting(probe, &["octo/issues"], &["octo/app", "octo/web"]);
         // agentcellsが作ったPRに、agentcellsがoperatorを割り当て、reviewのラベルを付けた
         let pr_events = [
             assigned("bot[bot]", "me", "2026-10-25T03:00:00Z"),
@@ -453,6 +652,203 @@ next = ["done"]
         assert_eq!(found.skipped.len(), 1);
         assert!(
             found.skipped[0].1.starts_with("履歴を読めません"),
+            "{:?}",
+            found.skipped
+        );
+    }
+
+    #[test]
+    fn replies_from_the_operator_resume_waiting_work_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"
+operator = "me"
+
+[[product]]
+name = "app"
+issues = "octo/issues"
+repos = ["octo/app"]
+cells = ["triage", "implement", "review"]
+
+[[cell]]
+name = "triage"
+on = "issue"
+label = "ac:triage"
+next = ["implement", "done"]
+
+[[cell]]
+name = "implement"
+on = ["issue", "pull_request"]
+label = "ac:implement"
+next = ["review"]
+
+[[cell]]
+name = "review"
+on = "pull_request"
+label = "ac:review"
+review = true
+next = ["implement", "done"]
+"#;
+        let config = Config::parse(text, dir.path()).unwrap();
+        let comment = |user: &str, body: &str, at: &str| {
+            serde_json::json!({"user": {"login": user}, "body": body, "created_at": at, "author_association": "OWNER"})
+                .to_string()
+        };
+        let review = |user: &str, body: &str, at: &str| {
+            serde_json::json!({"id": 1, "user": {"login": user}, "body": body, "submitted_at": at, "author_association": "OWNER"})
+                .to_string()
+        };
+        let asked = "[agentcells] triage round 1\n\nAとBのどちらですか\n\n<!-- agentcells read-until 2026-10-25T03:00:00Z -->";
+        let probe = FakeProbe::default()
+            .with(&list_command("issue", "octo/issues", "ac:triage"), true, "[]")
+            .with(&list_command("issue", "octo/issues", "ac:implement"), true, "[]")
+            .with(&list_command("pr", "octo/app", "ac:implement"), true, "[]")
+            .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
+            .with(
+                &list_command("issue", "octo/issues", "ac:needs-human"),
+                true,
+                &format!(
+                    r#"[{{"number":21,"title":"まだ","labels":[{{"name":"ac:needs-human"}}],{ME}}},
+                    {{"number":20,"title":"質問","labels":[{{"name":"ac:needs-human"}}],{ME}}},
+                    {{"number":22,"title":"やめた","labels":[{{"name":"ac:needs-human"}}],"assignees":[]}}]"#
+                ),
+            )
+            .with(&list_command("pr", "octo/app", "ac:needs-human"), true, "[]")
+            .with(
+                &list_command("pr", "octo/app", "ac:in-review"),
+                true,
+                &format!(
+                    r#"[{{"number":30,"title":"検品","labels":[{{"name":"ac:in-review"}}],{ME},"author":{{"login":"me"}}}}]"#
+                ),
+            );
+        // #20: 質問のあとに、operatorが答えた
+        let probe = discussion::fake::with_item(
+            probe,
+            "octo/issues",
+            20,
+            r#"{"title":"質問","user":{"login":"me"}}"#,
+        );
+        let probe = discussion::fake::with_list(
+            probe,
+            "/repos/octo/issues/issues/20/comments",
+            &[
+                &comment("bot[bot]", asked, "2026-10-25T03:05:00Z"),
+                &comment("me", "Bです", "2026-10-25T03:10:00Z"),
+            ],
+        );
+        // #21: 質問のあとは、ほかの人しか書いていない（動かさない）
+        let probe = discussion::fake::with_item(
+            probe,
+            "octo/issues",
+            21,
+            r#"{"title":"まだ","user":{"login":"me"}}"#,
+        );
+        let probe = discussion::fake::with_list(
+            probe,
+            "/repos/octo/issues/issues/21/comments",
+            &[
+                &comment("bot[bot]", asked, "2026-10-25T03:05:00Z"),
+                &comment("other", "Aがいい", "2026-10-25T03:10:00Z"),
+            ],
+        );
+        // #30: レビューが動いている間に、operatorがコメントした（目印より前に並ぶが、読んでいない）
+        let probe = discussion::fake::with_item(
+            probe,
+            "octo/app",
+            30,
+            r#"{"title":"検品","user":{"login":"me"}}"#,
+        )
+        .with(
+            "gh api /repos/octo/app/pulls/30",
+            true,
+            r#"{"base":{"ref":"main"},"head":{"ref":"fix"}}"#,
+        );
+        let probe = discussion::fake::with_list(
+            probe,
+            "/repos/octo/app/issues/30/comments",
+            &[&comment("me", "ついでにREADMEも", "2026-10-25T04:02:00Z")],
+        );
+        let probe = discussion::fake::with_list(
+            probe,
+            "/repos/octo/app/pulls/30/reviews",
+            &[&review(
+                "bot[bot]",
+                "[agentcells] review round 1\n\n問題なし\n\n<!-- agentcells read-until 2026-10-25T04:00:00Z -->",
+                "2026-10-25T04:05:00Z",
+            )],
+        );
+        let probe = discussion::fake::with_list(probe, "/repos/octo/app/pulls/30/comments", &[]);
+        let issue_events = [
+            assigned("me", "me", "2026-10-25T01:00:00Z"),
+            labeled("me", "ac:triage", "2026-10-25T02:00:00Z"),
+            labeled("bot[bot]", "ac:needs-human", "2026-10-25T03:05:00Z"),
+        ];
+        let probe = with_history(probe, "octo/issues", 20, &issue_events, NO_EDITS);
+        let pr_events = [
+            assigned("me", "me", "2026-10-25T01:00:00Z"),
+            labeled("me", "ac:review", "2026-10-25T02:00:00Z"),
+            labeled("bot[bot]", "ac:in-review", "2026-10-25T04:05:00Z"),
+        ];
+        let probe = with_history(probe, "octo/app", 30, &pr_events, NO_EDITS);
+
+        let found = find(&config, &probe, &token, &actors()).unwrap();
+        let work: Vec<String> = found.work.iter().map(Work::describe).collect();
+        assert_eq!(
+            work,
+            vec![
+                "triage（返事を受けて） Issue octo/issues#20「質問」",
+                "implement（返事を受けて） PR octo/app#30「検品」",
+            ],
+            "{:?}",
+            found.skipped
+        );
+        assert_eq!(found.work[0].waiting, Some(Waiting::NeedsHuman));
+        assert_eq!(found.work[1].waiting, Some(Waiting::InReview));
+        assert!(found.skipped.is_empty(), "{:?}", found.skipped);
+    }
+
+    #[test]
+    fn replies_are_guarded_like_labels() {
+        let (_dir, config) = config();
+        let probe = FakeProbe::default()
+            .with(&list_command("issue", "octo/issues", "ac:triage"), true, "[]")
+            .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
+            .with(&list_command("pr", "octo/web", "ac:review"), true, "[]")
+            .with(
+                &list_command("issue", "octo/issues", "ac:needs-human"),
+                true,
+                &format!(
+                    r#"[{{"number":20,"title":"質問","labels":[{{"name":"ac:needs-human"}}],{ME}}}]"#
+                ),
+            );
+        let probe = nothing_waiting(probe, &[], &["octo/app", "octo/web"]);
+        let probe = discussion::fake::with_item(
+            probe,
+            "octo/issues",
+            20,
+            r#"{"title":"質問","user":{"login":"me"}}"#,
+        );
+        let probe = discussion::fake::with_list(
+            probe,
+            "/repos/octo/issues/issues/20/comments",
+            &[
+                r#"{"user":{"login":"bot[bot]"},"body":"[agentcells] triage round 1\n\n質問","created_at":"2026-10-25T03:05:00Z"}"#,
+                r#"{"user":{"login":"me"},"body":"答え","created_at":"2026-10-25T03:10:00Z"}"#,
+            ],
+        );
+        // ほかの人が、ac:needs-human を付け直した
+        let events = [
+            assigned("me", "me", "2026-10-25T01:00:00Z"),
+            labeled("me", "ac:triage", "2026-10-25T02:00:00Z"),
+            labeled("eager", "ac:needs-human", "2026-10-25T03:06:00Z"),
+        ];
+        let probe = with_history(probe, "octo/issues", 20, &events, NO_EDITS);
+        let found = find(&config, &probe, &token, &actors()).unwrap();
+        assert!(found.work.is_empty());
+        assert_eq!(found.skipped.len(), 1);
+        assert!(
+            found.skipped[0]
+                .1
+                .contains("ac:needs-human」を最後に付けたのが eager"),
             "{:?}",
             found.skipped
         );

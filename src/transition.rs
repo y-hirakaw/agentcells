@@ -22,6 +22,31 @@ pub fn is_reserved(name: &str) -> bool {
     name == DONE || name == NEEDS_HUMAN
 }
 
+/// 人間を待っている状態。cellを使う人がコメントすると、また動く（[`crate::tick`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// 人間の答えや作業を待っている（`ac:needs-human`）。待っていたcellが、また動く
+    NeedsHuman,
+    /// AIのレビューが終わったPRで、人間の検品を待っている（`ac:in-review`）。直すcellが動く
+    InReview,
+}
+
+impl Waiting {
+    pub const ALL: [Waiting; 2] = [Waiting::NeedsHuman, Waiting::InReview];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Waiting::NeedsHuman => labels::NEEDS_HUMAN,
+            Waiting::InReview => labels::IN_REVIEW,
+        }
+    }
+
+    /// 待っている状態を置けるもの。検品を待つのはPRだけ。
+    pub fn applies_to(self, item: Target) -> bool {
+        self == Waiting::NeedsHuman || item == Target::PullRequest
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Destination {
     Cell(String),
@@ -30,9 +55,17 @@ pub enum Destination {
 }
 
 /// AIが選べる先。設定の `next` に `needs-human` を足したもの。
-pub fn choices(cell: &Cell) -> Vec<String> {
+/// 検品を待つPRへのコメントで動いたときは、`done`（返事だけして、検品待ちに戻す）も選べる。
+pub fn choices(cell: &Cell, waiting: Option<Waiting>) -> Vec<String> {
+    let reply_only = (waiting == Some(Waiting::InReview) && !cell.review).then_some(DONE);
     let mut choices: Vec<String> = Vec::new();
-    for next in cell.next.iter().map(String::as_str).chain([NEEDS_HUMAN]) {
+    for next in cell
+        .next
+        .iter()
+        .map(String::as_str)
+        .chain(reply_only)
+        .chain([NEEDS_HUMAN])
+    {
         if !choices.iter().any(|c| c == next) {
             choices.push(next.to_string());
         }
@@ -72,13 +105,13 @@ impl Outcome {
 
 /// `claude -p --json-schema` に渡すスキーマ。`next` は選べる先しか出せないようにする。
 /// レビューのcellには、コードへの指摘（`findings`）も返させる。
-pub fn output_schema(cell: &Cell) -> serde_json::Value {
+pub fn output_schema(cell: &Cell, waiting: Option<Waiting>) -> serde_json::Value {
     let mut schema = json!({
         "type": "object",
         "properties": {
             "next": {
                 "type": "string",
-                "enum": choices(cell),
+                "enum": choices(cell, waiting),
                 "description": "次に進める先。迷ったら needs-human を選び、comment に人間への質問を書く"
             },
             "comment": {
@@ -105,6 +138,8 @@ pub struct Finished<'a> {
     pub created_pr: bool,
     /// AIが選んだ先
     pub requested: &'a str,
+    /// 人間を待っていたところから、コメントで動いたなら、その状態
+    pub waiting: Option<Waiting>,
 }
 
 /// 遷移のためにCLIがすること。
@@ -128,8 +163,25 @@ pub struct Plan {
 /// 付け替えるときは、`add` を付けてから `remove`（`ac:working` を含む）を外す順にする。guardは、
 /// `ac:working` が付いている間に付いたcellのラベルを、agentcellsの付け替えとして承認から除くため。
 ///
-/// `runs` は、そのcellがこのIssue/PRですでに何回動いたかを返す（往復の上限に使う）。
+/// `runs` は、そのcellがこのIssue/PRで、cellを使う人の最後のコメントから何回動いたかを返す（往復の上限に使う）。
 pub fn plan(
+    config: &Config,
+    product: &Product,
+    finished: &Finished,
+    runs: &dyn Fn(&str) -> u32,
+) -> Plan {
+    let mut plan = plan_labels(config, product, finished, runs);
+    // 待っていたラベル（あれば）も外す。また同じ状態で待つなら、付けたまま
+    if let Some(waiting) = finished.waiting {
+        plan.remove.push(waiting.label().to_string());
+    }
+    let add = plan.add.clone();
+    plan.remove
+        .retain(|r| !add.iter().any(|a| a.eq_ignore_ascii_case(r)));
+    plan
+}
+
+fn plan_labels(
     config: &Config,
     product: &Product,
     finished: &Finished,
@@ -148,7 +200,7 @@ pub fn plan(
     };
 
     let requested = finished.requested;
-    let choices = choices(cell);
+    let choices = choices(cell, finished.waiting);
     if !choices.iter().any(|c| c == requested) {
         return to_human(Some(format!(
             "cell「{}」から「{requested}」には進めません（選べる先: {}）",
@@ -172,7 +224,7 @@ pub fn plan(
             Target::PullRequest => Plan {
                 destination: Destination::Done,
                 remove: remove(),
-                add: vec![labels::NEEDS_HUMAN.to_string()],
+                add: vec![labels::IN_REVIEW.to_string()],
                 add_to_created_pr: Vec::new(),
                 close: false,
                 overridden: None,
@@ -304,11 +356,24 @@ max_rounds = 2
         requested: &str,
         runs: u32,
     ) -> Plan {
+        plan_waiting(config, cell, item, created_pr, requested, runs, None)
+    }
+
+    fn plan_waiting(
+        config: &Config,
+        cell: &str,
+        item: Target,
+        created_pr: bool,
+        requested: &str,
+        runs: u32,
+        waiting: Option<Waiting>,
+    ) -> Plan {
         let finished = Finished {
             cell: config.cell(cell).unwrap(),
             item,
             created_pr,
             requested,
+            waiting,
         };
         plan(config, &config.products[0], &finished, &|_| runs)
     }
@@ -321,18 +386,21 @@ max_rounds = 2
     fn choices_always_include_needs_human_once() {
         let (_dir, config) = config();
         assert_eq!(
-            choices(config.cell("triage").unwrap()),
+            choices(config.cell("triage").unwrap(), None),
             strings(&["implement", "done", NEEDS_HUMAN])
         );
         let mut cell = config.cell("triage").unwrap().clone();
         cell.next.push(NEEDS_HUMAN.to_string());
-        assert_eq!(choices(&cell), strings(&["implement", "done", NEEDS_HUMAN]));
+        assert_eq!(
+            choices(&cell, None),
+            strings(&["implement", "done", NEEDS_HUMAN])
+        );
     }
 
     #[test]
     fn schema_limits_next_to_choices() {
         let (_dir, config) = config();
-        let schema = output_schema(config.cell("review").unwrap());
+        let schema = output_schema(config.cell("review").unwrap(), None);
         assert_eq!(
             schema["properties"]["next"]["enum"],
             json!(["implement", "done", NEEDS_HUMAN])
@@ -347,7 +415,7 @@ max_rounds = 2
         let (_dir, config) = config();
         let mut cell = config.cell("review").unwrap().clone();
         cell.review = true;
-        let schema = output_schema(&cell);
+        let schema = output_schema(&cell, None);
         assert_eq!(schema["required"], json!(["next", "comment", "findings"]));
         assert_eq!(schema["properties"]["findings"]["type"], "array");
 
@@ -499,7 +567,77 @@ max_rounds = 2
         let plan = plan_for(&config, "review", Target::PullRequest, false, DONE, 0);
         assert_eq!(plan.destination, Destination::Done);
         assert!(!plan.close);
+        assert_eq!(plan.add, strings(&[labels::IN_REVIEW]));
+    }
+
+    #[test]
+    fn a_reply_on_an_inspected_pr_may_only_answer() {
+        let (_dir, config) = config();
+        let implement = config.cell("implement").unwrap();
+        assert_eq!(choices(implement, None), strings(&["review", NEEDS_HUMAN]));
+        assert_eq!(
+            choices(implement, Some(Waiting::InReview)),
+            strings(&["review", DONE, NEEDS_HUMAN])
+        );
+        // 返事だけなら、検品待ちに戻す（付けたまま）
+        let plan = plan_waiting(
+            &config,
+            "implement",
+            Target::PullRequest,
+            false,
+            DONE,
+            0,
+            Some(Waiting::InReview),
+        );
+        assert_eq!(plan.destination, Destination::Done);
+        assert_eq!(plan.add, strings(&[labels::IN_REVIEW]));
+        assert_eq!(plan.remove, strings(&["ac:implement", labels::WORKING]));
+        // 直したら、レビューに回し、検品待ちのラベルは外す
+        let plan = plan_waiting(
+            &config,
+            "implement",
+            Target::PullRequest,
+            false,
+            "review",
+            0,
+            Some(Waiting::InReview),
+        );
+        assert_eq!(plan.add, strings(&["ac:review"]));
+        assert_eq!(
+            plan.remove,
+            strings(&["ac:implement", labels::WORKING, labels::IN_REVIEW])
+        );
+    }
+
+    #[test]
+    fn a_reply_to_a_question_moves_on_or_waits_again() {
+        let (_dir, config) = config();
+        let plan = plan_waiting(
+            &config,
+            "triage",
+            Target::Issue,
+            false,
+            "implement",
+            0,
+            Some(Waiting::NeedsHuman),
+        );
+        assert_eq!(plan.add, strings(&["ac:implement"]));
+        assert_eq!(
+            plan.remove,
+            strings(&["ac:triage", labels::WORKING, labels::NEEDS_HUMAN])
+        );
+        // また質問するなら、needs-human は付けたまま
+        let plan = plan_waiting(
+            &config,
+            "triage",
+            Target::Issue,
+            false,
+            NEEDS_HUMAN,
+            0,
+            Some(Waiting::NeedsHuman),
+        );
         assert_eq!(plan.add, strings(&[labels::NEEDS_HUMAN]));
+        assert_eq!(plan.remove, strings(&["ac:triage", labels::WORKING]));
     }
 
     #[test]

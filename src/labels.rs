@@ -12,12 +12,15 @@ use crate::probe::Probe;
 pub const PREFIX: &str = "ac:";
 /// 処理中。同じ仕事を二重に拾わないために付ける。
 pub const WORKING: &str = "ac:working";
-/// 人間の回答や検品を待っている。
+/// 人間の回答や作業を待っている。cellを使う人がコメントすると、待っていたcellがまた動く。
 pub const NEEDS_HUMAN: &str = "ac:needs-human";
+/// AIのレビューが終わったPRで、人間の検品を待っている。cellを使う人がコメントすると、直すcellが動く。
+pub const IN_REVIEW: &str = "ac:in-review";
 
 const SYSTEM: &[(&str, &str, &str)] = &[
     (WORKING, "fbca04", "agentcellsが処理中"),
-    (NEEDS_HUMAN, "d93f0b", "人間の回答や検品を待っている"),
+    (NEEDS_HUMAN, "d93f0b", "人間の回答や作業を待っている"),
+    (IN_REVIEW, "0e8a16", "人間の検品を待っている"),
 ];
 const CELL_COLOR: &str = "1d76db";
 
@@ -232,18 +235,25 @@ prompt = "review.md"
         let issues = &required[&RepoName::parse("octo/issues").unwrap()];
         assert_eq!(
             names(issues),
-            vec![WORKING, NEEDS_HUMAN, "ac:triage", "ac:review"]
+            vec![WORKING, NEEDS_HUMAN, IN_REVIEW, "ac:triage", "ac:review"]
         );
         let app = &required[&RepoName::parse("octo/app").unwrap()];
-        assert_eq!(names(app), vec![WORKING, NEEDS_HUMAN, "ac:triage"]);
+        assert_eq!(
+            names(app),
+            vec![WORKING, NEEDS_HUMAN, IN_REVIEW, "ac:triage"]
+        );
         let web = &required[&RepoName::parse("octo/web").unwrap()];
-        assert_eq!(names(web), vec![WORKING, NEEDS_HUMAN, "ac:review"]);
+        assert_eq!(
+            names(web),
+            vec![WORKING, NEEDS_HUMAN, IN_REVIEW, "ac:review"]
+        );
     }
 
     #[test]
     fn system_labels_are_case_insensitive() {
         assert!(is_system("ac:working"));
         assert!(is_system("AC:Needs-Human"));
+        assert!(is_system("ac:in-review"));
         assert!(!is_system("ac:triage"));
     }
 
@@ -265,7 +275,7 @@ prompt = "review.md"
             .unwrap();
         assert_eq!(
             names(&issues.1),
-            vec![NEEDS_HUMAN, "ac:triage", "ac:review"]
+            vec![NEEDS_HUMAN, IN_REVIEW, "ac:triage", "ac:review"]
         );
         assert!(
             !probe
@@ -308,10 +318,11 @@ prompt = "review.md"
             .iter()
             .filter(|c| c.contains("--repo octo/app "))
             .collect();
-        assert_eq!(app_creates.len(), 1);
-        assert!(app_creates[0].starts_with("gh label create ac:triage "));
-        // octo/issues に4つ、octo/app に1つ、octo/web に3つ
-        assert_eq!(creates.len(), 8);
+        assert_eq!(app_creates.len(), 2);
+        assert!(app_creates[0].starts_with("gh label create ac:in-review "));
+        assert!(app_creates[1].starts_with("gh label create ac:triage "));
+        // octo/issues に5つ、octo/app に2つ、octo/web に4つ
+        assert_eq!(creates.len(), 11);
     }
 
     #[test]
@@ -382,7 +393,7 @@ prompt = "review.md"
         let probe = with_empty_list(FakeProbe::default(), &["octo/app", "octo/web"]).with(
             "gh label list --repo octo/issues --json name --limit 1000",
             true,
-            r#"[{"name":"ac:working"},{"name":"ac:needs-human"},{"name":"ac:triage"},{"name":"ac:implement"},{"name":"ac:review"}]"#,
+            r#"[{"name":"ac:working"},{"name":"ac:needs-human"},{"name":"ac:in-review"},{"name":"ac:triage"},{"name":"ac:implement"},{"name":"ac:review"}]"#,
         );
         let missing = missing(&config, &probe).unwrap();
         let repos: Vec<String> = missing.iter().map(|(r, _)| r.to_string()).collect();

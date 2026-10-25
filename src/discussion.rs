@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::config::Target;
 use crate::error::{Error, Result};
 use crate::home::RepoName;
+use crate::marker;
 use crate::probe::Probe;
 
 /// やり取りの1件（会話欄のコメントか、PRのレビュー）。
@@ -43,6 +44,8 @@ pub struct Discussion {
     pub author: String,
     /// 本文を書いた人が、リポジトリの持ち主か、メンバーか、コラボレーターか
     pub author_trusted: bool,
+    /// 作られた時刻（ISO 8601、UTC）
+    pub created_at: String,
     /// PRのベースブランチとブランチ
     pub base: Option<String>,
     pub head: Option<String>,
@@ -66,6 +69,8 @@ struct RawItem {
     user: Option<User>,
     #[serde(default)]
     author_association: String,
+    #[serde(default)]
+    created_at: String,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +145,7 @@ pub fn fetch(
         body: raw.body.unwrap_or_default(),
         author: login(raw.user),
         author_trusted: trusted(&raw.author_association),
+        created_at: raw.created_at,
         ..Discussion::default()
     };
 
@@ -193,6 +199,35 @@ pub fn fetch(
     // 会話欄のコメントとレビューを、時刻の順に並べる（同じ時刻なら取った順のまま）
     discussion.posts.sort_by(|a, b| a.at.cmp(&b.at));
     Ok(discussion)
+}
+
+/// 書き込みのアカウントが書いた、目印付きの投稿か（目印は誰でも書けるので、書いた人も見る）。
+pub fn is_marker(post: &Post, writer: &str) -> bool {
+    marker::parse(&post.body).is_some() && post.author == writer
+}
+
+/// 最後の目印付きの投稿の位置。
+pub fn last_marker(posts: &[Post], writer: &str) -> Option<usize> {
+    posts.iter().rposition(|p| is_marker(p, writer))
+}
+
+/// cellがまだ読んでいない投稿（目印は除く）。最後の目印に書いた「読んだところ」より後のもの。
+/// その行がなければ（動かせなかったときなど）、最後の目印より後のもの。目印がなければ、すべて。
+/// cellが動いている間に書かれたコメントは、目印より前に並ぶが、読んでいないものとして扱う。
+pub fn unread<'a>(posts: &'a [Post], writer: &str) -> Vec<&'a Post> {
+    let boundary = last_marker(posts, writer).map(|i| {
+        let posted = posts[i].at.as_str();
+        // 目印の投稿より後を「読んだ」とは書けない
+        match marker::read_until(&posts[i].body) {
+            Some(at) if at < posted => at,
+            _ => posted,
+        }
+    });
+    posts
+        .iter()
+        .filter(|p| !is_marker(p, writer))
+        .filter(|p| boundary.is_none_or(|b| p.at.as_str() > b))
+        .collect()
 }
 
 fn gh_api(probe: &dyn Probe, env: &[(&str, &str)], args: &[&str], path: &str) -> Result<String> {
@@ -264,6 +299,67 @@ mod tests {
 
     fn repo() -> RepoName {
         RepoName::parse("octo/app").unwrap()
+    }
+
+    fn post(author: &str, body: &str, at: &str) -> Post {
+        Post {
+            author: author.to_string(),
+            trusted: true,
+            body: body.to_string(),
+            at: at.to_string(),
+            review_id: None,
+        }
+    }
+
+    fn bodies<'a>(posts: &[&'a Post]) -> Vec<&'a str> {
+        posts.iter().map(|p| p.body.as_str()).collect()
+    }
+
+    #[test]
+    fn unread_posts_start_where_the_last_marker_read_until() {
+        let marker = "[agentcells] triage round 1\n\n質問\n\n<!-- agentcells read-until 2026-10-25T03:00:00Z -->";
+        let posts = vec![
+            post("me", "読んだ", "2026-10-25T02:00:00Z"),
+            // cellが動いている間に書かれた（目印より前に並ぶ）
+            post("me", "動いている間", "2026-10-25T03:01:00Z"),
+            post("bot[bot]", marker, "2026-10-25T03:05:00Z"),
+            // ほかの人が書いた目印は、目印として扱わない
+            post(
+                "other",
+                "[agentcells] triage round 9",
+                "2026-10-25T03:06:00Z",
+            ),
+            post("me", "あと", "2026-10-25T03:10:00Z"),
+        ];
+        assert_eq!(
+            bodies(&unread(&posts, "bot[bot]")),
+            vec!["動いている間", "[agentcells] triage round 9", "あと"]
+        );
+        assert_eq!(last_marker(&posts, "bot[bot]"), Some(2));
+        // 目印がなければ、すべて読んでいない
+        assert_eq!(unread(&posts[..2], "bot[bot]").len(), 2);
+    }
+
+    #[test]
+    fn unread_posts_without_read_until_or_with_a_later_one_start_at_the_marker() {
+        for marker in [
+            // 動かせなかったとき（round 0）は、読んだところを書かない
+            "[agentcells] triage round 0\n\n実行できませんでした".to_string(),
+            // 目印の投稿より後を「読んだ」とは書けない
+            "[agentcells] triage round 1\n\n<!-- agentcells read-until 2099-01-01T00:00:00Z -->"
+                .to_string(),
+        ] {
+            let posts = vec![
+                post("me", "前", "2026-10-25T03:01:00Z"),
+                post("bot[bot]", &marker, "2026-10-25T03:05:00Z"),
+                post("me", "あと", "2026-10-25T03:10:00Z"),
+            ];
+            assert_eq!(
+                bodies(&unread(&posts, "bot[bot]")),
+                vec!["あと"],
+                "{marker}"
+            );
+        }
     }
 
     #[test]

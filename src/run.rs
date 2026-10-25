@@ -29,7 +29,7 @@ use crate::files;
 use crate::github::{self, Credentials, ISOLATED_GIT_ENV, Purpose};
 use crate::guard::{self, Actors};
 use crate::home::{Home, RepoName};
-use crate::labels::{NEEDS_HUMAN, WORKING};
+use crate::labels::{IN_REVIEW, NEEDS_HUMAN, WORKING};
 use crate::marker;
 use crate::probe::Probe;
 use crate::prompt;
@@ -159,14 +159,21 @@ impl Runner<'_> {
         place.clean();
         match result {
             Ok(report) => Ok(report),
-            Err(failure) => Err(self.fail(failure, cell, &issue, &place)),
+            Err(failure) => Err(self.fail(failure, cell, work, &issue, &place)),
         }
     }
 
     /// 失敗したときの片付け。詳しいことは手元の記録（`error.txt`）とtickの出力に残し、
     /// 公開のIssueには、決まった短い文だけを書いて人間に回す。
     /// プロセスを止めきれなかったときは、トークンを作らず、GitHubには何も書かない。
-    fn fail(&self, failure: Failure, cell: &Cell, issue: &Issue, place: &Place) -> Error {
+    fn fail(
+        &self,
+        failure: Failure,
+        cell: &Cell,
+        work: &Work,
+        issue: &Issue,
+        place: &Place,
+    ) -> Error {
         let _ = std::fs::create_dir_all(&place.run);
         let e = match failure {
             Failure::Error(e) => e,
@@ -210,14 +217,31 @@ impl Runner<'_> {
             format!("{}\n{}\n", e.message, e.hint.clone().unwrap_or_default()),
         );
         let text = format!(
-            "実行できませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください。\n\n直したら、ラベル「{}」を付け直すと、もう一度動きます。",
+            "実行できませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください。\n\n直したら、ここにコメントすると、もう一度動きます。",
             place.run_name(),
-            cell.label
         );
-        // round 0 の目印は、往復の回数に数えない
+        // round 0 の目印は、往復の回数に数えない。読んだところは書かない（このあとのコメントで動かす）
         if let Ok(write) = self.write_credentials(issue.repo) {
-            let _ = issue.comment(&write, &marker::comment(&cell.name, 0, &text));
-            let _ = issue.edit_labels(&write, &[NEEDS_HUMAN], &[&cell.label, WORKING]);
+            // 目印を書けなければ、ラベルは変えない（ac:working が付いたままになり、人が片付けるまで止まる）。
+            // 待っているラベルにだけ戻すと、きっかけになった返事を、次のtickでまた読んでいないものとして拾い、
+            // 同じ失敗をくり返すため
+            if issue
+                .comment(&write, &marker::comment(&cell.name, 0, &text))
+                .is_err()
+            {
+                write.revoke(self.probe);
+                return e;
+            }
+            // 付いているものだけ外す。ラベルを読めなければ、今のcellのラベルと ac:working を外す
+            let remove = match issue.labels(&write) {
+                Ok(labels) => present(
+                    &labels,
+                    &[cell.label.as_str(), WORKING, IN_REVIEW, work.label(cell)],
+                    &[NEEDS_HUMAN],
+                ),
+                Err(_) => vec![cell.label.as_str(), WORKING],
+            };
+            let _ = issue.edit_labels(&write, &[NEEDS_HUMAN], &remove);
             write.revoke(self.probe);
         }
         e
@@ -344,7 +368,7 @@ impl Runner<'_> {
                 env: &env,
             },
             author: &task.discussion.author,
-            label: &cell.label,
+            label: work.label(cell),
             cell_labels: &cell_labels,
             original: original
                 .as_ref()
@@ -417,8 +441,8 @@ impl Runner<'_> {
         };
         Ok(Prepared::Ready(Box::new(Ready {
             user: prompt::user_prompt(cell, extra.as_deref(), Some(&task)),
-            system: prompt::system_prompt(cell),
-            schema: transition::output_schema(cell),
+            system: prompt::system_prompt(cell, work.waiting),
+            schema: transition::output_schema(cell, work.waiting),
             settings_path,
             context_path,
             labels_before: issue.labels(item_read)?,
@@ -510,7 +534,8 @@ impl Runner<'_> {
         let labels_after = issue.labels(write)?;
         let task = &ready.task;
         let round = task.round(&cell.name);
-        let runs = |name: &str| task.round(name).saturating_sub(1);
+        let runs = |name: &str| task.runs_since_operator(name);
+        let read_until = task.read_until();
 
         // AIが決めた結果を読む。読めなければ、人間に回す
         let mut overridden: Option<String> = None;
@@ -578,6 +603,7 @@ impl Runner<'_> {
                     item: work.item,
                     created_pr,
                     requested,
+                    waiting: work.waiting,
                 },
                 &runs,
             )
@@ -598,12 +624,20 @@ impl Runner<'_> {
         }
 
         // レビューのcellは、指摘を行ごとにPRのレビューとして投稿する。それ以外はコメントにする
+        // 最後の行に、読んだやり取りがどこまでかを書く（動いている間に届いたコメントで、また動かすため）
         let review = (cell.review && work.item == Target::PullRequest && reason.is_none())
             .then(|| self.review_payload(cell, round, &text, &outcome.findings, task, place))
-            .transpose()?;
+            .transpose()?
+            .map(|mut payload| {
+                let body = payload["body"].as_str().unwrap_or_default();
+                payload["body"] = marker::with_read_until(body, &read_until).into();
+                payload
+            });
         let posted = match &review {
             Some(payload) => payload.to_string(),
-            None => marker::comment(&cell.name, round, &text),
+            None => {
+                marker::with_read_until(&marker::comment(&cell.name, round, &text), &read_until)
+            }
         };
         // 投稿する本文の全体を、秘密らしいものがないか調べる。あれば、決まった文だけにして人間に回す
         let found = actions::scan_text(self.scanner, &posted)?;
@@ -619,7 +653,10 @@ impl Runner<'_> {
                 rules.join("、"),
                 place.run_name()
             );
-            let body = marker::comment(&cell.name, round, &format!("人間に回しました: {note}"));
+            let body = marker::with_read_until(
+                &marker::comment(&cell.name, round, &format!("人間に回しました: {note}")),
+                &read_until,
+            );
             issue.comment(write, &body)?;
             plan = plan_for(transition::NEEDS_HUMAN, pr_number.is_some());
             reason = Some(note);
@@ -639,7 +676,10 @@ impl Runner<'_> {
             created.edit_labels(write, &add, &[])?;
         }
         let add: Vec<&str> = plan.add.iter().map(String::as_str).collect();
-        let remove: Vec<&str> = plan.remove.iter().map(String::as_str).collect();
+        // 人間を待っていたラベルが残っていれば（cellのラベルを付け直して動かしたときなど）、それも外す
+        let mut remove: Vec<&str> = plan.remove.iter().map(String::as_str).collect();
+        remove.extend([NEEDS_HUMAN, IN_REVIEW]);
+        let remove = present(&labels_after, &remove, &add);
         issue.edit_labels(write, &add, &[])?;
         issue.edit_labels(write, &[], &remove)?;
         if plan.close {
@@ -1150,6 +1190,20 @@ fn git(probe: &dyn Probe, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
             out.stderr.trim()
         )))
     }
+}
+
+/// 外すラベルのうち、付いているもので、付けるものに入っていないもの（大文字・小文字を区別しない）。
+fn present<'a>(labels: &[String], remove: &[&'a str], add: &[&str]) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    for r in remove {
+        if labels.iter().any(|l| l.eq_ignore_ascii_case(r))
+            && !add.iter().any(|a| a.eq_ignore_ascii_case(r))
+            && !out.iter().any(|o| o.eq_ignore_ascii_case(r))
+        {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// gitを、使う人とシステムの設定を読まずに動かし、標準出力を返す。
@@ -1818,6 +1872,15 @@ mod tests {
             max_rounds: 3,
             timeout_minutes: 30,
         };
+        let work = Work {
+            product: "app".to_string(),
+            cell: "triage".to_string(),
+            item: Target::Issue,
+            repo: repo.clone(),
+            number: 3,
+            title: "t".to_string(),
+            waiting: None,
+        };
         // 止めきれなかったものとして、今動いているこのテストのプロセスを渡す
         let me = std::process::id();
         let started = process_table()
@@ -1828,6 +1891,7 @@ mod tests {
         let e = runner.fail(
             Failure::Unstopped(vec![Leftover { pid: me, started }]),
             &cell,
+            &work,
             &issue,
             &place,
         );
@@ -1853,7 +1917,13 @@ mod tests {
         assert!(!stuck_path(&home).exists());
 
         // ふつうの失敗なら、人間に回すコメントとラベルを書く
-        runner.fail(Failure::Error(Error::new("失敗")), &cell, &issue, &place);
+        runner.fail(
+            Failure::Error(Error::new("失敗")),
+            &cell,
+            &work,
+            &issue,
+            &place,
+        );
         let calls = probe.calls.borrow();
         assert!(
             calls.iter().any(|c| c.contains("issue comment 3")),
@@ -1864,6 +1934,19 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("--add-label ac:needs-human")),
             "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn only_present_labels_are_removed() {
+        let labels = vec!["ac:Working".to_string(), "ac:needs-human".to_string()];
+        assert_eq!(
+            present(
+                &labels,
+                &["ac:triage", "ac:working", "ac:needs-human", "ac:in-review"],
+                &["ac:needs-human"]
+            ),
+            vec!["ac:working"]
         );
     }
 
