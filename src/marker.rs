@@ -16,8 +16,18 @@ pub fn header(cell: &str, round: u32) -> String {
 }
 
 /// 目印を1行目に付けたコメント。Issue/PRへのコメント、PRの本文、レビューの本文はすべてこの形にする。
+///
+/// AIが前のコメントをまねて、本文の頭に目印を書くことがあるので、それは外す
+/// （CLIの目印と違うroundが並ぶと、人が読んで迷うため）。
 pub fn comment(cell: &str, round: u32, text: &str) -> String {
-    format!("{}\n\n{}", header(cell, round), text.trim())
+    let mut text = text.trim();
+    while parse(text).is_some() {
+        text = text.split_once('\n').map_or("", |(_, rest)| rest).trim();
+    }
+    if text.is_empty() {
+        return header(cell, round);
+    }
+    format!("{}\n\n{}", header(cell, round), text)
 }
 
 /// 本文の最後に、読んだやり取りがどこまでか（GitHubの時刻）を足す。
@@ -87,6 +97,23 @@ mod tests {
             "[agentcells] triage round 1\n\n仕様について確認させてください。\n- ログインは必須ですか？"
         );
         assert_eq!(parse(&c), Some(("triage".to_string(), 1)));
+    }
+
+    #[test]
+    fn comment_drops_markers_the_ai_wrote_at_the_top() {
+        let c = comment(
+            "implement",
+            1,
+            "[agentcells] implement round 2\n\n[agentcells] review round 1\n直しました\n[agentcells] review round 1",
+        );
+        assert_eq!(
+            c,
+            "[agentcells] implement round 1\n\n直しました\n[agentcells] review round 1"
+        );
+        assert_eq!(
+            comment("implement", 1, "[agentcells] implement round 2"),
+            "[agentcells] implement round 1"
+        );
     }
 
     #[test]
