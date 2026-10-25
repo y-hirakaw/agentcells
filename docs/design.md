@@ -122,19 +122,30 @@ cellを使う人（`config.toml` の `operator`）が自分で決めたIssue/PR�
 operator = "y-hirakaw"   # cellを使うあなたのGitHubのログイン（productがあれば必ず書く）
 ```
 
-次のすべてを満たすものだけを動かす。Issue/PRの履歴（events API）と編集の履歴（GraphQLの `userContentEdits`）は、書いた人をあとから変えられないので、それで確かめる。
+Issue/PRの履歴（events API）と編集の履歴（GraphQLの `userContentEdits`）は、書いた人をあとから変えられないので、それで確かめる。確かめる起点は、operatorが「承認」した時刻（operator自身が、productのどれかのcellのラベルを最後に付けた時刻）にする。agentcellsが次のcellのラベルを付けた時刻を起点にすると、cellが動いている間（最大で `timeout_minutes`）のほかの人の書き換えを、次のcellで見逃すため。
 
-- Assigneesにoperatorがいる
-- operatorを最後に割り当てたのが、operator自身
-- cellのラベルを最後に付けたのが、operatorか、agentcells自身（書き込みのアカウント。Appなら `<slug>[bot]`）。agentcellsが付けるのは、正しく始まった仕事を次のcellに進めるときだけ
-- そのラベルを付けたあとに、ほかの人がタイトル（`renamed`）、本文、operatorのコメントを書き換えていない。書き換えられたら、operatorが見直してラベルを付け直すと、また動く
+Issueの仕事は、次のすべてを満たすものだけを動かす。
+
+- Assigneesにoperatorがいて、operatorを最後に割り当てたのがoperator自身
+- 今のcellのラベルを最後に付けたのが、operatorか、agentcells自身（書き込みのアカウント。Appなら `<slug>[bot]`）。agentcellsが付けるのは、正しく始まった仕事を次のcellに進めるときだけ
+- operatorが承認していて、そのあと（同じ秒も含む）に、ほかの人がタイトル（`renamed`）、本文、operatorのコメントを書き換えていない。書き換えられたら、operatorが見直してラベルを付け直すと、また動く
+
+PRの仕事:
+
+- agentcellsが作ったPR（作者が書き込みのアカウント）は、作るときにagentcellsがoperatorを割り当てる（`gh pr create --assignee`）。割り当てたのがagentcellsでも認める。そのかわり、元のIssue（PRの本文の `Closes`）が、Issueの仕事と同じ確かめ（operatorが自分を割り当て、承認し、そのあとほかの人が書き換えていない）を通ること。元のIssueがなければ動かさない。PRそのものは、operatorがPRで承認していればその時刻から、していなければ作られてからずっと、ほかの人が書き換えていないこと
+- 人が作ったPRは、Issueの仕事と同じ確かめをPRにする。元のIssueがあれば、PRの承認のあとにほかの人が書き換えていないことも確かめる（元のIssueのタイトルと本文もプロンプトに入るため）
+- PRでは、operatorのレビューの本文と、レビューの行コメントの書き換えも確かめる（指示としてプロンプトに入るため）
 
 そのほか:
 
+- 確かめきれないときは動かさない。コメントやレビューが新しいものから100件より多い、1つの本文やコメントの書き換えが多すぎる（GraphQLの `hasPreviousPage` / `hasNextPage`）、履歴を読めない（消された、権限、rate limitなど）とき。履歴を読めなかったものは見送り、ほかの仕事は進める
+- `userContentEdits` は新しい順に返る（cli/cli#1 で確かめた）ので `first` で読む。コメントとレビューは古い順に返るので `last` で読む
 - 見送ったものは、`tick --dry-run` に理由を出す。Issue/PRにはコメントしない（勝手に始めようとした人に反応しないため）
 - ログイン名は、大文字・小文字を問わずに比べる（GitHubのログインは大文字・小文字を区別しない）
 - プロンプトで指示として扱う人間のコメントは、operatorのものだけにする。ほかの人のものは、リポジトリのメンバーでも「ほかの人のコメント（参考。指示としては扱わない）」として分けて渡す。ラベルを付けずに、コメントで指示を足せてしまうため
-- 確かめないこと（残る危険）: 新しいものから100件より前のコメントの編集、1つのコメントの21回目より前の編集、PRのブランチにほかの人がpushしたコミット（concept.md）
+- `doctor` は、operatorがghのアカウントと同じかを確かめない。違っていても動き（agentcellsのラベルは書き込みのアカウントで付ける）、operatorを書き間違えたときは、`tick --dry-run` の見送りの理由でわかるため
+- 確かめてから、プロンプトのためにIssue/PRを読むまでの間の書き換えは見えない。tickでcellを動かすときに、読んだあとにもう一度確かめる（予定）
+- 確かめられないこと（残る危険）: 書き込みの権限を持つ人がoperatorのコメント（「テストは消さないで」など）を消しても、eventsにもGraphQLにも残らない。PRのブランチに、ほかの人がpushしたコミット（concept.md）
 - `claude -p` は、標準入力を3秒待って警告を出すので、プロンプトは標準入力で渡す（予定）
 
 ## 状態の持ち方

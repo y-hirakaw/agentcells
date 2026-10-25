@@ -33,7 +33,9 @@ pub fn create_args(
     branch: &str,
     title: &str,
     body: &str,
+    assignee: &str,
 ) -> Vec<String> {
+    // cellを使う人を割り当てる。agentcellsが作ったPRは、割り当てたのがagentcellsでも、次のcellが動ける（guard）
     [
         "pr",
         "create",
@@ -47,6 +49,8 @@ pub fn create_args(
         title,
         "--body",
         body,
+        "--assignee",
+        assignee,
     ]
     .iter()
     .map(|s| s.to_string())
@@ -175,6 +179,7 @@ mod tests {
             "ac/octo-issues-7",
             "タイトル",
             "本文",
+            "y-hirakaw",
         );
         assert_eq!(
             args,
@@ -190,7 +195,9 @@ mod tests {
                 "--title",
                 "タイトル",
                 "--body",
-                "本文"
+                "本文",
+                "--assignee",
+                "y-hirakaw"
             ]
         );
     }

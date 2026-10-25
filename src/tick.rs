@@ -74,6 +74,10 @@ struct Listed {
     labels: Vec<ListedLabel>,
     #[serde(default)]
     assignees: Vec<ListedUser>,
+    #[serde(default)]
+    author: Option<ListedUser>,
+    #[serde(default)]
+    body: String,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +105,18 @@ pub fn find(
     // Appのトークンはリポジトリごとなので、1回のtickの中ではリポジトリごとに1つだけ作って使い回す
     let mut cache: HashMap<RepoName, Credentials> = HashMap::new();
     for product in &config.products {
+        // 元のIssueのリポジトリの分も、先に作っておく
+        for repo in std::iter::once(&product.issues).chain(&product.repos) {
+            if !cache.contains_key(repo) {
+                cache.insert(repo.clone(), credentials_for(repo)?);
+            }
+        }
+        let cell_labels: Vec<String> = product
+            .cells
+            .iter()
+            .filter_map(|name| config.cell(name))
+            .map(|c| c.label.clone())
+            .collect();
         for name in &product.cells {
             let Some(cell) = config.cell(name) else {
                 continue;
@@ -111,9 +127,6 @@ pub fn find(
                     Target::PullRequest => product.repos.iter().collect(),
                 };
                 for repo in repos {
-                    if !cache.contains_key(repo) {
-                        cache.insert(repo.clone(), credentials_for(repo)?);
-                    }
                     let env = cache[repo].gh_env()?;
                     let mut items = list(probe, &env, item, repo, &cell.label)?;
                     items.sort_by_key(|i| i.number);
@@ -142,9 +155,52 @@ pub fn find(
                             found.skipped.push((work, reason));
                             continue;
                         }
-                        match guard::check(probe, &env, repo, i.number, &cell.label, actors)? {
-                            None => found.work.push(work),
-                            Some(reason) => found.skipped.push((work, reason)),
+                        let original = match item {
+                            Target::PullRequest => crate::prompt::closes(&i.body, repo),
+                            Target::Issue => None,
+                        };
+                        let original_env = match &original {
+                            Some((original_repo, _)) => match cache.get(original_repo) {
+                                Some(c) => Some(c.gh_env()?),
+                                None => {
+                                    let reason = format!(
+                                        "元のIssueのリポジトリ {original_repo} が、このproductにありません"
+                                    );
+                                    found.skipped.push((work, reason));
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        let request = guard::Request {
+                            kind: item,
+                            subject: guard::Subject {
+                                repo,
+                                number: i.number,
+                                env: &env,
+                            },
+                            author: i
+                                .author
+                                .as_ref()
+                                .map(|a| a.login.as_str())
+                                .unwrap_or("ghost"),
+                            label: &cell.label,
+                            cell_labels: &cell_labels,
+                            original: original.as_ref().zip(original_env.as_ref()).map(
+                                |((original_repo, number), env)| guard::Subject {
+                                    repo: original_repo,
+                                    number: *number,
+                                    env,
+                                },
+                            ),
+                        };
+                        // 1件の履歴を読めなくても、ほかの仕事は進める（読めなかったものは動かさない）
+                        match guard::check(probe, &request, actors) {
+                            Ok(None) => found.work.push(work),
+                            Ok(Some(reason)) => found.skipped.push((work, reason)),
+                            Err(e) => found
+                                .skipped
+                                .push((work, format!("履歴を読めません: {}", e.message))),
                         }
                     }
                 }
@@ -176,7 +232,7 @@ fn list(
         "--state",
         "open",
         "--json",
-        "number,title,labels,assignees",
+        "number,title,labels,assignees,author,body",
         "--limit",
         "100",
     ];
@@ -216,7 +272,6 @@ mod tests {
             assigned("me", "me", "2026-10-25T01:00:00Z"),
             labeled("me", label, "2026-10-25T02:00:00Z"),
         ];
-        let events: Vec<&str> = events.iter().map(String::as_str).collect();
         with_history(probe, repo, number, &events, NO_EDITS)
     }
 
@@ -256,7 +311,7 @@ next = ["done"]
         let (_dir, config) = config();
         let probe = FakeProbe::default()
             .with(
-                "gh issue list --repo octo/issues --label ac:triage --state open --json number,title,labels,assignees --limit 100",
+                "gh issue list --repo octo/issues --label ac:triage --state open --json number,title,labels,assignees,author,body --limit 100",
                 true,
                 &format!(r#"[{{"number":9,"title":"後","labels":[{{"name":"ac:triage"}}],{ME}}},
                     {{"number":3,"title":"先","labels":[{{"name":"ac:triage"}}],{ME}}},
@@ -266,12 +321,12 @@ next = ["done"]
                     {{"number":7,"title":"勝手に","labels":[{{"name":"ac:triage"}}],{ME}}}]"#),
             )
             .with(
-                "gh pr list --repo octo/app --label ac:review --state open --json number,title,labels,assignees --limit 100",
+                "gh pr list --repo octo/app --label ac:review --state open --json number,title,labels,assignees,author,body --limit 100",
                 true,
                 &format!(r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME}}}]"#),
             )
             .with(
-                "gh pr list --repo octo/web --label ac:review --state open --json number,title,labels,assignees --limit 100",
+                "gh pr list --repo octo/web --label ac:review --state open --json number,title,labels,assignees,author,body --limit 100",
                 true,
                 "[]",
             );
@@ -283,7 +338,6 @@ next = ["done"]
             assigned("me", "me", "2026-10-25T01:00:00Z"),
             labeled("eager", "ac:triage", "2026-10-25T02:00:00Z"),
         ];
-        let eager: Vec<&str> = eager.iter().map(String::as_str).collect();
         let probe = with_history(probe, "octo/issues", 7, &eager, NO_EDITS);
         let found = find(&config, &probe, &token, &actors()).unwrap();
         let skipped: Vec<String> = found
@@ -340,7 +394,7 @@ next = ["done"]
         ] {
             probe = probe.with(
                 &format!(
-                    "gh {kind} list --repo octo/issues --label {label} --state open --json number,title,labels,assignees --limit 100"
+                    "gh {kind} list --repo octo/issues --label {label} --state open --json number,title,labels,assignees,author,body --limit 100"
                 ),
                 true,
                 "[]",
@@ -359,6 +413,48 @@ next = ["done"]
         );
         assert_eq!(probe.calls.borrow().len(), 3);
         assert_eq!(made.get(), 1);
+    }
+
+    #[test]
+    fn prs_made_by_agentcells_run_from_the_issue_approval_and_unreadable_items_are_skipped() {
+        let (_dir, config) = config();
+        let list = |kind: &str, repo: &str, label: &str| {
+            format!(
+                "gh {kind} list --repo {repo} --label {label} --state open --json number,title,labels,assignees,author,body --limit 100"
+            )
+        };
+        let probe = FakeProbe::default()
+            .with(
+                &list("issue", "octo/issues", "ac:triage"),
+                true,
+                &format!(r#"[{{"number":5,"title":"読めない","labels":[{{"name":"ac:triage"}}],{ME}}}]"#),
+            )
+            .with(
+                &list("pr", "octo/app", "ac:review"),
+                true,
+                &format!(
+                    r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME},"author":{{"login":"bot[bot]"}},"body":"Closes octo/issues#3"}}]"#
+                ),
+            )
+            .with(&list("pr", "octo/web", "ac:review"), true, "[]");
+        // agentcellsが作ったPRに、agentcellsがoperatorを割り当て、reviewのラベルを付けた
+        let pr_events = [
+            assigned("bot[bot]", "me", "2026-10-25T03:00:00Z"),
+            labeled("bot[bot]", "ac:review", "2026-10-25T03:00:00Z"),
+        ];
+        let probe = with_history(probe, "octo/app", 12, &pr_events, NO_EDITS);
+        // 元のIssueは、operatorが承認している
+        let probe = approved(probe, "octo/issues", 3, "ac:triage");
+        // octo/issues#5 の履歴は、応答を用意していないので読めない
+        let found = find(&config, &probe, &token, &actors()).unwrap();
+        let work: Vec<String> = found.work.iter().map(Work::describe).collect();
+        assert_eq!(work, vec!["review PR octo/app#12「PR」"]);
+        assert_eq!(found.skipped.len(), 1);
+        assert!(
+            found.skipped[0].1.starts_with("履歴を読めません"),
+            "{:?}",
+            found.skipped
+        );
     }
 
     #[test]
