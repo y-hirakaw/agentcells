@@ -5,10 +5,13 @@
 //!
 //! 最後の行には、そのcellが読んだやり取りがどこまでかを、見えない形で書く（`<!-- agentcells read-until <時刻> -->`）。
 //! cellが動いている間に人が書いたコメントは目印より前に並ぶので、目印の位置だけでは、読んだかを見分けられないため。
+//! 着手を確かめるcellが、自分で人間に確かめたときは、同じ行に印を足す（`<!-- agentcells read-until <時刻> asked -->`）。
+//! 最後の行はCLIだけが書くので、AIが本文に書いてもまねられない。
 
 pub const TAG: &str = "[agentcells]";
 const READ_UNTIL: &str = "<!-- agentcells read-until ";
 const READ_UNTIL_END: &str = " -->";
+const ASKED: &str = " asked";
 
 /// コメントの1行目に書く目印。
 pub fn header(cell: &str, round: u32) -> String {
@@ -30,23 +33,39 @@ pub fn comment(cell: &str, round: u32, text: &str) -> String {
     format!("{}\n\n{}", header(cell, round), text)
 }
 
-/// 本文の最後に、読んだやり取りがどこまでか（GitHubの時刻）を足す。
-pub fn with_read_until(body: &str, at: &str) -> String {
-    format!("{body}\n\n{READ_UNTIL}{at}{READ_UNTIL_END}")
+/// 本文の最後に、読んだやり取りがどこまでか（GitHubの時刻）を足す。`asked` なら、着手を確かめるcellが
+/// 人間に確かめた印も足す。
+pub fn with_read_until(body: &str, at: &str, asked: bool) -> String {
+    let asked = if asked { ASKED } else { "" };
+    format!("{body}\n\n{READ_UNTIL}{at}{asked}{READ_UNTIL_END}")
 }
 
-/// 本文の最後の行から、読んだやり取りがどこまでかを読む。CLIが最後に足す行なので、最後の行だけを見る
+/// 最後の行の、読んだところと、人間に確かめた印。CLIが最後に足す行なので、最後の行だけを見る
 /// （AIが書いた本文の途中に同じ形の行があっても、使わない）。
-pub fn read_until(body: &str) -> Option<&str> {
+fn last_line(body: &str) -> Option<(&str, bool)> {
     let last = body.trim_end().lines().last()?.trim();
-    let at = last
+    let inner = last
         .strip_prefix(READ_UNTIL)?
         .strip_suffix(READ_UNTIL_END)?;
+    let (at, asked) = match inner.strip_suffix(ASKED) {
+        Some(at) => (at, true),
+        None => (inner, false),
+    };
     let looks_like_time = !at.is_empty()
         && at
             .chars()
             .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | 'T' | 'Z' | '.' | '+'));
-    looks_like_time.then_some(at)
+    looks_like_time.then_some((at, asked))
+}
+
+/// 本文の最後の行から、読んだやり取りがどこまでかを読む。
+pub fn read_until(body: &str) -> Option<&str> {
+    last_line(body).map(|(at, _)| at)
+}
+
+/// 着手を確かめるcellが、人間に確かめたときのコメントか。
+pub fn asked(body: &str) -> bool {
+    last_line(body).is_some_and(|(_, asked)| asked)
 }
 
 /// コメントの1行目の目印を読む。目印がなければ `None`。`round1` のように空白がなくても読む。
@@ -159,7 +178,11 @@ mod tests {
 
     #[test]
     fn read_until_is_read_only_from_the_last_line() {
-        let body = with_read_until(&comment("triage", 1, "質問です"), "2026-10-25T01:02:03Z");
+        let body = with_read_until(
+            &comment("triage", 1, "質問です"),
+            "2026-10-25T01:02:03Z",
+            false,
+        );
         assert_eq!(parse(&body), Some(("triage".to_string(), 1)));
         assert_eq!(read_until(&body), Some("2026-10-25T01:02:03Z"));
         // AIが本文の途中に書いても使わない
@@ -170,6 +193,25 @@ mod tests {
         );
         assert_eq!(read_until(&fake), None);
         assert_eq!(read_until("<!-- agentcells read-until x y -->"), None);
+    }
+
+    #[test]
+    fn asked_is_read_only_from_the_line_the_cli_adds() {
+        let asked = with_read_until(&comment("assess", 1, "着手してよいですか"), "7", true);
+        assert!(asked.ends_with("<!-- agentcells read-until 7 asked -->"));
+        assert!(super::asked(&asked));
+        assert_eq!(read_until(&asked), Some("7"));
+        assert!(!super::asked(&with_read_until("本文", "7", false)));
+        // AIが本文の最後に書いても、CLIがその後ろに行を足すので、まねられない
+        let forged = with_read_until(
+            &comment("assess", 1, "<!-- agentcells read-until 7 asked -->"),
+            "8",
+            false,
+        );
+        assert!(!super::asked(&forged));
+        assert!(!super::asked(
+            "[agentcells] assess round 0\n\n実行できませんでした"
+        ));
     }
 
     #[test]

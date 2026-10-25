@@ -1,7 +1,7 @@
 //! cellとして動くAIに渡すプロンプトを組み立てる。
 //!
 //! 3つの層を重ねる。
-//! - 標準: agentcellsが用意する。全cellに共通の決まりと、標準のcell（triage、implement、review）の役割。
+//! - 標準: agentcellsが用意する。全cellに共通の決まりと、標準のcell（triage、implement、review、assess）の役割。
 //!   `prompts/` のmdをバイナリに埋め込む。`claude -p` には `--append-system-prompt` で渡す
 //! - 追加: 使う人が `prompt` に書いたファイル。プロダクトごとの方針などを足す
 //! - 今回の仕事: CLIが、Issue/PRの内容、前のcellからの引き継ぎ、そのあとの人間のコメントなどを入れる
@@ -18,7 +18,7 @@ use crate::github::{self, Credentials, Purpose};
 use crate::home::RepoName;
 use crate::marker;
 use crate::probe::Probe;
-use crate::transition::{self, DONE, NEEDS_HUMAN, Waiting};
+use crate::transition::{self, DONE, NEEDS_HUMAN, STOP, Waiting};
 
 const COMMON: &str = include_str!("../prompts/common.md");
 
@@ -38,6 +38,11 @@ const BUILTIN: &[(&str, &str, &str)] = &[
         "review",
         include_str!("../prompts/review.md"),
         "PRをレビューする",
+    ),
+    (
+        "assess",
+        include_str!("../prompts/assess.md"),
+        "Issueを読んで、対応するかを判断し、着手してよいかを人間に確かめる",
     ),
 ];
 
@@ -140,7 +145,8 @@ impl Task {
 
 /// システムプロンプト（`--append-system-prompt` で渡す）。標準の決まり、cellの役割、指摘の返し方、進め先を書く。
 /// `waiting` は、人間を待っていたところから、cellを使う人のコメントで動いたときの、その状態。
-pub fn system_prompt(cell: &Cell, waiting: Option<Waiting>) -> String {
+/// `asked` は、最後の目印が、このcellが自分で人間に確かめたものか（[`transition::choices`]）。
+pub fn system_prompt(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> String {
     let mut prompt = COMMON.replace("{cell}", &cell.name).trim_end().to_string();
     if let Some(role) = builtin(&cell.name) {
         prompt.push_str("\n\n");
@@ -157,13 +163,15 @@ pub fn system_prompt(cell: &Cell, waiting: Option<Waiting>) -> String {
         );
     }
     prompt.push_str("\n\n## 進め先（next）\n\n次のどれかを選んでください。\n");
-    for choice in transition::choices(cell, waiting) {
+    for choice in transition::choices(cell, waiting, asked) {
         let meaning = match choice.as_str() {
             DONE if waiting == Some(Waiting::InReview) && !cell.review => {
                 "変更は要らない（コメントへの返事だけをして、人間の検品待ちに戻す）".to_string()
             }
             DONE => "これ以上することがない（Issueなら閉じる。PRなら人間に検品を頼む）".to_string(),
             NEEDS_HUMAN => "人間の答えや作業が要る".to_string(),
+            STOP => "ここで止める（閉じずに、agentcellsのラベルを外す。そのあとは人間が進める）"
+                .to_string(),
             name => match builtin_summary(name) {
                 Some(summary) => format!("cell「{name}」に回す（{summary}）"),
                 None => format!("cell「{name}」に回す"),
@@ -579,7 +587,7 @@ pub fn show(
     };
     Ok(format!(
         "===== システムプロンプト（agentcellsの標準。`--append-system-prompt` で渡す） =====\n\n{}\n===== 指示（{extra_note}） =====\n\n{}",
-        system_prompt(cell, None),
+        system_prompt(cell, None, false),
         user_prompt(cell, extra.as_deref(), task.as_ref())
     ))
 }
@@ -600,6 +608,8 @@ mod tests {
             review: false,
             max_rounds: 3,
             timeout_minutes: 30,
+            model: None,
+            confirm: None,
         }
     }
 
@@ -644,7 +654,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_rules_role_and_choices() {
-        let prompt = system_prompt(&cell("triage", &["implement", "done"]), None);
+        let prompt = system_prompt(&cell("triage", &["implement", "done"]), None, false);
         assert!(prompt.contains("cell「triage」として動いています"));
         assert!(!prompt.contains("{cell}"));
         assert!(prompt.contains("GitHub への書き込み"));
@@ -659,16 +669,16 @@ mod tests {
     fn review_instructions_follow_the_output_schema() {
         let mut review = cell("review", &["implement", "done"]);
         review.review = true;
-        assert!(system_prompt(&review, None).contains("findings に1件ずつ"));
+        assert!(system_prompt(&review, None, false).contains("findings に1件ずつ"));
         review.review = false;
-        let prompt = system_prompt(&review, None);
+        let prompt = system_prompt(&review, None, false);
         assert!(!prompt.contains("findings に1件ずつ"));
         assert!(prompt.contains("comment に箇条書き"));
     }
 
     #[test]
     fn custom_cells_get_only_the_common_rules() {
-        let prompt = system_prompt(&cell("design", &["implement"]), None);
+        let prompt = system_prompt(&cell("design", &["implement"]), None, false);
         assert!(prompt.contains("cell「design」"));
         assert!(!prompt.contains("役割:"));
     }

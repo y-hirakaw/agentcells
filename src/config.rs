@@ -47,10 +47,12 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # name = "triage"
 # on = "issue"                       # issue か pull_request（両方なら ["issue", "pull_request"]）
 # label = "ac:triage"                # 拾うラベル（ac: で始める）
-# prompt = "cells/triage.md"         # 追加の指示のファイル（このファイルからの相対パス）。標準のcell（triage、implement、review）なら省略できる
-# next = ["implement", "done"]       # 進めてよい先（cellの名前か done）。needs-human はいつでも選べる
+# prompt = "cells/triage.md"         # 追加の指示のファイル（このファイルからの相対パス）。標準のcell（triage、implement、review、assess）なら省略できる
+# next = ["implement", "done"]       # 進めてよい先（cellの名前、done、stop）。needs-human はいつでも選べる
 # review = false                     # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
 # max_rounds = 3                     # 往復の上限（1〜3。省略すると3）
+# model = "sonnet"                   # 使うモデル（省略すると、Claude Codeの既定のもの）
+# confirm = false                    # true にすると、人間が着手を認めるまで次のcellに進めない（assess は省略すると true）
 # timeout_minutes = 30               # 1回の実行の上限（省略すると30）
 #
 # github_app: GitHubへの書き込み（コメント、ラベル、push、PR）に使うGitHub App（推奨）
@@ -163,7 +165,7 @@ pub struct Cell {
     /// 拾うラベル
     pub label: String,
     /// 標準のプロンプトに足す、追加の指示のファイル。読み込んだあとは絶対パスになっている。
-    /// 標準のcell（triage、implement、review）なら省略できる
+    /// 標準のcell（triage、implement、review、assess）なら省略できる
     #[serde(default)]
     pub prompt: Option<PathBuf>,
     /// 進めてよい先（cellの名前か `done`）。`needs-human` は書かなくても選べる
@@ -176,6 +178,20 @@ pub struct Cell {
     pub max_rounds: u32,
     #[serde(default = "default_timeout_minutes")]
     pub timeout_minutes: u32,
+    /// `claude -p` の `--model`（`sonnet` など）。書かなければ、Claude Codeの既定のもの
+    #[serde(default)]
+    pub model: Option<String>,
+    /// 次のcellに進む前に、人間に着手してよいかを確かめる（人間の返事で動いたときだけ、次のcellと
+    /// `stop` を選べる）。書かなければ、assess だけ確かめる
+    #[serde(default)]
+    pub confirm: Option<bool>,
+}
+
+impl Cell {
+    /// 次のcellに進む前に、人間に確かめるか。
+    pub fn confirms(&self) -> bool {
+        self.confirm.unwrap_or(self.name == "assess")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -448,9 +464,10 @@ impl Config {
                     problems.push(format!("cell「{}」の next に自分自身があります", c.name));
                 } else if !transition::is_reserved(next) && self.cell(next).is_none() {
                     problems.push(format!(
-                        "cell「{}」の next の「{next}」が [[cell]] に定義されていません（cellの名前か {} を書きます）",
+                        "cell「{}」の next の「{next}」が [[cell]] に定義されていません（cellの名前か {} か {} を書きます）",
                         c.name,
-                        transition::DONE
+                        transition::DONE,
+                        transition::STOP
                     ));
                 }
             }
@@ -504,6 +521,26 @@ impl Config {
                     c.name
                 ));
             }
+            if c.confirms()
+                && !c
+                    .next
+                    .iter()
+                    .any(|n| n == transition::STOP || self.cell(n).is_some())
+            {
+                problems.push(format!(
+                    "cell「{}」は着手を確かめるので、next に、認められたあとに進むcellか {} を書いてください",
+                    c.name,
+                    transition::STOP
+                ));
+            }
+            if let Some(model) = &c.model
+                && !is_valid_model(model)
+            {
+                problems.push(format!(
+                    "cell「{}」の model「{model}」に使えない文字があります（英数字・-・.・_・[]）",
+                    c.name
+                ));
+            }
             if c.timeout_minutes == 0 {
                 problems.push(format!(
                     "cell「{}」の timeout_minutes は1以上にしてください",
@@ -534,6 +571,16 @@ fn is_valid_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// `claude --model` に渡す名前（`sonnet`、`claude-sonnet-5-5`、`opus[1m]` など）。引数として渡すので、
+/// `-` で始まるものは断る。
+fn is_valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && !model.starts_with('-')
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._[]".contains(c))
 }
 
 /// GitHubのログイン（英数字と -、39文字まで。- で始まったり終わったりしない）。
@@ -644,6 +691,29 @@ timeout_minutes = 10
     }
 
     #[test]
+    fn cells_can_choose_a_model() {
+        let ok = VALID.replace(
+            "max_rounds = 2",
+            "max_rounds = 2\nmodel = \"claude-sonnet-5-5\"",
+        );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(&ok, dir.path()).unwrap();
+        assert!(
+            config
+                .cells
+                .iter()
+                .any(|c| c.model.as_deref() == Some("claude-sonnet-5-5"))
+        );
+        for bad in ["--dangerously-skip-permissions", "", "son net"] {
+            let text = VALID.replace(
+                "max_rounds = 2",
+                &format!("max_rounds = 2\nmodel = \"{bad}\""),
+            );
+            assert!(problems_of(&text).contains("model"), "{bad}");
+        }
+    }
+
+    #[test]
     fn max_rounds_is_capped_at_three() {
         let ok = VALID.replace("max_rounds = 2", "max_rounds = 3");
         let dir = base_with_prompts(&["triage.md", "review.md"]);
@@ -663,6 +733,24 @@ timeout_minutes = 10
         assert!(message.contains("「deploy」が [[cell]]"), "{message}");
         assert!(!message.contains("「done」"), "{message}");
         assert!(!message.contains("「needs-human」"), "{message}");
+    }
+
+    #[test]
+    fn confirming_cells_need_somewhere_to_go_after_approval() {
+        let text = VALID.replace(
+            "next = [\"review\", \"done\"]",
+            "next = [\"review\", \"done\"]\nconfirm = true",
+        );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        assert!(Config::parse(&text, dir.path()).is_ok());
+        let text = text.replace("next = [\"review\", \"done\"]", "next = [\"done\"]");
+        let message = problems_of(&text);
+        assert!(
+            message.contains("cell「triage」は着手を確かめる"),
+            "{message}"
+        );
+        let text = text.replace("next = [\"done\"]", "next = [\"stop\", \"done\"]");
+        assert!(Config::parse(&text, dir.path()).is_ok());
     }
 
     #[test]

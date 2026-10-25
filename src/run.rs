@@ -497,10 +497,11 @@ impl Runner<'_> {
             })?),
             None => None,
         };
+        let asked = crate::discussion::asked_by(&task.discussion.posts, &task.writer, &cell.name);
         Ok(Prepared::Ready(Box::new(Ready {
             user: prompt::user_prompt(cell, extra.as_deref(), Some(&task)),
-            system: prompt::system_prompt(cell, work.waiting),
-            schema: transition::output_schema(cell, work.waiting),
+            system: prompt::system_prompt(cell, work.waiting, asked),
+            schema: transition::output_schema(cell, work.waiting, asked),
             settings_path,
             context_path,
             labels_before: issue.labels(item_read)?,
@@ -591,6 +592,7 @@ impl Runner<'_> {
     ) -> Result<Report> {
         let labels_after = issue.labels(write)?;
         let task = &ready.task;
+        let asked = crate::discussion::asked_by(&task.discussion.posts, &task.writer, &cell.name);
         let round = task.round(&cell.name);
         let runs = |name: &str| task.runs_since_operator(name);
         let read_until = task.read_until();
@@ -624,10 +626,11 @@ impl Runner<'_> {
             overridden = Some(changed);
         }
 
-        // コミットを確かめてpushし、IssueからならPRを作る（レビューのcellはpushしない）
+        // コミットを確かめてpushし、IssueからならPRを作る（レビューのcellと、着手を確かめるcellはpushしない）
         let mut pr_number: Option<u64> = None;
         if overridden.is_none()
             && !cell.review
+            && !cell.confirms()
             && let Some(branch) = &ready.branch
         {
             match self.push(
@@ -637,6 +640,7 @@ impl Runner<'_> {
                     if work.item == Target::PullRequest
                         && outcome.next != transition::NEEDS_HUMAN
                         && outcome.next != transition::DONE
+                        && outcome.next != transition::STOP
                     {
                         overridden = Some(format!(
                             "新しいコミットがないので「{}」には進めません",
@@ -664,6 +668,7 @@ impl Runner<'_> {
                     created_pr,
                     requested,
                     waiting: work.waiting,
+                    asked,
                 },
                 &runs,
             )
@@ -683,6 +688,10 @@ impl Runner<'_> {
             text.push_str(&format!("人間に回しました: {reason}"));
         }
 
+        // 着手を確かめるcellが、自分で人間に確かめたなら、そう印を付ける（このあとの返事でだけ先へ進める）
+        let asking = cell.confirms()
+            && reason.is_none()
+            && plan.destination == transition::Destination::NeedsHuman;
         // レビューのcellは、指摘を行ごとにPRのレビューとして投稿する。それ以外はコメントにする
         // 最後の行に、読んだやり取りがどこまでかを書く（動いている間に届いたコメントで、また動かすため）
         let review = (cell.review && work.item == Target::PullRequest && reason.is_none())
@@ -690,14 +699,16 @@ impl Runner<'_> {
             .transpose()?
             .map(|mut payload| {
                 let body = payload["body"].as_str().unwrap_or_default();
-                payload["body"] = marker::with_read_until(body, &read_until).into();
+                payload["body"] = marker::with_read_until(body, &read_until, asking).into();
                 payload
             });
         let posted = match &review {
             Some(payload) => payload.to_string(),
-            None => {
-                marker::with_read_until(&marker::comment(&cell.name, round, &text), &read_until)
-            }
+            None => marker::with_read_until(
+                &marker::comment(&cell.name, round, &text),
+                &read_until,
+                asking,
+            ),
         };
         // 投稿する本文の全体を、秘密らしいものがないか調べる。あれば、決まった文だけにして人間に回す
         let found = actions::scan_text(self.scanner, &posted)?;
@@ -716,6 +727,7 @@ impl Runner<'_> {
             let body = marker::with_read_until(
                 &marker::comment(&cell.name, round, &format!("人間に回しました: {note}")),
                 &read_until,
+                false,
             );
             issue.comment(write, &body)?;
             plan = plan_for(transition::NEEDS_HUMAN, pr_number.is_some());
@@ -749,6 +761,7 @@ impl Runner<'_> {
             destination: match &plan.destination {
                 Destination::Cell(name) => name.clone(),
                 Destination::Done => transition::DONE.to_string(),
+                Destination::Stop => transition::STOP.to_string(),
                 Destination::NeedsHuman => transition::NEEDS_HUMAN.to_string(),
             },
             reason,
@@ -967,7 +980,7 @@ enum Pushed {
 }
 
 impl Ready {
-    fn claude<'a>(&'a self, runner: &'a Runner, cell: &Cell, place: &'a Place) -> ClaudeRun<'a> {
+    fn claude<'a>(&'a self, runner: &'a Runner, cell: &'a Cell, place: &'a Place) -> ClaudeRun<'a> {
         ClaudeRun {
             program: runner.claude,
             cwd: &place.worktree,
@@ -977,7 +990,8 @@ impl Ready {
             prompt: &self.user,
             context: &self.context_path,
             path_prefix: runner.agentcells.parent(),
-            model: runner.model,
+            // 試すときの指定（AGENTCELLS_MODEL）を、cellの設定より先にする
+            model: runner.model.or(cell.model.as_deref()),
             timeout: Duration::from_secs(u64::from(cell.timeout_minutes) * 60),
             log_dir: &place.run,
             job_dirs: &self.job_dirs,
@@ -2013,6 +2027,8 @@ mod tests {
             review: false,
             max_rounds: 3,
             timeout_minutes: 30,
+            model: None,
+            confirm: None,
         };
         let work = Work {
             product: "app".to_string(),

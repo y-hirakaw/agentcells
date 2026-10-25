@@ -16,10 +16,14 @@ name = "review"
 on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
 prompt = "cells/review.md"   # 追加の指示のファイル（標準のcellなら省略できる）
-next = ["implement", "done"] # 進めてよい先（cellの名前か done）
+next = ["implement", "done"] # 進めてよい先（cellの名前、done、stop）
 max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
+model = "sonnet"             # 使うモデル（省略すると、Claude Codeの既定のもの）
+confirm = false              # 人間が着手を認めるまで、次のcellに進めない（assess は省略すると true）
 ```
+
+- `model` は `claude -p --model` に渡す。cellごとに、重さに合ったモデルを選べるようにするため（判断だけのcellは sonnet など）。試すときの環境変数 `AGENTCELLS_MODEL` があれば、そちらを使う
 
 ## プロンプト
 
@@ -32,7 +36,7 @@ cellとして動くAIに渡すプロンプトは、3つの層を重ねて作る�
 | 今回の仕事 | CLI | Issue/PRの中身、前のcellからの引き継ぎ、直してほしい指摘、そのあとの人間のコメント、何回目か、作業場所、ベースブランチ | 指示の本文 |
 
 - 標準のプロンプトは、このリポジトリの `prompts/` にmdで置き、ビルドのときにバイナリに埋め込む。公開しているので、誰でも中身を読める
-- 標準のcellは triage、implement、review。設定の `prompt` は省略できる。書けば、そのファイルが追加の指示になる
+- 標準のcellは triage、implement、review、assess。設定の `prompt` は省略できる。書けば、そのファイルが追加の指示になる
 - 使う人が足したcell（例: design）には標準の役割がないので、`prompt` が要る（共通の決まりと進め先は付く）
 - `agentcells prompt show <cell> [--issue owner/repo#N | --pr owner/repo#N]` で、AIに渡るプロンプトを組み立てて表示する。どんなシステムプロンプトが入るかを、使う人が確かめられるようにするため
 - 実行のたびに、渡したプロンプトを `logs/` に残す（予定）
@@ -83,10 +87,18 @@ cellが終わったら、AIは「次はどこか」と、Issue/PRに残すコメ
 | triage | Issue | implement, done | 着手する / 対応しない（Issueを閉じる） |
 | implement | Issue, PR | review | PRを作る（Issueから）か指摘を直して、レビューに回す |
 | review | PR | implement, done | 指摘を直してもらう / 問題なし |
+| assess | Issue | implement か stop, done | 着手を認められたら次へ（なければ止める） / 対応しない（Issueを閉じる） |
 | （すべて） | | needs-human | 質問や検品を人間に頼む |
 
 - Issueを扱うcellから、PRを扱うcellに進むときは、実行の中で作られたPRにラベルを付ける。PRが作られていなければ人間に回す
 - `done` は、Issueなら閉じる。PRなら、自動マージの判断（dispatcher）ができるまでは `ac:in-review` を付けて検品を頼む
+- `stop` は、閉じずに止める。cellのラベルと人間を待っているラベルを外し、そのあとは人間が進める。`next` に書いたcellだけが選べる。次のcellがないところ（実装を人間がするリポジトリなど）で、着手が決まったIssueを開いたまま残すため
+- assess（`confirm = true` のcell）は、対応するべきかを判断し、するべきなら方針を書いて `needs-human` で人間に着手してよいかを確かめる。対応しないと判断したら、確かめずに `done` で閉じる（開き直せるので、害は小さい）
+  - 次のcellと `stop` を選べるのは、そのcellが自分で人間に確かめたあとの、operatorの返事で動いたときだけ。それ以外（最初に動いたとき、失敗して人間に回したあとの返事、ラベルを付け直して動いたとき）は `done` と `needs-human` しか選べない（スキーマとCLIの確かめで絞る）。AIが判断を誤って、確かめずに先へ進むことがないよう、CLIで縛るため
+  - 「自分で確かめた」は、AIが自分で `needs-human` を選び、CLIが人間に回さず（上限や秘密などで）、そのまま投稿したコメントにだけ、最後の行の印（`<!-- agentcells read-until <時刻> asked -->`）で示す。最後の行はCLIだけが書くので、AIが本文に書いてもまねられない。その印が、最後の目印にあるときだけ認めうるとみなす
+  - CLIが保証するのは、AIが方針を出したあとにoperatorが返事をしたことまで。返事が認めたものかどうかはAIが読む。着手を認めるのはコメントでする（ラベルを付け直して動かすと、もう一度確かめる）
+  - 着手を確かめるcellは、ファイルを変えない。コミットがあってもpushしない
+  - `confirm = true` のcellは、`next` に、認められたあとに進むcellか `stop` が要る
 - 往復は最大3回（`max_rounds` は1〜3）。進む先のcellが、そのIssue/PRで、operatorの最後のコメントから上限の回数動いていたら人間に回す。上限は、人を挟まないAIどうしの往復を止めるためのものなので、operatorが返事をしたら、また上限まで動ける。implementの最初の実装はIssueの上で数え、PRでは指摘を直した回数を数えるので、review → implement の差し戻しは最大3回になる
 
 ### 返事で動く

@@ -211,6 +211,15 @@ pub fn last_marker(posts: &[Post], writer: &str) -> Option<usize> {
     posts.iter().rposition(|p| is_marker(p, writer))
 }
 
+/// 最後の目印が、このcellが自分で人間に確かめたものか。着手を確かめるcellは、このあとの返事でだけ先へ進める
+/// （失敗して人間に回したあとの返事では進めない）。
+pub fn asked_by(posts: &[Post], writer: &str, cell: &str) -> bool {
+    last_marker(posts, writer).is_some_and(|i| {
+        marker::parse(&posts[i].body).is_some_and(|(c, _)| c == cell)
+            && marker::asked(&posts[i].body)
+    })
+}
+
 /// cellがまだ読んでいない投稿（目印は除く）。最後の目印に書いた「読んだところ」より後のもの。
 /// その行がなければ（動かせなかったときなど）、最後の目印より後のもの。目印がなければ、すべて。
 /// cellが動いている間に書かれたコメントは、目印より前に並ぶが、読んでいないものとして扱う。
@@ -338,6 +347,23 @@ mod tests {
         assert_eq!(last_marker(&posts, "bot[bot]"), Some(2));
         // 目印がなければ、すべて読んでいない
         assert_eq!(unread(&posts[..2], "bot[bot]").len(), 2);
+    }
+
+    #[test]
+    fn asked_only_when_the_last_marker_is_the_cells_own_question() {
+        let asked = "[agentcells] assess round 1\n\n着手してよいですか\n\n<!-- agentcells read-until 1 asked -->";
+        let failed = "[agentcells] assess round 0\n\n実行できませんでした";
+        let mut posts = vec![
+            post("bot[bot]", asked, "2026-10-25T03:00:00Z"),
+            post("me", "お願いします", "2026-10-25T03:10:00Z"),
+        ];
+        assert!(asked_by(&posts, "bot[bot]", "assess"));
+        assert!(!asked_by(&posts, "bot[bot]", "triage"));
+        // ほかの人が同じ形で書いても数えない
+        assert!(!asked_by(&posts, "other", "assess"));
+        // 確かめたあとに失敗して人間に回したなら、その返事では進めない
+        posts.push(post("bot[bot]", failed, "2026-10-25T03:20:00Z"));
+        assert!(!asked_by(&posts, "bot[bot]", "assess"));
     }
 
     #[test]

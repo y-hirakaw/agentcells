@@ -16,10 +16,12 @@ use crate::review::{self, Finding};
 pub const DONE: &str = "done";
 /// 人間に回す。どのcellからでも選べる。
 pub const NEEDS_HUMAN: &str = "needs-human";
+/// ここで止める。Issue/PRは閉じずに、agentcellsのラベルを外す（そのあとは人間が進める）。
+pub const STOP: &str = "stop";
 
 /// cellの名前に使えない、遷移先として予約された名前か。
 pub fn is_reserved(name: &str) -> bool {
-    name == DONE || name == NEEDS_HUMAN
+    name == DONE || name == NEEDS_HUMAN || name == STOP
 }
 
 /// 人間を待っている状態。cellを使う人がコメントすると、また動く（[`crate::tick`]）。
@@ -51,18 +53,23 @@ impl Waiting {
 pub enum Destination {
     Cell(String),
     Done,
+    Stop,
     NeedsHuman,
 }
 
 /// AIが選べる先。設定の `next` に `needs-human` を足したもの。
 /// 検品を待つPRへのコメントで動いたときは、`done`（返事だけして、検品待ちに戻す）も選べる。
-pub fn choices(cell: &Cell, waiting: Option<Waiting>) -> Vec<String> {
+/// 着手を確かめるcell（[`Cell::confirms`]）は、自分で人間に確かめたあとの返事で動いたとき（`asked`）だけ、
+/// 次のcellと `stop` を選べる。
+pub fn choices(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> Vec<String> {
     let reply_only = (waiting == Some(Waiting::InReview) && !cell.review).then_some(DONE);
+    let approved = !cell.confirms() || (waiting.is_some() && asked);
     let mut choices: Vec<String> = Vec::new();
     for next in cell
         .next
         .iter()
         .map(String::as_str)
+        .filter(|next| approved || *next == DONE)
         .chain(reply_only)
         .chain([NEEDS_HUMAN])
     {
@@ -105,13 +112,13 @@ impl Outcome {
 
 /// `claude -p --json-schema` に渡すスキーマ。`next` は選べる先しか出せないようにする。
 /// レビューのcellには、コードへの指摘（`findings`）も返させる。
-pub fn output_schema(cell: &Cell, waiting: Option<Waiting>) -> serde_json::Value {
+pub fn output_schema(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> serde_json::Value {
     let mut schema = json!({
         "type": "object",
         "properties": {
             "next": {
                 "type": "string",
-                "enum": choices(cell, waiting),
+                "enum": choices(cell, waiting, asked),
                 "description": "次に進める先。迷ったら needs-human を選び、comment に人間への質問を書く"
             },
             "comment": {
@@ -140,6 +147,8 @@ pub struct Finished<'a> {
     pub requested: &'a str,
     /// 人間を待っていたところから、コメントで動いたなら、その状態
     pub waiting: Option<Waiting>,
+    /// 最後の目印が、このcellが自分で人間に確かめたものか（[`choices`]）
+    pub asked: bool,
 }
 
 /// 遷移のためにCLIがすること。
@@ -200,7 +209,7 @@ fn plan_labels(
     };
 
     let requested = finished.requested;
-    let choices = choices(cell, finished.waiting);
+    let choices = choices(cell, finished.waiting, finished.asked);
     if !choices.iter().any(|c| c == requested) {
         return to_human(Some(format!(
             "cell「{}」から「{requested}」には進めません（選べる先: {}）",
@@ -211,6 +220,14 @@ fn plan_labels(
 
     match requested {
         NEEDS_HUMAN => to_human(None),
+        STOP => Plan {
+            destination: Destination::Stop,
+            remove: remove(),
+            add: Vec::new(),
+            add_to_created_pr: Vec::new(),
+            close: false,
+            overridden: None,
+        },
         DONE => match finished.item {
             Target::Issue => Plan {
                 destination: Destination::Done,
@@ -374,6 +391,7 @@ max_rounds = 2
             created_pr,
             requested,
             waiting,
+            asked: false,
         };
         plan(config, &config.products[0], &finished, &|_| runs)
     }
@@ -386,21 +404,87 @@ max_rounds = 2
     fn choices_always_include_needs_human_once() {
         let (_dir, config) = config();
         assert_eq!(
-            choices(config.cell("triage").unwrap(), None),
+            choices(config.cell("triage").unwrap(), None, false),
             strings(&["implement", "done", NEEDS_HUMAN])
         );
         let mut cell = config.cell("triage").unwrap().clone();
         cell.next.push(NEEDS_HUMAN.to_string());
         assert_eq!(
-            choices(&cell, None),
+            choices(&cell, None, false),
             strings(&["implement", "done", NEEDS_HUMAN])
         );
     }
 
     #[test]
+    fn confirming_cells_move_on_only_after_a_human_reply() {
+        let (_dir, config) = config();
+        let mut cell = config.cell("triage").unwrap().clone();
+        cell.next = strings(&["implement", STOP, DONE]);
+        cell.confirm = Some(true);
+        // 最初に動いたときは、閉じるか人間に確かめるかだけ
+        assert_eq!(choices(&cell, None, false), strings(&[DONE, NEEDS_HUMAN]));
+        // 自分で確かめたあとの、人間の返事で動いたなら、次のcellと stop も選べる
+        assert_eq!(
+            choices(&cell, Some(Waiting::NeedsHuman), true),
+            strings(&["implement", STOP, DONE, NEEDS_HUMAN])
+        );
+        // 失敗して人間に回したあとの返事（確かめていない）や、ラベルを付け直して動いたときは、進めない
+        assert_eq!(
+            choices(&cell, Some(Waiting::NeedsHuman), false),
+            strings(&[DONE, NEEDS_HUMAN])
+        );
+        assert_eq!(choices(&cell, None, true), strings(&[DONE, NEEDS_HUMAN]));
+        // 確かめないcellなら、いつでも選べる
+        cell.confirm = Some(false);
+        assert_eq!(
+            choices(&cell, None, false),
+            strings(&["implement", STOP, DONE, NEEDS_HUMAN])
+        );
+        // assess は、書かなければ確かめる
+        cell.confirm = None;
+        assert!(!cell.confirms());
+        cell.name = "assess".to_string();
+        assert!(cell.confirms());
+
+        // 確かめるcellが、返事を待たずに次のcellを選んでも、人間に回す
+        let mut config = config;
+        config.cells[0].next = strings(&["implement", STOP, DONE]);
+        config.cells[0].confirm = Some(true);
+        let plan = plan_for(&config, "triage", Target::Issue, false, "implement", 0);
+        assert_eq!(plan.destination, Destination::NeedsHuman);
+        assert!(plan.overridden.unwrap().contains("進めません"));
+    }
+
+    #[test]
+    fn stop_leaves_the_issue_open_without_agentcells_labels() {
+        let (_dir, mut config) = config();
+        config.cells[0].next = strings(&[STOP, DONE]);
+        let plan = plan_waiting(
+            &config,
+            "triage",
+            Target::Issue,
+            false,
+            STOP,
+            0,
+            Some(Waiting::NeedsHuman),
+        );
+        assert_eq!(plan.destination, Destination::Stop);
+        assert!(!plan.close);
+        assert!(plan.add.is_empty());
+        assert_eq!(
+            plan.remove,
+            strings(&["ac:triage", labels::WORKING, labels::NEEDS_HUMAN])
+        );
+        // next に書いていなければ選べない
+        config.cells[0].next = strings(&[DONE]);
+        let plan = plan_for(&config, "triage", Target::Issue, false, STOP, 0);
+        assert_eq!(plan.destination, Destination::NeedsHuman);
+    }
+
+    #[test]
     fn schema_limits_next_to_choices() {
         let (_dir, config) = config();
-        let schema = output_schema(config.cell("review").unwrap(), None);
+        let schema = output_schema(config.cell("review").unwrap(), None, false);
         assert_eq!(
             schema["properties"]["next"]["enum"],
             json!(["implement", "done", NEEDS_HUMAN])
@@ -415,7 +499,7 @@ max_rounds = 2
         let (_dir, config) = config();
         let mut cell = config.cell("review").unwrap().clone();
         cell.review = true;
-        let schema = output_schema(&cell, None);
+        let schema = output_schema(&cell, None, false);
         assert_eq!(schema["required"], json!(["next", "comment", "findings"]));
         assert_eq!(schema["properties"]["findings"]["type"], "array");
 
@@ -574,9 +658,12 @@ max_rounds = 2
     fn a_reply_on_an_inspected_pr_may_only_answer() {
         let (_dir, config) = config();
         let implement = config.cell("implement").unwrap();
-        assert_eq!(choices(implement, None), strings(&["review", NEEDS_HUMAN]));
         assert_eq!(
-            choices(implement, Some(Waiting::InReview)),
+            choices(implement, None, false),
+            strings(&["review", NEEDS_HUMAN])
+        );
+        assert_eq!(
+            choices(implement, Some(Waiting::InReview), false),
             strings(&["review", DONE, NEEDS_HUMAN])
         );
         // 返事だけなら、検品待ちに戻す（付けたまま）
