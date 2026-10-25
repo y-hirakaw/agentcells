@@ -134,6 +134,9 @@ pub fn runtime_settings(
     // .git（linked worktreeではリポジトリを指すファイル）を書き換えさせない
     rule(&mut deny, "Edit", &worktree.join(".git"), "")?;
     rule(&mut deny, "Edit", &worktree.join(".git"), "/**")?;
+    // Claude Codeの設定（hooksなど）を書かせない。agentcellsはリポジトリの設定を読まないが、
+    // 人がそのブランチをClaude Codeで開いたときに、AIが書いたhooksが動かないように
+    rule(&mut deny, "Edit", &worktree.join(".claude"), "/**")?;
     for path in run.placed {
         rule(&mut deny, "Edit", path, "")?;
         // Readのdenyはsandboxの読めない場所にも足される（2.1.310で確かめた）ので、
@@ -192,6 +195,8 @@ pub fn runtime_settings(
         .collect();
 
     Ok(json!({
+        // hooksはsandboxの外で動くので、どこから来たものも動かさない
+        "disableAllHooks": true,
         "env": env,
         "permissions": { "allow": allow, "deny": deny },
         "sandbox": {
@@ -576,6 +581,7 @@ mod tests {
         for rule in [
             "Edit(//w/octo/app/12/.git)",
             "Edit(//w/octo/app/12/.git/**)",
+            "Edit(//w/octo/app/12/.claude/**)",
             "Read(//w/octo/app/12/key.jks)",
             "Edit(//w/octo/app/12/key.jks)",
         ] {
@@ -790,6 +796,7 @@ mod tests {
         assert_eq!(network["strictAllowlist"], true);
         // sandboxの中では ~/.gitconfig が読めないので、gitに使う人の設定を読ませない
         assert_eq!(settings["env"]["GIT_CONFIG_GLOBAL"], "/dev/null");
+        assert_eq!(settings["disableAllHooks"], true);
         assert_eq!(network["allowLocalBinding"], false);
         // ビルドやテストには、仕事ごとの一時ディレクトリを使わせる
         assert!(allow_read.contains(&"/home/me/.agentcells/tmp/12".to_string()));

@@ -5,14 +5,16 @@
 //! 2. Issue/PRを読み、もう一度 [`guard`] を通す（確かめてから読むまでの間の書き換えを見逃さない）
 //! 3. 作業の場所を作る（`repos/` のbareのcloneを最新にし、そこから仕事ごとの `--shared` のcloneを作る）
 //! 4. 今の仕事のファイルと、`--settings` で渡すsandboxの設定を書く
-//! 5. `claude -p` を、時間の上限とプロセスグループを付けて動かす
-//! 6. 結果を読み、AIが実行中にラベルを変えていないかを確かめる
-//! 7. コメントをbetterleaksで調べてから、目印を付けて投稿する
-//! 8. ラベルを付け替える（付けてから外す）。どこかで失敗したら、人間に回す
+//! 5. ここまでに作ったGitHub Appのトークンを取り消す（AIの動かすものに読まれても使えないように）
+//! 6. `claude -p` を、時間の上限を付けて動かす。終わったら、claudeとその子孫のプロセスをすべて止める
+//! 7. 止めたことを確かめてから、新しいトークンを作る。結果を読み、AIが実行中にラベルを変えていないかを確かめる
+//! 8. コメントをbetterleaksで調べてから、目印を付けて投稿する
+//! 9. ラベルを付け替える（付けてから外す）。どこかで失敗したら、人間に回す
 //!
 //! 今は、コミットを要らないIssueのcell（triageなど）だけを動かす。implementとreviewは、pushとPRの作成、
 //! レビューの投稿をつなぐときに動かす。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -38,9 +40,9 @@ use crate::transition::{self, Destination, Finished, Outcome};
 /// 1回の実行の結果。
 #[derive(Debug)]
 pub struct Report {
-    /// 進めた先（`implement`、`done`、`needs-human` など）
+    /// 進めた先（`implement`、`done`、`needs-human`、見送ったときは `skipped`）
     pub destination: String,
-    /// 人間に回したときの理由
+    /// 人間に回したときや、見送ったときの理由
     pub reason: Option<String>,
 }
 
@@ -84,34 +86,49 @@ impl Runner<'_> {
             .config
             .cell(&work.cell)
             .ok_or_else(|| Error::new(format!("cell「{}」がありません", work.cell)))?;
-        let write = github::credentials(self.config, self.probe, &work.repo, Purpose::Work)?;
         let issue = Issue {
             probe: self.probe,
             repo: &work.repo,
             number: work.number,
-            credentials: &write,
         };
+        {
+            let write = self.write_credentials(&work.repo)?;
+            let added = issue.edit_labels(&write, &[WORKING], &[]);
+            write.revoke(self.probe);
+            added?;
+        }
 
-        issue.edit_labels(&[WORKING], &[])?;
-        match self.run_working(work, product, cell, &issue) {
+        let mut place = Place::new(self.home, &work.repo, work.number);
+        let result = self.run_working(work, product, cell, &issue, &mut place);
+        // 置いた秘密のファイルを残さないよう、うまくいってもいかなくても作業の場所を消す（実行の記録は残す）
+        place.clean();
+        match result {
             Ok(report) => Ok(report),
             Err(e) => {
-                // 動かせなかったことを、人間に伝えて回す。round 0 の目印は、往復の回数に数えない
-                let round = 0;
+                // 詳しいことは、手元の記録とtickの出力に残す。公開のIssueには、決まった短い文だけを書く
+                let _ = std::fs::create_dir_all(&place.run);
+                let _ = std::fs::write(
+                    place.run.join("error.txt"),
+                    format!("{}\n{}\n", e.message, e.hint.clone().unwrap_or_default()),
+                );
                 let text = format!(
-                    "実行できませんでした: {}{}\n\n確かめて、ラベル「{}」を付け直すと、もう一度動きます。",
-                    e.message,
-                    e.hint
-                        .as_ref()
-                        .map(|h| format!("（{h}）"))
-                        .unwrap_or_default(),
+                    "実行できませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください。\n\n直したら、ラベル「{}」を付け直すと、もう一度動きます。",
+                    place.run_name(),
                     cell.label
                 );
-                let _ = issue.comment(&marker::comment(&cell.name, round, &text));
-                let _ = issue.edit_labels(&[NEEDS_HUMAN], &[&cell.label, WORKING]);
+                // round 0 の目印は、往復の回数に数えない
+                if let Ok(write) = self.write_credentials(&work.repo) {
+                    let _ = issue.comment(&write, &marker::comment(&cell.name, 0, &text));
+                    let _ = issue.edit_labels(&write, &[NEEDS_HUMAN], &[&cell.label, WORKING]);
+                    write.revoke(self.probe);
+                }
                 Err(e)
             }
         }
+    }
+
+    fn write_credentials(&self, repo: &RepoName) -> Result<Credentials> {
+        github::credentials(self.config, self.probe, repo, Purpose::Work)
     }
 
     fn run_working(
@@ -120,9 +137,69 @@ impl Runner<'_> {
         product: &Product,
         cell: &Cell,
         issue: &Issue,
+        place: &mut Place,
     ) -> Result<Report> {
-        let read =
-            |repo: &RepoName| github::credentials(self.config, self.probe, repo, Purpose::Read);
+        let work_repo = place_repo(product)?;
+        // claudeを動かす前に作ったトークンは、動かす前にすべて取り消す
+        let issue_read = github::credentials(self.config, self.probe, &work.repo, Purpose::Read)?;
+        let work_read = github::credentials(self.config, self.probe, &work_repo, Purpose::Read)?;
+        let result = self.prepare(work, product, cell, place, &issue_read, &work_read, issue);
+        issue_read.revoke(self.probe);
+        work_read.revoke(self.probe);
+        let ready = match result? {
+            Prepared::Skipped(reason) => {
+                // 勝手に始めようとした人に反応しないよう、コメントはせずに ac:working だけ外す。
+                // 外せなくても、コメントはしない（tickの出力に出す）
+                let removed = self.write_credentials(&work.repo).and_then(|write| {
+                    let removed = issue.edit_labels(&write, &[], &[WORKING]);
+                    write.revoke(self.probe);
+                    removed
+                });
+                let note = match removed {
+                    Ok(()) => reason,
+                    Err(e) => format!("{reason}（ac:working を外せませんでした: {}）", e.message),
+                };
+                return Ok(Report {
+                    destination: "skipped".to_string(),
+                    reason: Some(note),
+                });
+            }
+            Prepared::Ready(ready) => ready,
+        };
+
+        let finished = ready.claude(self, cell, place).run()?;
+
+        // AIの動かしたものをすべて止めたあとで、書き込みのトークンを作る
+        let write = self.write_credentials(&work.repo)?;
+        let result = self.finish(work, product, cell, issue, place, &ready, finished, &write);
+        write.revoke(self.probe);
+        result
+    }
+
+    /// claudeを動かす前の用意。ガードで見送るときは `Skipped`。
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &self,
+        work: &Work,
+        product: &Product,
+        cell: &Cell,
+        place: &mut Place,
+        issue_read: &Credentials,
+        work_read: &Credentials,
+        issue: &Issue,
+    ) -> Result<Prepared> {
+        let work_repo = place_repo(product)?;
+        let read = |repo: &RepoName| {
+            if repo == &work.repo {
+                issue_read.reuse()
+            } else if repo == &work_repo {
+                work_read.reuse()
+            } else {
+                Err(Error::new(format!(
+                    "{repo} は、この仕事で読むリポジトリではありません"
+                )))
+            }
+        };
         let mut task = prompt::fetch_task(
             self.probe,
             &read,
@@ -134,8 +211,7 @@ impl Runner<'_> {
         )?;
 
         // 確かめてから読むまでの間に書き換えられていないか、読んだあとにもう一度確かめる
-        let read_credentials = read(&work.repo)?;
-        let env = read_credentials.gh_env()?;
+        let env = issue_read.gh_env()?;
         let cell_labels: Vec<String> = product
             .cells
             .iter()
@@ -155,24 +231,14 @@ impl Runner<'_> {
             original: None,
         };
         if let Some(reason) = guard::check(self.probe, &request, self.actors)? {
-            // 勝手に始めようとした人に反応しないよう、コメントはせずに ac:working だけ外す
-            issue.edit_labels(&[], &[WORKING])?;
-            return Ok(Report {
-                destination: "skipped".to_string(),
-                reason: Some(reason),
-            });
+            return Ok(Prepared::Skipped(reason));
         }
 
-        let round = task.round(&cell.name);
-        let work_repo = product.repos.first().ok_or_else(|| {
-            Error::new(format!("product「{}」に repos がありません", product.name))
-        })?;
-        let mut place = Place::new(self.home, &work.repo, work.number);
-        place.prepare(self.probe, self.config, self.home, work_repo)?;
+        place.prepare(self.probe, work_read, self.home, &work_repo)?;
         task.worktree = Some(place.worktree.clone());
 
         // gitignoreされたファイルを置き、その中身のハッシュを、コミットさせないために覚えておく
-        let placed = files::apply(self.home, work_repo, &place.worktree)?;
+        let placed = files::apply(self.home, &work_repo, &place.worktree)?;
         let placed_blobs = placed
             .iter()
             .map(|p| actions::blob_hash(&place.worktree, p))
@@ -191,7 +257,7 @@ impl Runner<'_> {
             commands: product.commands.clone(),
             placed: placed.clone(),
             placed_blobs,
-            identity: self.identity(&read_credentials)?,
+            identity: self.identity(issue_read)?,
             scanner: self.scanner.to_path_buf(),
             tmp: place.tmp.clone(),
             caches: cache_dirs.clone(),
@@ -223,26 +289,42 @@ impl Runner<'_> {
             })?),
             None => None,
         };
-        let user = prompt::user_prompt(cell, extra.as_deref(), Some(&task));
-        let system = prompt::system_prompt(cell);
-        let schema = transition::output_schema(cell);
+        Ok(Prepared::Ready(Box::new(Ready {
+            user: prompt::user_prompt(cell, extra.as_deref(), Some(&task)),
+            system: prompt::system_prompt(cell),
+            schema: transition::output_schema(cell),
+            settings_path,
+            context_path,
+            labels_before: issue.labels(issue_read)?,
+            job_dirs: [
+                place.worktree.clone(),
+                place.git_dir.clone(),
+                place.tmp.clone(),
+            ]
+            .into_iter()
+            .chain(cache_list)
+            .collect(),
+            task,
+        })))
+    }
 
-        let labels_before = issue.labels()?;
-        let claude = ClaudeRun {
-            program: self.claude,
-            cwd: &place.worktree,
-            settings: &settings_path,
-            system: &system,
-            schema: &schema,
-            prompt: &user,
-            context: &context_path,
-            path_prefix: self.agentcells.parent(),
-            model: self.model,
-            timeout: Duration::from_secs(u64::from(cell.timeout_minutes) * 60),
-            log_dir: &place.run,
-        };
-        let finished = claude.run()?;
-        let labels_after = issue.labels()?;
+    /// claudeが終わったあと。結果を読んで投稿し、ラベルを付け替える。
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        &self,
+        work: &Work,
+        product: &Product,
+        cell: &Cell,
+        issue: &Issue,
+        place: &Place,
+        ready: &Ready,
+        finished: ClaudeEnd,
+        write: &Credentials,
+    ) -> Result<Report> {
+        let labels_after = issue.labels(write)?;
+        let task = &ready.task;
+        let round = task.round(&cell.name);
+        let runs = |name: &str| task.round(name).saturating_sub(1);
 
         // AIが決めた結果を読む。読めなければ、人間に回す
         let mut overridden: Option<String> = None;
@@ -256,46 +338,36 @@ impl Runner<'_> {
                 Err(e) => Err(format!("AIの出力を読めません: {e}")),
             },
         };
-        let (requested, mut text) = match outcome {
+        let (requested, text) = match outcome {
             Ok(outcome) => (outcome.next, outcome.comment),
             Err(reason) => {
                 overridden = Some(reason);
                 (transition::NEEDS_HUMAN.to_string(), String::new())
             }
         };
-        if let Some(changed) = transition::tampered(&labels_before, &labels_after) {
+        if let Some(changed) = transition::tampered(&ready.labels_before, &labels_after) {
             overridden = Some(changed);
         }
-
-        // 投稿する前に、秘密らしいものがないかを調べる。あれば、AIの文章は投稿しない
-        let found = actions::scan_text(self.scanner, &text)?;
-        if !found.is_empty() {
-            let rules: Vec<String> = found.iter().map(|(_, rule)| rule.clone()).collect();
-            overridden = Some(format!(
-                "AIのコメントに秘密らしいもの（{}）があったので、投稿しませんでした。実行の記録（{}）を確かめてください",
-                rules.join("、"),
-                place.run.display()
-            ));
-            text = String::new();
-        }
-
         let requested = if overridden.is_some() {
             transition::NEEDS_HUMAN.to_string()
         } else {
             requested
         };
-        let plan = transition::plan(
-            self.config,
-            product,
-            &Finished {
-                cell,
-                item: work.item,
-                created_pr: false,
-                requested: &requested,
-            },
-            &|name: &str| task.round(name).saturating_sub(1),
-        );
-        let reason = overridden.or(plan.overridden.clone());
+        let finished_cell = |requested: &str| {
+            transition::plan(
+                self.config,
+                product,
+                &Finished {
+                    cell,
+                    item: work.item,
+                    created_pr: false,
+                    requested,
+                },
+                &runs,
+            )
+        };
+        let mut plan = finished_cell(&requested);
+        let mut reason = overridden.or(plan.overridden.clone());
         let mut body = text.trim().to_string();
         if let Some(reason) = &reason {
             if !body.is_empty() {
@@ -303,17 +375,31 @@ impl Runner<'_> {
             }
             body.push_str(&format!("人間に回しました: {reason}"));
         }
-        issue.comment(&marker::comment(&cell.name, round, &body))?;
+        let mut body = marker::comment(&cell.name, round, &body);
+
+        // 投稿する本文の全体を、秘密らしいものがないか調べる。あれば、決まった文だけにして人間に回す
+        let found = actions::scan_text(self.scanner, &body)?;
+        if !found.is_empty() {
+            let rules: Vec<String> = found.iter().map(|(_, rule)| rule.clone()).collect();
+            let note = format!(
+                "コメントに秘密らしいもの（{}）があったので、投稿しませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください",
+                rules.join("、"),
+                place.run_name()
+            );
+            body = marker::comment(&cell.name, round, &format!("人間に回しました: {note}"));
+            plan = finished_cell(transition::NEEDS_HUMAN);
+            reason = Some(note);
+        }
+        issue.comment(write, &body)?;
 
         // 付けてから外す（guardが、ac:working が付いている間のラベルをagentcellsの付け替えとみなすため）
         let add: Vec<&str> = plan.add.iter().map(String::as_str).collect();
         let remove: Vec<&str> = plan.remove.iter().map(String::as_str).collect();
-        issue.edit_labels(&add, &[])?;
-        issue.edit_labels(&[], &remove)?;
+        issue.edit_labels(write, &add, &[])?;
+        issue.edit_labels(write, &[], &remove)?;
         if plan.close {
-            issue.close()?;
+            issue.close(write)?;
         }
-        place.clean();
         Ok(Report {
             destination: match &plan.destination {
                 Destination::Cell(name) => name.clone(),
@@ -346,6 +432,52 @@ impl Runner<'_> {
     }
 }
 
+/// 作業するリポジトリ（今は product の repos の最初）。
+fn place_repo(product: &Product) -> Result<RepoName> {
+    product
+        .repos
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::new(format!("product「{}」に repos がありません", product.name)))
+}
+
+enum Prepared {
+    Skipped(String),
+    Ready(Box<Ready>),
+}
+
+/// claudeを動かす用意ができたもの。
+struct Ready {
+    user: String,
+    system: String,
+    schema: serde_json::Value,
+    settings_path: PathBuf,
+    context_path: PathBuf,
+    labels_before: Vec<String>,
+    task: prompt::Task,
+    /// worktree、一時ディレクトリ、キャッシュ
+    job_dirs: Vec<PathBuf>,
+}
+
+impl Ready {
+    fn claude<'a>(&'a self, runner: &'a Runner, cell: &Cell, place: &'a Place) -> ClaudeRun<'a> {
+        ClaudeRun {
+            program: runner.claude,
+            cwd: &place.worktree,
+            settings: &self.settings_path,
+            system: &self.system,
+            schema: &self.schema,
+            prompt: &self.user,
+            context: &self.context_path,
+            path_prefix: runner.agentcells.parent(),
+            model: runner.model,
+            timeout: Duration::from_secs(u64::from(cell.timeout_minutes) * 60),
+            log_dir: &place.run,
+            job_dirs: &self.job_dirs,
+        }
+    }
+}
+
 fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| Error::new(format!("{} を書けません: {e}", path.display())))?;
@@ -353,17 +485,16 @@ fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
         .map_err(|e| Error::new(format!("{} を書けません: {e}", path.display())))
 }
 
-/// GitHubのIssueへの書き込み（書き込みのアカウントで）。
+/// GitHubのIssueへの読み書き。トークンは、そのたびに渡す（作る時を、AIが動いていないときに限るため）。
 struct Issue<'a> {
     probe: &'a dyn Probe,
     repo: &'a RepoName,
     number: u64,
-    credentials: &'a Credentials,
 }
 
 impl Issue<'_> {
-    fn gh(&self, args: &[&str], input: Option<&str>) -> Result<String> {
-        let env = self.credentials.gh_env()?;
+    fn gh(&self, credentials: &Credentials, args: &[&str], input: Option<&str>) -> Result<String> {
+        let env = credentials.gh_env()?;
         let out = self
             .probe
             .run_with_input("gh", args, &env, input)
@@ -372,24 +503,21 @@ impl Issue<'_> {
             })?;
         if !out.success {
             return Err(Error::new(format!(
-                "gh {} が失敗しました: {}",
+                "gh {} {} が失敗しました: {}",
                 args.first().unwrap_or(&""),
+                args.get(1).unwrap_or(&""),
                 out.stderr.trim()
             )));
         }
         Ok(out.stdout)
     }
 
-    fn number(&self) -> String {
-        self.number.to_string()
-    }
-
-    fn edit_labels(&self, add: &[&str], remove: &[&str]) -> Result<()> {
+    fn edit_labels(&self, credentials: &Credentials, add: &[&str], remove: &[&str]) -> Result<()> {
         if add.is_empty() && remove.is_empty() {
             return Ok(());
         }
         let repo = self.repo.to_string();
-        let number = self.number();
+        let number = self.number.to_string();
         let add = add.join(",");
         let remove = remove.join(",");
         let mut args = vec!["issue", "edit", number.as_str(), "--repo", repo.as_str()];
@@ -399,13 +527,14 @@ impl Issue<'_> {
         if !remove.is_empty() {
             args.extend(["--remove-label", remove.as_str()]);
         }
-        self.gh(&args, None).map(|_| ())
+        self.gh(credentials, &args, None).map(|_| ())
     }
 
-    fn comment(&self, body: &str) -> Result<()> {
+    fn comment(&self, credentials: &Credentials, body: &str) -> Result<()> {
         let repo = self.repo.to_string();
-        let number = self.number();
+        let number = self.number.to_string();
         self.gh(
+            credentials,
             &[
                 "issue",
                 "comment",
@@ -420,20 +549,22 @@ impl Issue<'_> {
         .map(|_| ())
     }
 
-    fn close(&self) -> Result<()> {
+    fn close(&self, credentials: &Credentials) -> Result<()> {
         let repo = self.repo.to_string();
-        let number = self.number();
+        let number = self.number.to_string();
         self.gh(
+            credentials,
             &["issue", "close", number.as_str(), "--repo", repo.as_str()],
             None,
         )
         .map(|_| ())
     }
 
-    fn labels(&self) -> Result<Vec<String>> {
+    fn labels(&self, credentials: &Credentials) -> Result<Vec<String>> {
         let repo = self.repo.to_string();
-        let number = self.number();
+        let number = self.number.to_string();
         let out = self.gh(
+            credentials,
             &[
                 "issue",
                 "view",
@@ -468,32 +599,41 @@ struct Place {
     tmp: PathBuf,
     /// 今の仕事のファイル、sandboxの設定、AIの出力を置く（実行のあとも残す）
     run: PathBuf,
+    /// `<owner>/<repo>/<番号>`
+    relative: PathBuf,
 }
 
 impl Place {
     fn new(home: &Home, repo: &RepoName, number: u64) -> Self {
-        let rel = Path::new(&repo.owner)
+        let relative = Path::new(&repo.owner)
             .join(&repo.name)
             .join(number.to_string());
         Place {
             cache: PathBuf::new(),
-            worktree: home.worktrees_dir().join(&rel),
-            git_dir: home.root().join("gitdirs").join(&rel),
-            tmp: home.root().join("tmp").join(&rel),
-            run: home.root().join("runs").join(&rel),
+            worktree: home.worktrees_dir().join(&relative),
+            git_dir: home.root().join("gitdirs").join(&relative),
+            tmp: home.root().join("tmp").join(&relative),
+            run: home.root().join("runs").join(&relative),
+            relative,
         }
+    }
+
+    /// 公開のコメントに書く、実行の記録の場所（手元の絶対パスは書かない）。
+    fn run_name(&self) -> String {
+        format!("~/.agentcells/runs/{}", self.relative.display())
     }
 
     /// 作業するリポジトリのcloneを最新にし、仕事ごとの場所を空にして作り直す。
     fn prepare(
         &mut self,
         probe: &dyn Probe,
-        config: &Config,
+        read: &Credentials,
         home: &Home,
         work_repo: &RepoName,
     ) -> Result<()> {
-        self.cache = update_cache(probe, config, home, work_repo)?;
+        self.cache = update_cache(probe, read, home, work_repo)?;
         self.clean();
+        let _ = std::fs::remove_dir_all(&self.run);
         for dir in [&self.tmp, &self.run] {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::new(format!("{} を作れません: {e}", dir.display())))?;
@@ -535,16 +675,13 @@ impl Place {
 /// `repos/<owner>/<repo>` のbareのcloneを作るか、最新にする。CLIだけが書き、sandboxからは読むだけにする。
 fn update_cache(
     probe: &dyn Probe,
-    config: &Config,
+    read: &Credentials,
     home: &Home,
     repo: &RepoName,
 ) -> Result<PathBuf> {
     let cache = home.repos_dir().join(&repo.owner).join(&repo.name);
-    let credentials = github::credentials(config, probe, repo, Purpose::Read)?;
-    let git_args = credentials.git_args();
-    let env = credentials.git_env();
     let url = crate::pr::remote_url(repo);
-    let mut args: Vec<String> = git_args.clone();
+    let mut args: Vec<String> = read.git_args();
     if cache.join("HEAD").exists() {
         args.extend(
             [
@@ -571,7 +708,7 @@ fn update_cache(
         );
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    git(probe, &args, &env)?;
+    git(probe, &args, &read.git_env())?;
     Ok(cache)
 }
 
@@ -610,6 +747,8 @@ struct ClaudeRun<'a> {
     timeout: Duration,
     /// 標準出力と標準エラーを残す場所
     log_dir: &'a Path,
+    /// この仕事の場所（worktree、一時ディレクトリ、キャッシュ）。ここで動いているプロセスは、終わったら止める
+    job_dirs: &'a [PathBuf],
 }
 
 enum ClaudeEnd {
@@ -617,12 +756,19 @@ enum ClaudeEnd {
     TimedOut,
 }
 
-/// AIに渡さない環境変数。トークンを、使う人の環境から持ち込ませない。
-const STRIPPED_ENV: &[&str] = &[
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN",
+/// claudeに渡す環境変数。使う人の環境変数（`SSH_AUTH_SOCK`、`AWS_*`、ほかのツールのトークンなど）は、
+/// AIとビルドから使えてしまうので、要るものだけを渡す。claudeの認証は、macOSならキーチェーンを使う。
+/// `ANTHROPIC_API_KEY` で認証しているときは渡すしかなく、AIの動かすコマンドからも見える（docs/design.md）。
+const PASSED_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "TMPDIR",
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY",
 ];
 
 impl ClaudeRun<'_> {
@@ -633,9 +779,10 @@ impl ClaudeRun<'_> {
             "json",
             "--settings",
             &self.settings.display().to_string(),
-            // 使う人のグローバルの設定は読まない。作業するリポジトリの設定（project、local）の上に重ねる
+            // 使う人の設定も、作業するリポジトリの設定（.claude/settings.json）も読まない。
+            // リポジトリの設定のhooksやenvは、AIがブランチに書けるうえ、hooksはsandboxの外で動く
             "--setting-sources",
-            "project,local",
+            "",
             // 作業するリポジトリの .mcp.json のMCPサーバーを動かさない
             "--strict-mcp-config",
             "--append-system-prompt",
@@ -652,6 +799,37 @@ impl ClaudeRun<'_> {
         args
     }
 
+    fn env(&self) -> Vec<(String, std::ffi::OsString)> {
+        let mut env: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
+            .filter_map(|(k, v)| {
+                let k = k.to_str()?.to_string();
+                (PASSED_ENV.contains(&k.as_str()) || k.starts_with("LC_")).then_some((k, v))
+            })
+            .collect();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths: Vec<PathBuf> = self
+            .path_prefix
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect();
+        paths.extend(std::env::split_paths(&path));
+        if let Ok(path) = std::env::join_paths(paths) {
+            env.push(("PATH".to_string(), path));
+        }
+        env.push((actions::CONTEXT_ENV.to_string(), self.context.into()));
+        env
+    }
+
+    /// この実行の目印。claudeの子孫は環境変数を受け継ぐので、親子のつながりが切れたもの
+    /// （親が先に終わって付け替えられたもの）も、これで見つけて止める。
+    fn mark(&self) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("{:x}{:x}", std::process::id(), nanos)
+    }
+
     fn run(&self) -> Result<ClaudeEnd> {
         let log = |name: &str| -> Result<std::fs::File> {
             let path = self.log_dir.join(name);
@@ -659,29 +837,17 @@ impl ClaudeRun<'_> {
                 .map_err(|e| Error::new(format!("{} を作れません: {e}", path.display())))
         };
         let stdout_path = self.log_dir.join("claude.json");
-        let path_env = match (self.path_prefix, std::env::var_os("PATH")) {
-            (Some(prefix), Some(path)) => {
-                let mut paths = vec![prefix.to_path_buf()];
-                paths.extend(std::env::split_paths(&path));
-                std::env::join_paths(paths).ok()
-            }
-            (_, path) => path,
-        };
+        let mark = self.mark();
         let mut command = Command::new(self.program);
         command
             .args(self.args())
             .current_dir(self.cwd)
-            .env(actions::CONTEXT_ENV, self.context)
+            .env_clear()
+            .envs(self.env())
+            .env(RUN_MARK_ENV, &mark)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log("claude.json")?))
             .stderr(Stdio::from(log("claude.err")?));
-        if let Some(path) = path_env {
-            command.env("PATH", path);
-        }
-        for key in STRIPPED_ENV {
-            command.env_remove(key);
-        }
-        // AIが残したプロセスもまとめて止められるよう、新しいプロセスグループで動かす
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -698,18 +864,34 @@ impl ClaudeRun<'_> {
             // claudeは標準入力を読み終えてから動くので、書き終えてから待つ（大きくても止まらない）
             let _ = stdin.write_all(self.prompt.as_bytes());
         }
+        // Claude Codeは、Bashのコマンドを別のプロセスグループで動かす。そのため、動いている間に
+        // claudeの子孫を集めておき、終わったらすべて止める（親が終わって付け替えられた子も、先に覚えておけば止められる）
+        let mut seen = Processes {
+            mark: format!("{RUN_MARK_ENV}={mark}"),
+            dirs: self.job_dirs.to_vec(),
+            ..Processes::default()
+        };
         let deadline = Instant::now() + self.timeout;
         let timed_out = loop {
+            seen.collect(pid);
             match child.try_wait() {
                 Ok(Some(_)) => break false,
                 Ok(None) if Instant::now() >= deadline => break true,
-                Ok(None) => std::thread::sleep(Duration::from_millis(500)),
+                // Claude CodeのBashのシェルはすぐ終わるので、短い間隔で見る
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(e) => return Err(Error::new(format!("claudeを待てません: {e}"))),
             }
         };
-        // 時間切れでも、終わったあとでも、AIが残したプロセスをまとめて止める
-        kill_group(pid, timed_out);
+        if timed_out {
+            let _ = Command::new("kill")
+                .args(["-TERM", "--", &format!("-{pid}")])
+                .stderr(Stdio::null())
+                .status();
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        let stopped = seen.stop_all(pid);
         let _ = child.wait();
+        stopped?;
         if timed_out {
             return Ok(ClaudeEnd::TimedOut);
         }
@@ -719,17 +901,211 @@ impl ClaudeRun<'_> {
     }
 }
 
-/// プロセスグループをまとめて止める。時間切れなら、まずTERMで止まる時間を与える。
-fn kill_group(pid: u32, gentle: bool) {
-    let group = format!("-{pid}");
-    if gentle {
-        let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
-        std::thread::sleep(Duration::from_secs(5));
+/// claudeの子孫に付ける、実行ごとの目印の環境変数。
+const RUN_MARK_ENV: &str = "AGENTCELLS_RUN";
+
+/// claudeの子孫のプロセス。PIDは使い回されるので、始まった時刻と組にして覚え、同じものだけを止める。
+#[derive(Default)]
+struct Processes {
+    /// PIDと、始まった時刻（`ps -o lstart`）
+    known: BTreeMap<u32, String>,
+    groups: BTreeSet<u32>,
+    /// `AGENTCELLS_RUN=<目印>`。環境変数にこれを持つプロセスも止める（Linuxだけ。macOSでは、
+    /// sandboxの中のプロセスの環境変数を読めない）
+    mark: String,
+    /// この仕事の場所。作業のディレクトリ（cwd）がこの中にあるプロセスも止める
+    dirs: Vec<PathBuf>,
+}
+
+/// 作業のディレクトリ（cwd）が `dirs` のどれかの中にあるプロセス。
+fn working_in(dirs: &[PathBuf]) -> Vec<u32> {
+    let dirs: Vec<PathBuf> = dirs.iter().filter_map(|d| d.canonicalize().ok()).collect();
+    if dirs.is_empty() {
+        return Vec::new();
     }
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &group])
+    let inside = |path: &Path| dirs.iter().any(|d| path.starts_with(d));
+    if cfg!(target_os = "linux") {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        return entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/cwd"))
+                    .map(|cwd| inside(&cwd))
+                    .unwrap_or(false)
+            })
+            .collect();
+    }
+    // `-F pn` は、プロセスごとに `p<PID>`、`fcwd`、`n<パス>` の行を出す
+    let Ok(out) = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-F", "pn"])
         .stderr(Stdio::null())
-        .status();
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut pid = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p.parse::<u32>().ok();
+        } else if let (Some(path), Some(p)) = (line.strip_prefix('n'), pid)
+            && inside(Path::new(path))
+        {
+            found.push(p);
+        }
+    }
+    found
+}
+
+/// 環境変数に `mark` を持つプロセス。macOSは `ps -E`、Linuxは `/proc/<pid>/environ` で読む。
+/// 使う人のほかのプロセスの環境変数は、読むだけで、どこにも残さない。
+fn marked(mark: &str) -> Vec<u32> {
+    if mark.is_empty() {
+        return Vec::new();
+    }
+    if cfg!(target_os = "linux") {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        return entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/environ"))
+                    .map(|env| env.split(|b| *b == 0).any(|kv| kv == mark.as_bytes()))
+                    .unwrap_or(false)
+            })
+            .collect();
+    }
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-ww", "-E", "-o", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.split_whitespace().any(|w| w == mark))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+/// 今のプロセスの一覧（PID、親のPID、プロセスグループ、始まった時刻）。
+fn process_table() -> Vec<(u32, u32, u32, String)> {
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,lstart="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let pid = f.next()?.parse().ok()?;
+            let ppid = f.next()?.parse().ok()?;
+            let pgid = f.next()?.parse().ok()?;
+            let started = f.collect::<Vec<_>>().join(" ");
+            Some((pid, ppid, pgid, started))
+        })
+        .collect()
+}
+
+impl Processes {
+    /// 今のプロセスの一覧から、`root` の子孫（覚えているものの子孫も）と、覚えているグループのものを足す。
+    /// 今の一覧を返す。
+    fn collect(&mut self, root: u32) -> Vec<(u32, u32, u32, String)> {
+        let rows = process_table();
+        let me = std::process::id();
+        if let Some((_, _, _, started)) = rows.iter().find(|r| r.0 == root) {
+            self.known.entry(root).or_insert_with(|| started.clone());
+        }
+        self.groups.insert(root);
+        // 子孫を、増えなくなるまでたどる
+        loop {
+            let before = (self.known.len(), self.groups.len());
+            for (pid, ppid, pgid, started) in &rows {
+                if *pid == me {
+                    continue;
+                }
+                let parent_known = self.same(&rows, *ppid);
+                if parent_known || self.groups.contains(pgid) {
+                    self.known.entry(*pid).or_insert_with(|| started.clone());
+                    // 自分のグループを作ったもの（Claude CodeのBashなど）は、そのグループも覚える
+                    if *pgid > 1 {
+                        self.groups.insert(*pgid);
+                    }
+                }
+            }
+            if (self.known.len(), self.groups.len()) == before {
+                break;
+            }
+        }
+        rows
+    }
+
+    /// `pid` が、覚えているものと同じプロセス（始まった時刻も同じ）か。
+    fn same(&self, rows: &[(u32, u32, u32, String)], pid: u32) -> bool {
+        match self.known.get(&pid) {
+            Some(started) => rows.iter().any(|r| r.0 == pid && &r.3 == started),
+            None => false,
+        }
+    }
+
+    /// 覚えたグループとプロセス、目印を持つプロセスをすべて止め、残っていないことを確かめる。
+    fn stop_all(&mut self, root: u32) -> Result<()> {
+        let me = std::process::id();
+        for _ in 0..10 {
+            let rows = self.collect(root);
+            let mut alive: Vec<u32> = self
+                .known
+                .keys()
+                .copied()
+                .filter(|pid| self.same(&rows, *pid) && is_alive(*pid))
+                .collect();
+            for pid in marked(&self.mark).into_iter().chain(working_in(&self.dirs)) {
+                if pid != me && !alive.contains(&pid) && is_alive(pid) {
+                    alive.push(pid);
+                }
+            }
+            if alive.is_empty() {
+                return Ok(());
+            }
+            for group in &self.groups {
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{group}")])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            for pid in alive {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        Err(
+            Error::new("AIが動かしたプロセスを止めきれませんでした。書き込みをせずに止めます")
+                .with_hint("残ったプロセスを止めてから、ラベルを付け直してください"),
+        )
+    }
+}
+
+/// 生きているか。ゾンビ（終わったが、親がまだ回収していない）は、生きているとみなさない。
+fn is_alive(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| {
+            let stat = String::from_utf8_lossy(&o.stdout);
+            let stat = stat.trim();
+            !stat.is_empty() && !stat.starts_with('Z')
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(all(test, unix))]
@@ -762,15 +1138,21 @@ mod tests {
             model: Some("haiku"),
             timeout,
             log_dir: dir,
+            job_dirs: &[],
         }
     }
 
+    fn alive_from_file(dir: &Path, name: &str) -> bool {
+        let pid = std::fs::read_to_string(dir.join(name)).unwrap();
+        is_alive(pid.trim().parse().unwrap())
+    }
+
     #[test]
-    fn passes_the_prompt_on_stdin_and_keeps_settings_isolated() {
+    fn passes_the_prompt_on_stdin_with_only_the_needed_env() {
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
-            r#"cat > prompt.txt; echo "$@" > args.txt; echo "$PATH" > path.txt; echo "$AGENTCELLS_CONTEXT" > context.txt; echo "${GH_TOKEN:-none}" > token.txt; echo '{"structured_output":{"next":"done","comment":"ok"}}'"#,
+            r#"cat > prompt.txt; printf '%s\n' "$@" > args.txt; echo "$PATH" > path.txt; echo "$AGENTCELLS_CONTEXT" > context.txt; env > env.txt; echo '{"structured_output":{"next":"done","comment":"ok"}}'"#,
         );
         let schema = serde_json::json!({"type": "object"});
         let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(30))
@@ -782,45 +1164,133 @@ mod tests {
         assert!(stdout.contains("\"done\""));
         let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
         assert_eq!(read("prompt.txt"), "user prompt");
-        let args = read("args.txt");
-        for arg in [
-            "-p",
-            "--setting-sources project,local",
-            "--strict-mcp-config",
-            "--settings /s.json",
-            "--model haiku",
-        ] {
-            assert!(args.contains(arg), "{arg}: {args}");
-        }
+        let args: Vec<String> = read("args.txt").lines().map(str::to_string).collect();
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(pair("--setting-sources", ""), "{args:?}");
+        assert!(pair("--settings", "/s.json"), "{args:?}");
+        assert!(pair("--model", "haiku"), "{args:?}");
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(read("path.txt").starts_with("/opt/agentcells/bin:"));
         assert_eq!(read("context.txt").trim(), "/c.json");
-        assert_eq!(read("token.txt").trim(), "none");
+        // 使う人の環境変数は、要るもの以外を渡さない
+        let names: Vec<String> = read("env.txt")
+            .lines()
+            .filter_map(|l| l.split('=').next().map(str::to_string))
+            .collect();
+        for name in &names {
+            let allowed = PASSED_ENV.contains(&name.as_str())
+                || name.starts_with("LC_")
+                || [
+                    "PATH",
+                    "AGENTCELLS_CONTEXT",
+                    RUN_MARK_ENV,
+                    "PWD",
+                    "SHLVL",
+                    "_",
+                    "OLDPWD",
+                ]
+                .contains(&name.as_str());
+            assert!(allowed, "{name} should not be passed");
+        }
     }
 
     #[test]
-    fn stops_the_whole_process_group_on_timeout() {
+    fn stops_descendants_in_other_process_groups() {
         let dir = tempfile::tempdir().unwrap();
-        // バックグラウンドに子を残してから、待ち続ける
+        // Claude CodeのBashのように、自分のプロセスグループを作った子を残して終わる
         let program = script(
             dir.path(),
-            r#"cat > /dev/null; sleep 30 & echo $! > child.pid; sleep 30"#,
+            r#"cat > /dev/null; python3 -c 'import os,time; os.setsid(); open("child.pid","w").write(str(os.getpid())); time.sleep(60)' & sleep 2; echo '{}'"#,
+        );
+        let schema = serde_json::json!({});
+        let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(30))
+            .run()
+            .unwrap();
+        assert!(matches!(end, ClaudeEnd::Exited(_)));
+        assert!(
+            !alive_from_file(dir.path(), "child.pid"),
+            "child is still alive"
+        );
+    }
+
+    #[test]
+    fn stops_everything_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = script(
+            dir.path(),
+            r#"cat > /dev/null; sleep 60 & echo $! > child.pid; sleep 60"#,
         );
         let schema = serde_json::json!({});
         let started = Instant::now();
-        let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(1))
+        let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(2))
             .run()
             .unwrap();
         assert!(matches!(end, ClaudeEnd::TimedOut));
-        assert!(started.elapsed() < Duration::from_secs(15));
-        std::thread::sleep(Duration::from_millis(300));
-        // 残した子も止まっている
-        let child = std::fs::read_to_string(dir.path().join("child.pid")).unwrap();
-        let alive = Command::new("kill")
-            .args(["-0", child.trim()])
-            .stderr(Stdio::null())
-            .status()
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(
+            !alive_from_file(dir.path(), "child.pid"),
+            "child is still alive"
+        );
+    }
+
+    /// 本物のclaudeで、AIがBashでバックグラウンドに残したプロセスも止まることを確かめる。
+    /// claudeを動かすので、手で `cargo test -- --ignored real_claude` を実行したときだけ動く（haikuを使う）。
+    #[test]
+    #[ignore]
+    fn real_claude_background_processes_are_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = format!("agentcells-bg-{}", std::process::id());
+        let settings = dir.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            serde_json::json!({
+                "disableAllHooks": true,
+                "permissions": { "allow": ["Bash(sh bg.sh)"] },
+                "sandbox": { "enabled": true, "allowUnsandboxedCommands": false }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bg.sh"),
+            format!("nohup sh -c 'exec -a {marker} sleep 300' >/dev/null 2>&1 &\necho started\n"),
+        )
+        .unwrap();
+        let job_dirs = [dir.path().to_path_buf()];
+        let claude = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|d| d.join("claude"))
+            .find(|p| p.is_file())
+            .expect("claude is on PATH");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "done": { "type": "boolean" } },
+            "required": ["done"]
+        });
+        let run = ClaudeRun {
+            program: &claude,
+            cwd: dir.path(),
+            settings: &settings,
+            system: "You are a test helper.",
+            schema: &schema,
+            prompt: "Run exactly this Bash command once: sh bg.sh  Then return done=true.",
+            context: Path::new("/nonexistent"),
+            path_prefix: None,
+            model: Some("haiku"),
+            timeout: Duration::from_secs(300),
+            log_dir: dir.path(),
+            job_dirs: &job_dirs,
+        };
+        let end = run.run().unwrap();
+        assert!(matches!(end, ClaudeEnd::Exited(_)));
+        std::thread::sleep(Duration::from_millis(500));
+        let left = Command::new("pgrep")
+            .args(["-f", &marker])
+            .output()
             .unwrap();
-        assert!(!alive.success(), "child {} is still alive", child.trim());
+        let left = String::from_utf8_lossy(&left.stdout).trim().to_string();
+        let log = std::fs::read_to_string(dir.path().join("claude.json")).unwrap_or_default();
+        assert!(left.is_empty(), "left: {left}\n{log}");
+        assert!(log.contains("started") || log.contains("done"), "{log}");
     }
 
     #[test]
@@ -846,5 +1316,12 @@ mod tests {
         assert!(unsupported(&work(Target::Issue, "triage"), &cell("triage")).is_none());
         assert!(unsupported(&work(Target::Issue, "implement"), &cell("implement")).is_some());
         assert!(unsupported(&work(Target::PullRequest, "review"), &cell("review")).is_some());
+    }
+
+    #[test]
+    fn public_run_names_do_not_include_local_paths() {
+        let home = Home::new(PathBuf::from("/Users/someone/.agentcells"));
+        let place = Place::new(&home, &RepoName::parse("octo/app").unwrap(), 3);
+        assert_eq!(place.run_name(), "~/.agentcells/runs/octo/app/3");
     }
 }

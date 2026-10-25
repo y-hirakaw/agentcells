@@ -466,6 +466,26 @@ impl Credentials {
             gh_config: empty_gh_config()?,
         })
     }
+
+    /// 同じトークンを、別の空のghの設定で使う（あとで取り消せるよう、もとのものを手元に残すため）。
+    pub fn reuse(&self) -> Result<Self> {
+        Self::new(self.source, self.token.clone())
+    }
+
+    /// GitHub Appのトークンを取り消す。AIが動いている間に、そのプロセスから読まれても使えないようにする。
+    /// ghのアカウントのトークンは、使う人のものなので取り消さない。取り消せなくても、1時間で切れる。
+    pub fn revoke(&self, probe: &dyn Probe) {
+        if self.source != Source::App {
+            return;
+        }
+        if let Ok(env) = self.gh_env() {
+            let _ = probe.run_with_env(
+                "gh",
+                &["api", "-X", "DELETE", "/installation/token", "--silent"],
+                &env,
+            );
+        }
+    }
 }
 
 /// トークンを使わないgitにも付ける環境変数。使う人とシステムのgitの設定は読まない
