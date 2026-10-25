@@ -6,6 +6,8 @@
 //!
 //! 確かめる起点は、operatorが「承認」した時刻（operator自身が、productのどれかのcellのラベルを最後に付けた時刻）。
 //! agentcellsが次のcellのラベルを付けた時刻を起点にすると、cellが動いている間のほかの人の書き換えを見逃すため。
+//! ghのアカウントで書き込むと、agentcellsが付けたラベルもoperatorのログインで残る。agentcellsは、次のcellの
+//! ラベルを付けるのと同時に `ac:working` を外すので、同じ人が数秒以内に `ac:working` を外したラベルは、承認とみなさない。
 //!
 //! Issueの仕事:
 //! - Assigneesにoperatorがいて、operatorを最後に割り当てたのがoperator自身
@@ -27,7 +29,11 @@ use crate::config::Target;
 use crate::discussion;
 use crate::error::{Error, Result};
 use crate::home::RepoName;
+use crate::labels::WORKING;
 use crate::probe::Probe;
+
+/// agentcellsが付けたラベルと、同時に外した `ac:working` の時刻の差の上限（秒）。
+const TRANSITION_WINDOW_SECONDS: i64 = 5;
 
 /// 動かしてよい人。
 #[derive(Debug, Clone)]
@@ -104,7 +110,7 @@ fn login(user: &Option<User>) -> &str {
 /// - `userContentEdits` は新しい順に返るので（cli/cli#1 で確かめた）、`first` で新しいものから読む
 /// - コメントとレビューは古い順に返るので、`last` で新しいものから読む
 /// - どれも、読みきれなければ（`hasNextPage` / `hasPreviousPage`）動かさない
-pub const EDITS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { ... on Issue { userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } } ... on PullRequest { userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } reviews(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } comments(first: 100) { pageInfo { hasNextPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } } } } } } } fragment edits on UserContentEditConnection { pageInfo { hasNextPage } nodes { editedAt editor { login } } }";
+pub const EDITS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { ... on Issue { state assignees(first: 20) { nodes { login } } userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } } ... on PullRequest { state assignees(first: 20) { nodes { login } } userContentEdits(first: 100) { ...edits } comments(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } reviews(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } userContentEdits(first: 20) { ...edits } comments(first: 100) { pageInfo { hasNextPage } nodes { author { login } userContentEdits(first: 20) { ...edits } } } } } } } } } fragment edits on UserContentEditConnection { pageInfo { hasNextPage } nodes { editedAt editor { login } } }";
 
 #[derive(Deserialize)]
 struct EditsResponse {
@@ -170,6 +176,23 @@ struct Content {
     comments: Option<Connection<Content>>,
     #[serde(default)]
     reviews: Option<Connection<Content>>,
+    /// Issue/PRの今の状態（`OPEN` など）
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    assignees: Option<Connection<User>>,
+}
+
+impl Content {
+    fn is_open(&self) -> bool {
+        self.state.as_deref() == Some("OPEN")
+    }
+
+    fn is_assigned(&self, actors: &Actors) -> bool {
+        self.assignees
+            .as_ref()
+            .is_some_and(|a| a.items().any(|u| actors.is_operator(&u.login)))
+    }
 }
 
 /// 1つのIssue/PRの履歴。
@@ -208,7 +231,8 @@ impl History {
         })
     }
 
-    /// operatorが、cellのラベルのどれかを最後に付けた時刻。
+    /// operatorが、cellのラベルのどれかを最後に付けた時刻。agentcellsが次のcellへ進めたもの
+    /// （同じ人が、数秒以内に `ac:working` を外している）は除く。
     fn approved_at(&self, cell_labels: &[String], actors: &Actors) -> Option<&str> {
         self.events
             .iter()
@@ -219,8 +243,26 @@ impl History {
                     && e.label.as_ref().is_some_and(|l| {
                         cell_labels.iter().any(|c| c.eq_ignore_ascii_case(&l.name))
                     })
+                    && !self.is_transition(e)
             })
             .map(|e| e.created_at.as_str())
+    }
+
+    /// agentcellsが次のcellへ進めたときのラベルか（同じ人が、数秒以内に `ac:working` を外している）。
+    /// 時刻を読めなければ、承認とみなさない側に倒す。
+    fn is_transition(&self, labeled: &Event) -> bool {
+        let Some(at) = seconds(&labeled.created_at) else {
+            return true;
+        };
+        self.events.iter().any(|e| {
+            e.event == "unlabeled"
+                && login(&e.actor).eq_ignore_ascii_case(login(&labeled.actor))
+                && e.label
+                    .as_ref()
+                    .is_some_and(|l| l.name.eq_ignore_ascii_case(WORKING))
+                && seconds(&e.created_at)
+                    .is_none_or(|t| (t - at).abs() <= TRANSITION_WINDOW_SECONDS)
+        })
     }
 
     /// `since` 以後（同じ秒も含む）に、ほかの人がタイトル、本文、operatorのコメントやレビューを書き換えたか。
@@ -284,6 +326,25 @@ fn edited_by_others(
         .then(|| "書き換えが多すぎて確かめきれません".to_string())
 }
 
+/// `2026-10-25T02:00:00Z` の形の時刻を、1970年からの秒にする。
+fn seconds(at: &str) -> Option<i64> {
+    let at = at.strip_suffix('Z')?;
+    let (date, time) = at.split_once('T')?;
+    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, mi, s) = (t.next()??, t.next()??, t.next()??);
+    // 暦の日付から日数を求める（Howard Hinnant の days_from_civil）
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3_600 + mi * 60 + s)
+}
+
 /// 見送る理由に、「見直して、ラベルを付け直すと動きます」を足す。
 fn retry(reason: String) -> Option<String> {
     Some(format!("{reason}（見直して、ラベルを付け直すと動きます）"))
@@ -340,8 +401,8 @@ pub fn check(probe: &dyn Probe, request: &Request, actors: &Actors) -> Result<Op
         None if made_by_agentcells => String::new(),
         None => {
             return Ok(Some(format!(
-                "{} がcellのラベルを付けた記録がありません（{} が付けたものから始めます）",
-                actors.operator, actors.operator
+                "{} がcellのラベルを付けた記録がありません（自分で付けたものから始めます）",
+                actors.operator
             )));
         }
     };
@@ -359,6 +420,16 @@ pub fn check(probe: &dyn Probe, request: &Request, actors: &Actors) -> Result<Op
             return Ok(None);
         };
         let original_history = History::fetch(probe, original)?;
+        // operatorが元のIssueをやめた（閉じた、自分を外した）ら、そのPRも動かさない
+        if !original_history.content.is_open() {
+            return Ok(Some("元のIssueが閉じています".to_string()));
+        }
+        if !original_history.content.is_assigned(actors) {
+            return Ok(Some(format!(
+                "元のIssueの Assignees に {} がいません",
+                actors.operator
+            )));
+        }
         let issue_since = if made_by_agentcells {
             // 元のIssueが、Issueの仕事と同じ確かめを通ること
             match original_history.last_assigned_operator(actors) {
@@ -473,14 +544,23 @@ pub(crate) mod fake {
         )
     }
 
-    pub fn body_edit(editor: &str, at: &str) -> String {
+    pub fn unlabeled(actor: &str, label: &str, at: &str) -> String {
         format!(
-            r#"{{"userContentEdits":{{"nodes":[{{"editedAt":"{at}","editor":{{"login":"{editor}"}}}}]}},"comments":{{"nodes":[]}}}}"#
+            r#"{{"event":"unlabeled","actor":{{"login":"{actor}"}},"label":{{"name":"{label}"}},"created_at":"{at}"}}"#
         )
     }
 
-    pub const NO_EDITS: &str =
-        r#"{"userContentEdits":{"nodes":[]},"comments":{"nodes":[]},"reviews":{"nodes":[]}}"#;
+    /// 開いていて、cellを使う人（テストでは y-hirakaw か me）が割り当てられている
+    const OPEN: &str =
+        r#""state":"OPEN","assignees":{"nodes":[{"login":"y-hirakaw"},{"login":"me"}]}"#;
+
+    pub fn body_edit(editor: &str, at: &str) -> String {
+        format!(
+            r#"{{{OPEN},"userContentEdits":{{"nodes":[{{"editedAt":"{at}","editor":{{"login":"{editor}"}}}}]}},"comments":{{"nodes":[]}}}}"#
+        )
+    }
+
+    pub const NO_EDITS: &str = r#"{"state":"OPEN","assignees":{"nodes":[{"login":"y-hirakaw"},{"login":"me"}]},"userContentEdits":{"nodes":[]},"comments":{"nodes":[]},"reviews":{"nodes":[]}}"#;
 }
 
 #[cfg(test)]
@@ -722,6 +802,71 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn labels_agentcells_added_as_the_operator_are_not_approvals() {
+        // ghのアカウントで書き込むと、agentcellsが付けたラベルもoperatorのログインで残る
+        let same = Actors {
+            operator: "y-hirakaw".to_string(),
+            writer: "y-hirakaw".to_string(),
+        };
+        let mut events = approved_issue();
+        // T3 に書き換えられ、T4 にagentcellsが ac:working を外して次のcellへ進めた
+        events.push(unlabeled("y-hirakaw", "ac:triage", T4));
+        events.push(unlabeled("y-hirakaw", "ac:working", T4));
+        events.push(labeled("y-hirakaw", "ac:implement", T4));
+        let probe = with_history(
+            FakeProbe::default(),
+            "octo/app",
+            3,
+            &events,
+            &body_edit("eager", T3),
+        );
+        let repo = RepoName::parse("octo/app").unwrap();
+        let labels = labels();
+        let request = Request {
+            kind: Target::Issue,
+            subject: Subject {
+                repo: &repo,
+                number: 3,
+                env: &[],
+            },
+            author: "stranger",
+            label: "ac:implement",
+            cell_labels: &labels,
+            original: None,
+        };
+        let reason = check(&probe, &request, &same).unwrap().unwrap();
+        assert!(reason.contains("本文を、eager"), "{reason}");
+    }
+
+    #[test]
+    fn prs_stop_when_the_operator_drops_the_original_issue() {
+        let pr_events = [
+            assigned("agentcells-yh[bot]", "y-hirakaw", T3),
+            labeled("agentcells-yh[bot]", "ac:review", T3),
+        ];
+        let closed = NO_EDITS.replace(r#""state":"OPEN""#, r#""state":"CLOSED""#);
+        assert!(
+            pr(&pr_events, NO_EDITS, &approved_issue(), &closed)
+                .unwrap()
+                .contains("閉じています")
+        );
+        let unassigned = NO_EDITS.replace(r#"{"login":"y-hirakaw"},"#, "");
+        assert!(
+            pr(&pr_events, NO_EDITS, &approved_issue(), &unassigned)
+                .unwrap()
+                .contains("Assignees に y-hirakaw がいません")
+        );
+    }
+
+    #[test]
+    fn reads_timestamps() {
+        assert_eq!(seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(seconds("2026-10-25T02:00:05Z"), Some(1_792_893_605));
+        assert_eq!(seconds("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(seconds("bad"), None);
     }
 
     #[test]

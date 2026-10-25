@@ -122,7 +122,7 @@ cellを使う人（`config.toml` の `operator`）が自分で決めたIssue/PR�
 operator = "y-hirakaw"   # cellを使うあなたのGitHubのログイン（productがあれば必ず書く）
 ```
 
-Issue/PRの履歴（events API）と編集の履歴（GraphQLの `userContentEdits`）は、書いた人をあとから変えられないので、それで確かめる。確かめる起点は、operatorが「承認」した時刻（operator自身が、productのどれかのcellのラベルを最後に付けた時刻）にする。agentcellsが次のcellのラベルを付けた時刻を起点にすると、cellが動いている間（最大で `timeout_minutes`）のほかの人の書き換えを、次のcellで見逃すため。
+Issue/PRの履歴（events API）と編集の履歴（GraphQLの `userContentEdits`）は、書いた人をあとから変えられないので、それで確かめる。確かめる起点は、operatorが「承認」した時刻（operator自身が、productのどれかのcellのラベルを最後に付けた時刻）にする。agentcellsが次のcellのラベルを付けた時刻を起点にすると、cellが動いている間（最大で `timeout_minutes`）のほかの人の書き換えを、次のcellで見逃すため。ghのアカウントで書き込むと、agentcellsが付けたラベルもoperatorのログインで残る。agentcellsは次のcellのラベルを付けるのと同時に `ac:working` を外すので、同じ人が5秒以内に `ac:working` を外したラベルは、承認とみなさない。
 
 Issueの仕事は、次のすべてを満たすものだけを動かす。
 
@@ -132,7 +132,7 @@ Issueの仕事は、次のすべてを満たすものだけを動かす。
 
 PRの仕事:
 
-- agentcellsが作ったPR（作者が書き込みのアカウント）は、作るときにagentcellsがoperatorを割り当てる（`gh pr create --assignee`）。割り当てたのがagentcellsでも認める。そのかわり、元のIssue（PRの本文の `Closes`）が、Issueの仕事と同じ確かめ（operatorが自分を割り当て、承認し、そのあとほかの人が書き換えていない）を通ること。元のIssueがなければ動かさない。PRそのものは、operatorがPRで承認していればその時刻から、していなければ作られてからずっと、ほかの人が書き換えていないこと
+- agentcellsが作ったPR（作者が書き込みのアカウント）は、作るときにagentcellsがoperatorを割り当てる（`gh pr create --assignee`）。割り当てたのがagentcellsでも認める。そのかわり、元のIssue（PRの本文の `Closes`）が、Issueの仕事と同じ確かめ（operatorが自分を割り当て、承認し、そのあとほかの人が書き換えていない）を通ること。元のIssueがなければ動かさない。元のIssueが閉じているか、AssigneesにoperatorがいなければPRも動かさない（operatorが元のIssueをやめたことが、PRにも効く）。PRそのものは、operatorがPRで承認していればその時刻から、していなければ作られてからずっと、ほかの人が書き換えていないこと
 - 人が作ったPRは、Issueの仕事と同じ確かめをPRにする。元のIssueがあれば、PRの承認のあとにほかの人が書き換えていないことも確かめる（元のIssueのタイトルと本文もプロンプトに入るため）
 - PRでは、operatorのレビューの本文と、レビューの行コメントの書き換えも確かめる（指示としてプロンプトに入るため）
 
