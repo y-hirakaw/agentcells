@@ -47,9 +47,13 @@ impl Work {
         } else {
             ""
         };
+        // タイトルはほかの人が書けるので、制御文字を置き換える
         format!(
             "{}{reply} {kind} {}#{}「{}」",
-            self.cell, self.repo, self.number, self.title
+            self.cell,
+            self.repo,
+            self.number,
+            crate::display::printable(&self.title)
         )
     }
 

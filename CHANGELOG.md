@@ -6,6 +6,23 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.12.0] - 2026-10-25
+
+### 追加
+
+- **動いているcellを見る**: `agentcells status` の最初に、動いているcell（Issue/PR、経過時間、ツールを使った回数）と、AIが最近したこと（Bashのコマンド、読み書きしたファイルなど）を出す。`agentcells status --watch` なら、それだけを2秒ごとに出し直す。定期実行で目を離して動かすようになり、今何をしているかが見えなかったため
+  - cellが動いている間は、`~/.agentcells/running.json` に何が動いているかを書く。GitHubは読まない
+  - claudeが終わったあと、push や投稿の間は「結果をGitHubに書いています」と出す
+
+### 変えたこと
+
+- claudeを `--output-format stream-json --verbose` で動かし、出来事を1行ずつ `runs/.../claude.jsonl` に書かせる（今までは、終わったときに結果だけを `claude.json` に書いていた）。結果は最後の行から読む
+- 実行の記録（`runs/` の下）を、ディレクトリは0700、ファイルは0600で作る。`claude.jsonl` には、AIが読んだファイルの中身やコマンドの出力も入るため
+
+### 直したこと
+
+- Issue/PRのタイトルやAIが書いた文に含まれる制御文字（ESCなど）を、`status` と `tick` の出力で `�` に置き換える。そのまま出すと、ターミナルが解釈して、表示を書き換えたりクリップボードに書いたりできるため
+
 ## [0.11.0] - 2026-10-25
 
 ### 追加

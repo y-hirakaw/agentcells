@@ -55,8 +55,12 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// agentcellsが扱っているIssueごとに、今どこまで進んでいるかを出す（読むだけ）
-    Status,
+    /// 動いているcellと、agentcellsが扱っているIssueごとに、今どこまで進んでいるかを出す（読むだけ）
+    Status {
+        /// 動いているcellの様子だけを、2秒ごとに出し直す（GitHubは読まない。Ctrl-Cで終わる）
+        #[arg(long)]
+        watch: bool,
+    },
     /// 定期実行（macOSのlaunchd）を扱う
     Schedule {
         #[command(subcommand)]
@@ -264,14 +268,29 @@ fn run(command: Commands) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Status => {
+        Commands::Status { watch: true } => loop {
+            // 画面を消して、上から書き直す
+            print!("\x1b[2J\x1b[H");
+            println!("動いているcell（2秒ごとに更新。Ctrl-Cで終わる）\n");
+            for line in agentcells::running::describe(&home, unix_now(), 20) {
+                println!("{line}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        },
+        Commands::Status { watch: false } => {
+            println!("動いているcell");
+            for line in agentcells::running::describe(&home, unix_now(), 5) {
+                println!("  {line}");
+            }
+            // 止めきれなかったプロセスがあれば、次のtickは動かない
+            if let Some(note) = run::stuck(&home) {
+                println!("  ※{note}");
+            }
+            println!();
             let config = Config::load(&home.config_path())?;
             let credentials_for =
                 |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default();
+            let now = unix_now();
             let actors = guard::Actors {
                 operator: config.operator.clone().unwrap_or_default(),
                 writer: prompt::writer_login(&config, &SystemProbe)?,
@@ -314,6 +333,8 @@ fn run(command: Commands) -> Result<ExitCode> {
                 println!("ほかのtickが動いているので、何もしません");
                 return Ok(ExitCode::SUCCESS);
             };
+            // ロックを取れたので、動いているcellはない。殺されたtickが残した印を片付ける
+            agentcells::running::finish(&home);
             // 前の実行でAIのプロセスを止めきれなかったら、それが残っている間は何も動かさない
             // （次の仕事の書き込みのトークンを、残ったプロセスに読ませないため）
             if let Some(note) = run::stuck(&home) {
@@ -483,6 +504,14 @@ fn print_doctor(home: &Home) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// 今の時刻（UNIXの秒）。
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 /// 定期実行のplistの場所。launchdのない環境では `None`。

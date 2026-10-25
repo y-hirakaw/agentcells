@@ -177,7 +177,7 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
 8. AIがコミットしていれば、確かめてからpushし、IssueからならPRを作る（「ブランチとpush」）
 9. 投稿する本文の全体を、betterleaksで調べる。秘密らしいものがあれば、決まった文だけにして人間に回す。目印（`[agentcells] <cell> round <n>`）を付けてコメントする。レビューのcell（`review = true`）は、PRのレビューとして投稿する（「コメントとレビュー」）
 10. 次のcellのラベルを付けてから、今のcellのラベル、`ac:working`、人間を待っていたラベルを外す（付いているものだけ）。作ったPRに次のcellのラベルを付ける。`done` なら閉じる
-11. 作業の場所（worktree、`.git` の実体、一時ディレクトリ）を消す。うまくいかなかったときも消す（置いた秘密のファイルを残さないため）。`runs/` の記録（AIの出力 `claude.json`、`claude.err`、エラー `error.txt`）は残す
+11. 作業の場所（worktree、`.git` の実体、一時ディレクトリ）を消す。うまくいかなかったときも消す（置いた秘密のファイルを残さないため）。`runs/` の記録（AIの出力 `claude.jsonl`、`claude.err`、エラー `error.txt`）は残す。`claude.jsonl` には、AIが読んだファイルの中身やコマンドの出力も入るので、記録のディレクトリは0700、ファイルは0600で作る（同じMacのほかのユーザーに読ませない）
 
 途中で失敗したら、`[agentcells] <cell> round 0`（往復の回数に数えない）で「実行できませんでした。手元の記録（`~/.agentcells/runs/<owner>/<repo>/<番号>`）を確かめてください。直したら、ここにコメントすると、もう一度動きます」とだけコメントし、`ac:needs-human` に回す。公開のIssueに、手元の絶対パスやエラーの中身（gitやghの標準エラー）を書かないため。詳しいことは、手元の記録とtickの出力に残す。
 
@@ -281,7 +281,18 @@ PRの仕事:
 
 ### Issueの状態（status）
 
-`agentcells status` は、productごとに、扱っているIssue/PRの今の状態を1行ずつ出す。読むだけで、何も書き換えない。
+`agentcells status` は、最初に動いているcellの様子を出し、そのあと、productごとに、扱っているIssue/PRの今の状態を1行ずつ出す。読むだけで、何も書き換えない。
+
+動いているcell:
+
+- claudeは `--output-format stream-json --verbose` で動かし、出来事（AIの発言、ツールの呼び出し、ツールの結果）を1行ずつ `runs/.../claude.jsonl` に書かせる。結果は最後の `"type":"result"` の行から読む（中身は `--output-format json` と同じ）
+- cellが動いている間は、`~/.agentcells/running.json` に、cell、Issue/PR、始まった時刻、`claude.jsonl` の場所、動かしているtick（PIDと始まった時刻）を書く。claudeが終わったら「結果をGitHubに書いています」と段階を書き足し、push や投稿が終わるまで残す（失敗で途中で抜けても消す）。tickが殺されて残ったものは、次のtickがロックを取ったときに消す
+- `status` は、それと `claude.jsonl` から、cell、Issue/PR、経過した時間、ツールを使った回数、最後に出力してからの時間と、最近のしたこと（ツールの名前と、何に使ったか。Bashならコマンドの1行目、Read/Editならファイル）を出す。ツールの結果は大きいことがあるので読まない
+- 動かしていたtickが止まっていれば（殺されたなど）、そう添える
+- AIが書いた文やコマンド、Issue/PRのタイトルは、ほかの人が決められる。ESCなどの制御文字をそのまま出すと、ターミナルが解釈して、表示を書き換えたりクリップボードに書いたり（OSC 52）できるので、`�` に置き換えて出す（`status`、`tick` の出力も同じ）
+- `agentcells status --watch` は、動いているcellの様子だけを、2秒ごとに出し直す（最近のしたことを20件まで）。GitHubは読まないので、APIを使わない。Ctrl-Cで終わる
+
+Issue/PRの状態:
 
 - ラベルのあるPRは、どれも1行ずつ出す。つながった開いているIssueがあれば、それと並べる（本文の `Closes` が指すIssueを先に）
 - Issueは、次のように出す

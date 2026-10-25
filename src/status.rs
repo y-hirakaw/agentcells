@@ -486,7 +486,12 @@ fn labeler_note(state: &State, labeled: Option<&Labeled>, actors: &Actors) -> Op
 
 impl Line {
     /// 1行で書く。`now` は今の時刻（UNIXの秒）で、ラベルが付いてからの長さを出すのに使う。
+    /// タイトルはほかの人が書けるので、制御文字を置き換える。
     pub fn describe(&self, now: u64) -> String {
+        crate::display::printable(&self.describe_raw(now))
+    }
+
+    fn describe_raw(&self, now: u64) -> String {
         let mut text = self.state.describe();
         match (&self.issue, &self.pr) {
             (Some(issue), pr) => {

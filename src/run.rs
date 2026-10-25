@@ -79,6 +79,25 @@ struct Stuck {
     tick: Option<Leftover>,
 }
 
+/// そのプロセス（PIDと始まった時刻が同じもの）が、まだ動いているか。
+pub(crate) fn is_alive_leftover(p: &Leftover) -> bool {
+    process_table()
+        .iter()
+        .any(|r| r.0 == p.pid && r.3 == p.started)
+}
+
+/// 今のプロセス（tick自身）。
+fn current_process() -> Option<Leftover> {
+    let me = std::process::id();
+    process_table()
+        .into_iter()
+        .find(|r| r.0 == me)
+        .map(|r| Leftover {
+            pid: me,
+            started: r.3,
+        })
+}
+
 fn stuck_path(home: &Home) -> PathBuf {
     home.root().join("stuck.json")
 }
@@ -304,7 +323,33 @@ impl Runner<'_> {
             Prepared::Ready(ready) => ready,
         };
 
+        // 動いている間、`agentcells status` で見えるようにする
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        crate::running::start(
+            self.home,
+            &crate::running::Running {
+                cell: cell.name.clone(),
+                kind: match work.item {
+                    Target::Issue => "Issue",
+                    Target::PullRequest => "PR",
+                }
+                .to_string(),
+                repo: work.repo.to_string(),
+                number: work.number,
+                title: work.title.clone(),
+                started,
+                log: place.run.join(CLAUDE_LOG),
+                tick: current_process(),
+                phase: None,
+            },
+        );
+        // 抜けるときに（失敗でも）消す。push や投稿の間も、動いているものとして見せる
+        let _running = crate::running::Guard(self.home);
         let finished = ready.claude(self, cell, place).run()?;
+        crate::running::set_phase(self.home, "結果をGitHubに書いています");
 
         // AIの動かしたものをすべて止めたあとで、書き込みのトークンを作る
         let write = self.write_credentials(&work.repo)?;
@@ -1116,6 +1161,12 @@ impl Place {
         for dir in [&self.tmp, &self.run] {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::new(format!("{} を作れません: {e}", dir.display())))?;
+            // 記録には、AIが読んだファイルの中身やコマンドの出力も入るので、ほかのユーザーに読ませない
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
         }
         for dir in [&self.worktree, &self.git_dir] {
             if let Some(parent) = dir.parent() {
@@ -1298,8 +1349,10 @@ impl ClaudeRun<'_> {
     fn args(&self) -> Vec<String> {
         let mut args: Vec<String> = [
             "-p",
+            // 動いている間の様子を見られるように、出来事を1行ずつ書かせる（最後の行が結果）
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--settings",
             &self.settings.display().to_string(),
             // 使う人の設定も、作業するリポジトリの設定（.claude/settings.json）も読まない。
@@ -1356,10 +1409,19 @@ impl ClaudeRun<'_> {
     fn run(&self) -> std::result::Result<ClaudeEnd, Failure> {
         let log = |name: &str| -> Result<std::fs::File> {
             let path = self.log_dir.join(name);
-            std::fs::File::create(&path)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // AIが読んだファイルの中身やコマンドの出力も入るので、ほかのユーザーに読ませない
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&path)
                 .map_err(|e| Error::new(format!("{} を作れません: {e}", path.display())))
         };
-        let stdout_path = self.log_dir.join("claude.json");
+        let stdout_path = self.log_dir.join(CLAUDE_LOG);
         let mark = self.mark();
         let mut command = Command::new(self.program);
         command
@@ -1369,7 +1431,7 @@ impl ClaudeRun<'_> {
             .envs(self.env())
             .env(RUN_MARK_ENV, &mark)
             .stdin(Stdio::piped())
-            .stdout(Stdio::from(log("claude.json")?))
+            .stdout(Stdio::from(log(CLAUDE_LOG)?))
             .stderr(Stdio::from(log("claude.err")?));
         #[cfg(unix)]
         {
@@ -1395,14 +1457,7 @@ impl ClaudeRun<'_> {
             ..Processes::default()
         };
         let deadline = Instant::now() + self.timeout;
-        let me = std::process::id();
-        let tick = process_table()
-            .into_iter()
-            .find(|r| r.0 == me)
-            .map(|r| Leftover {
-                pid: me,
-                started: r.3,
-            });
+        let tick = current_process();
         let mut recorded = 0;
         let timed_out = loop {
             seen.collect(pid);
@@ -1442,8 +1497,23 @@ impl ClaudeRun<'_> {
         }
         let stdout = std::fs::read_to_string(&stdout_path)
             .map_err(|e| Error::new(format!("claudeの出力を読めません: {e}")))?;
-        Ok(ClaudeEnd::Exited(stdout))
+        Ok(ClaudeEnd::Exited(result_line(&stdout).to_string()))
     }
+}
+
+/// claudeの出力（`stream-json`）を書くファイル。
+const CLAUDE_LOG: &str = "claude.jsonl";
+
+/// `stream-json` の出力から、結果の行（`"type":"result"`）を読む。なければ空。
+fn result_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .rev()
+        .find(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|v| v["type"].as_str() == Some("result"))
+        })
+        .unwrap_or("")
 }
 
 /// claudeの子孫に付ける、実行ごとの目印の環境変数。
@@ -1749,7 +1819,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
-            r#"cat > prompt.txt; printf '%s\n' "$@" > args.txt; echo "$PATH" > path.txt; echo "$AGENTCELLS_CONTEXT" > context.txt; env > env.txt; echo '{"structured_output":{"next":"done","comment":"ok"}}'"#,
+            r#"cat > prompt.txt; printf '%s\n' "$@" > args.txt; echo "$PATH" > path.txt; echo "$AGENTCELLS_CONTEXT" > context.txt; env > env.txt; echo '{"type":"system"}'; echo '{"type":"result","structured_output":{"next":"done","comment":"ok"}}'"#,
         );
         let schema = serde_json::json!({"type": "object"});
         let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(30))
@@ -1879,14 +1949,19 @@ mod tests {
             record: None,
         };
         let end = run.run().unwrap_or_else(|_| panic!("failed"));
-        assert!(matches!(end, ClaudeEnd::Exited(_)));
+        let ClaudeEnd::Exited(result) = end else {
+            panic!("timed out");
+        };
+        // stream-json の最後の結果の行を読む
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["type"], "result", "{result}");
         std::thread::sleep(Duration::from_millis(500));
         let left = Command::new("pgrep")
             .args(["-f", &marker])
             .output()
             .unwrap();
         let left = String::from_utf8_lossy(&left.stdout).trim().to_string();
-        let log = std::fs::read_to_string(dir.path().join("claude.json")).unwrap_or_default();
+        let log = std::fs::read_to_string(dir.path().join(CLAUDE_LOG)).unwrap_or_default();
         assert!(left.is_empty(), "left: {left}\n{log}");
         assert!(log.contains("started") || log.contains("done"), "{log}");
     }
