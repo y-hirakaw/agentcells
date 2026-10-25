@@ -1,8 +1,10 @@
 # agentcells
 
+[English](../README.md) | 日本語
+
 Issueを作ると、AIエージェントのcellが仕事を進めます。次の工程に回すか人間に回すかはdispatcherが振り分け、質問や検品の依頼はIssueとPRで人間に届きます。グラフエンジニアリング／ソフトウェアファクトリーのような仕組みです。
 
-> **実験的なプロジェクトで、作成中です。** 仕様は予告なく変わります。構想は [concept.md](concept.md)、作ったものの仕様は [docs/design.md](docs/design.md)、変更の履歴は [CHANGELOG.md](CHANGELOG.md) にあります。
+> **実験的なプロジェクトで、作成中です。** 仕様は予告なく変わります。構想は [concept.md](../concept.md)、作ったものの仕様は [docs/design.md](design.md)、変更の履歴は [CHANGELOG.md](../CHANGELOG.md) にあります。
 
 ## できるようにしたいこと
 
@@ -38,7 +40,7 @@ cd agentcells
 
 `~/.agentcells/bin/agentcells` に入り、続けて `agentcells setup` が動きます。足りないものがあれば、直し方が表示されます。置き場所は環境変数 `AGENTCELLS_HOME` で変えられます。
 
-新しい版にするときは、cloneしたリポジトリで次を実行します。入れ直さないと、手元の `agentcells` は古い版のままです（`agentcells --version` で確かめられます）。新しい版で設定の項目が増えたときは、[CHANGELOG.md](CHANGELOG.md) に書いてあります。
+新しい版にするときは、cloneしたリポジトリで次を実行します。入れ直さないと、手元の `agentcells` は古い版のままです（`agentcells --version` で確かめられます）。新しい版で設定の項目が増えたときは、[CHANGELOG.md](../CHANGELOG.md) に書いてあります。
 
 ```sh
 git pull
@@ -60,7 +62,7 @@ agentcells doctor
 | `agentcells status [--watch]` | 動いているcell（経過時間、AIが使っているツール）と、扱っているIssueごとに、今どこまで進んでいるか（作業中、返事待ち、検品待ち、順番待ち）と、いつからかを出す。PRができたIssueは、PRの状態を出す（読むだけ）。`--watch` なら、動いているcellの様子だけを2秒ごとに出し直す |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |
 
-設定ファイル `~/.agentcells/config.toml` には、cellを使うあなたのGitHubのログイン（`operator`）と、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [docs/design.md](docs/design.md) と、雛形のコメントを見てください。動くのは、あなたがAssigneesに自分を入れ、cellのラベルを付けたIssue/PRだけです（ほかの人がラベルやAssigneesを変えても、勝手に始まりません）。AIが質問して止まったもの（`ac:needs-human`）や、検品を待つPR（`ac:in-review`）には、人に返事をするのと同じようにコメントすれば、続きが動きます（ほかの人のコメントでは動きません。あなたのコメントは、どれも返事として扱います）。標準のcell（triage、implement、review、assess）は、プロンプトを書かなくても [prompts/](prompts/) の標準のプロンプトで動きます。`prompt` にファイルを書くと、追加の指示として足されます。
+設定ファイル `~/.agentcells/config.toml` には、cellを使うあなたのGitHubのログイン（`operator`）と、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [docs/design.md](design.md) と、雛形のコメントを見てください。動くのは、あなたがAssigneesに自分を入れ、cellのラベルを付けたIssue/PRだけです（ほかの人がラベルやAssigneesを変えても、勝手に始まりません）。AIが質問して止まったもの（`ac:needs-human`）や、検品を待つPR（`ac:in-review`）には、人に返事をするのと同じようにコメントすれば、続きが動きます（ほかの人のコメントでは動きません。あなたのコメントは、どれも返事として扱います）。標準のcell（triage、implement、review、assess）は、プロンプトを書かなくても [prompts/](../prompts/) の標準のプロンプトで動きます。`prompt` にファイルを書くと、追加の指示として足されます。
 
 ### GitHub App（推奨）
 
@@ -68,7 +70,7 @@ agentcells doctor
 
 1. GitHubの Settings → Developer settings → GitHub Apps → New GitHub App で作る
    - Webhookは使わないので、Activeのチェックを外す
-   - Repository permissions: Contents、Issues、Pull requests を Read and write にする（`.github/workflows` を変えるなら Workflows も）
+   - Repository permissions: Contents、Issues、Pull requests を Read and write にする（Workflows は要らない。agentcellsは `.github/workflows` を変えるコミットをpushしない）
    - Where can this GitHub App be installed? は Only on this account でよい
 2. 作ったAppの画面で Generate a private key を押し、ダウンロードした `.pem` を `~/.agentcells/github-app.pem` に置いて `chmod 600` する
 3. Install App から、Issueのリポジトリと作業するリポジトリにインストールする
@@ -98,4 +100,4 @@ cargo test
 
 ## ライセンス
 
-MIT（[LICENSE](LICENSE)）
+MIT（[LICENSE](../LICENSE)）
