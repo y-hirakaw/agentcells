@@ -395,7 +395,7 @@ fn resumed_cell(
             .cells
             .iter()
             .any(|c| c == name)
-            .then(|| config.cell(name))
+            .then(|| config.cell_in(product, name))
             .flatten()
     };
     let last = discussion::last_marker(&d.posts, &actors.writer)

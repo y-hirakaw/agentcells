@@ -168,8 +168,9 @@ impl Runner<'_> {
             .ok_or_else(|| Error::new(format!("product「{}」がありません", work.product)))?;
         let cell = self
             .config
-            .cell(&work.cell)
+            .cell_in(product, &work.cell)
             .ok_or_else(|| Error::new(format!("cell「{}」がありません", work.cell)))?;
+        let cell = &cell;
         let issue = Issue {
             probe: self.probe,
             repo: &work.repo,

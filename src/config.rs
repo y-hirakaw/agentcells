@@ -34,6 +34,9 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # test = "npm test"
 # build = "npm run build"
 #
+# [product.next]                     # このproductでだけ、cellの進め先を替える（cellはファイル全体で1つずつ定義するため）
+# assess = ["stop", "done"]
+#
 # [product.sandbox]                  # AIが動かすコマンドに開ける場所。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない
 # read = ["~/.nvm"]                  # ホームの下で読ませる場所（ツールチェーンなど）。開けた場所の秘密は読まれうる
 # caches = ["npm"]                   # ビルドツールのキャッシュ（gradle npm yarn pnpm cargo maven pip go）。agentcellsが持つ場所に向ける
@@ -113,6 +116,10 @@ pub struct Product {
     /// AIが動かすコマンド（ビルドやテストを含む）に、読ませる場所と通信させる先
     #[serde(default)]
     pub sandbox: Sandbox,
+    /// このproductでだけ、cellの進め先（`next`）を替える（cellの名前 → 進め先）。cellはファイル全体で
+    /// 1つずつ定義するので、productごとに進め先を変えたいときに使う
+    #[serde(default)]
+    pub next: BTreeMap<String, Vec<String>>,
 }
 
 /// AIが動かすコマンドは、sandboxの中で動く。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない。
@@ -337,6 +344,33 @@ impl Config {
         self.cells.iter().find(|c| c.name == name)
     }
 
+    /// productで動くcell。productの `next` に書いてあれば、進め先をそれに替える。
+    pub fn cell_in(&self, product: &Product, name: &str) -> Option<Cell> {
+        let mut cell = self.cell(name)?.clone();
+        if let Some(next) = product.next.get(name) {
+            cell.next = next.clone();
+        }
+        Some(cell)
+    }
+
+    /// cellの進め先の問題（自分自身、定義されていないcell）。
+    fn next_problems(&self, c: &Cell) -> Vec<String> {
+        let mut problems = Vec::new();
+        for next in &c.next {
+            if next == &c.name {
+                problems.push(format!("cell「{}」の next に自分自身があります", c.name));
+            } else if !transition::is_reserved(next) && self.cell(next).is_none() {
+                problems.push(format!(
+                    "cell「{}」の next の「{next}」が [[cell]] に定義されていません（cellの名前か {} か {} を書きます）",
+                    c.name,
+                    transition::DONE,
+                    transition::STOP
+                ));
+            }
+        }
+        problems
+    }
+
     /// 見つかった問題をすべて返す。1つずつ直しては実行し直す手間を減らすため、最初の1つで止めない。
     fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
@@ -421,22 +455,49 @@ impl Config {
                     ));
                 }
             }
+            for name in p.next.keys() {
+                if !p.cells.contains(name) {
+                    problems.push(format!(
+                        "product「{}」の next の「{name}」が、このproductの cells にありません",
+                        p.name
+                    ));
+                }
+            }
             for name in &p.cells {
-                let Some(cell) = self.cell(name) else {
+                let Some(cell) = self.cell_in(p, name) else {
                     problems.push(format!(
                         "product「{}」のcell「{name}」が [[cell]] に定義されていません",
                         p.name
                     ));
                     continue;
                 };
+                if p.next.contains_key(name) {
+                    problems.extend(
+                        self.next_problems(&cell)
+                            .into_iter()
+                            .map(|e| format!("product「{}」の next: {e}", p.name)),
+                    );
+                }
                 // 遷移先のcellも、同じproductで動いていないと拾われない。
                 for next in &cell.next {
                     if self.cell(next).is_some() && !p.cells.contains(next) {
                         problems.push(format!(
-                            "product「{}」のcell「{name}」は「{next}」に進めますが、「{next}」がこのproductの cells にありません",
+                            "product「{}」のcell「{name}」は「{next}」に進めますが、「{next}」がこのproductの cells にありません（このproductでだけ進め先を変えるなら、[product.next] に書きます）",
                             p.name
                         ));
                     }
+                }
+                if cell.confirms()
+                    && !cell
+                        .next
+                        .iter()
+                        .any(|n| n == transition::STOP || self.cell(n).is_some())
+                {
+                    problems.push(format!(
+                        "product「{}」のcell「{name}」は着手を確かめるので、next に、認められたあとに進むcellか {} を書いてください",
+                        p.name,
+                        transition::STOP
+                    ));
                 }
             }
         }
@@ -459,18 +520,7 @@ impl Config {
                     c.name
                 ));
             }
-            for next in &c.next {
-                if next == &c.name {
-                    problems.push(format!("cell「{}」の next に自分自身があります", c.name));
-                } else if !transition::is_reserved(next) && self.cell(next).is_none() {
-                    problems.push(format!(
-                        "cell「{}」の next の「{next}」が [[cell]] に定義されていません（cellの名前か {} か {} を書きます）",
-                        c.name,
-                        transition::DONE,
-                        transition::STOP
-                    ));
-                }
-            }
+            problems.extend(self.next_problems(c));
             if !c.label.starts_with(labels::PREFIX) || c.label.len() == labels::PREFIX.len() {
                 problems.push(format!(
                     "cell「{}」のラベル「{}」は {} で始めてください",
@@ -519,18 +569,6 @@ impl Config {
                 problems.push(format!(
                     "cell「{}」の max_rounds は1から{MAX_ROUNDS_LIMIT}までにしてください",
                     c.name
-                ));
-            }
-            if c.confirms()
-                && !c
-                    .next
-                    .iter()
-                    .any(|n| n == transition::STOP || self.cell(n).is_some())
-            {
-                problems.push(format!(
-                    "cell「{}」は着手を確かめるので、next に、認められたあとに進むcellか {} を書いてください",
-                    c.name,
-                    transition::STOP
                 ));
             }
             if let Some(model) = &c.model
@@ -751,6 +789,46 @@ timeout_minutes = 10
         );
         let text = text.replace("next = [\"done\"]", "next = [\"stop\", \"done\"]");
         assert!(Config::parse(&text, dir.path()).is_ok());
+    }
+
+    #[test]
+    fn products_can_change_where_a_cell_goes_next() {
+        // review は triage に進めるが、このproductでは止める
+        let text = VALID
+            .replace("cells = [\"triage\", \"review\"]", "cells = [\"review\"]")
+            .replace(
+                "[[cell]]\nname = \"triage\"",
+                "[product.next]\nreview = [\"stop\", \"done\"]\n\n[[cell]]\nname = \"triage\"",
+            )
+            .replace(
+                "timeout_minutes = 10",
+                "timeout_minutes = 10\nnext = [\"triage\", \"done\"]",
+            );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(&text, dir.path()).unwrap();
+        let product = &config.products[0];
+        assert_eq!(config.cell("review").unwrap().next, ["triage", "done"]);
+        assert_eq!(
+            config.cell_in(product, "review").unwrap().next,
+            ["stop", "done"]
+        );
+
+        // 書き替えた先も確かめる
+        let bad = text.replace("review = [\"stop\", \"done\"]", "review = [\"deploy\"]");
+        assert!(
+            problems_of(&bad)
+                .contains("product「agentcells」の next: cell「review」の next の「deploy」")
+        );
+        let bad = text.replace("review = [\"stop\", \"done\"]", "review = [\"triage\"]");
+        assert!(problems_of(&bad).contains("「triage」がこのproductの cells にありません"));
+        // このproductで動かないcellは書けない
+        let bad = text.replace(
+            "review = [\"stop\", \"done\"]",
+            "review = [\"done\"]\ntriage = [\"done\"]",
+        );
+        assert!(
+            problems_of(&bad).contains("next の「triage」が、このproductの cells にありません")
+        );
     }
 
     #[test]

@@ -521,6 +521,7 @@ mod tests {
             cells: vec!["triage".to_string()],
             commands: Default::default(),
             sandbox,
+            next: Default::default(),
         }
     }
 

@@ -6,6 +6,12 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.15.0] - 2026-10-25
+
+### 足したこと
+
+- productごとに、cellの進め先を替える `[product.next]`。cellはファイル全体で1つずつ定義するので、assessを、実装するproductでは implement に、agentcellsのように実装を人間がするproductでは stop に進めたいときに、書けなかったため。同じcellを2つのproductに書こうとすると、名前とラベルの重複でエラーになっていた
+
 ## [0.14.0] - 2026-10-25
 
 ### 足したこと

@@ -346,8 +346,13 @@ name = "agentcells"
 issues = "y-hirakaw/agentcells"    # Issueを置くリポジトリ
 repos = ["y-hirakaw/agentcells"]   # 作業するリポジトリ
 cells = ["triage", "implement", "review"]
+
+[product.next]                     # このproductでだけ、cellの進め先を替える（書かなければ [[cell]] の next）
+assess = ["stop", "done"]
 ```
 
+- cellはファイル全体で1つずつ定義し、productは `cells` で名前を選ぶ（同じ名前のcellを2つは書けない。拾うラベルも1つずつ）。同じcellでも、productによって進め先を変えたいとき（assessが、実装するproductでは implement に、実装を人間がするproductでは stop に進む、など）は、`[product.next]` に書く。書き替えた進め先も、`[[cell]]` の next と同じように確かめる（定義されたcellか、done・stop か、そのproductの cells にあるか）。`agentcells prompt show <cell> --issue owner/repo#N` は、そのIssueのproductでの進め先で表示する
+- 2つのproductが同じリポジトリで同じcellを動かすと、設定で先に書いたproductで動く（その進め先になる）
 - PRは作業するリポジトリに作り、Issueにリンクをコメントする
 - 作業は仕事ごとの作業場所（このドキュメントではworktreeと呼ぶ）で行う。人間がふだん使っているcloneとは別に、作業用のcloneを `repos/` に持つ
 - 仕事ごとの作業場所は、`git worktree add` ではなく、`repos/` のcloneから `git clone --shared --separate-git-dir=gitdirs/...` で作る（予定）。オブジェクトは共有して読むだけにし、`.git` の実体は仕事ごとに作業場所の外に置く。理由は「AIに許すこと」のsandboxを参照

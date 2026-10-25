@@ -581,6 +581,21 @@ pub fn show(
         }
         None => None,
     };
+    // Issue/PRを指したなら、そのproductでの進め先（[product.next]）にする。tickと同じく、
+    // Issueはproductの issues、PRは repos で選ぶ
+    let in_product = task
+        .as_ref()
+        .and_then(|t| {
+            config.products.iter().find(|p| {
+                p.cells.contains(&cell.name)
+                    && match t.item {
+                        Target::Issue => p.issues == t.repo,
+                        Target::PullRequest => p.repos.contains(&t.repo),
+                    }
+            })
+        })
+        .and_then(|p| config.cell_in(p, &cell.name));
+    let cell = in_product.as_ref().unwrap_or(cell);
     let extra_note = match &cell.prompt {
         Some(path) => format!("追加の指示は {}", path.display()),
         None => "追加の指示のファイルはありません".to_string(),
