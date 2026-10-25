@@ -46,6 +46,21 @@ pub struct Report {
     pub reason: Option<String>,
 }
 
+/// 動かしている途中の失敗。
+enum Failure {
+    /// ふつうの失敗。人間に回すコメントとラベルを書く
+    Error(Error),
+    /// AIが動かしたプロセスを止めきれなかった。残ったプロセスにトークンを読まれうるので、
+    /// トークンを作らず、GitHubには何も書かない（`ac:working` は付いたまま。人が片付ける）
+    Unstopped(Error),
+}
+
+impl From<Error> for Failure {
+    fn from(e: Error) -> Self {
+        Failure::Error(e)
+    }
+}
+
 /// 今は動かせない仕事なら、その理由。
 pub fn unsupported(work: &Work, cell: &Cell) -> Option<String> {
     if work.item != Target::Issue {
@@ -104,27 +119,38 @@ impl Runner<'_> {
         place.clean();
         match result {
             Ok(report) => Ok(report),
-            Err(e) => {
-                // 詳しいことは、手元の記録とtickの出力に残す。公開のIssueには、決まった短い文だけを書く
-                let _ = std::fs::create_dir_all(&place.run);
-                let _ = std::fs::write(
-                    place.run.join("error.txt"),
-                    format!("{}\n{}\n", e.message, e.hint.clone().unwrap_or_default()),
-                );
-                let text = format!(
-                    "実行できませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください。\n\n直したら、ラベル「{}」を付け直すと、もう一度動きます。",
-                    place.run_name(),
-                    cell.label
-                );
-                // round 0 の目印は、往復の回数に数えない
-                if let Ok(write) = self.write_credentials(&work.repo) {
-                    let _ = issue.comment(&write, &marker::comment(&cell.name, 0, &text));
-                    let _ = issue.edit_labels(&write, &[NEEDS_HUMAN], &[&cell.label, WORKING]);
-                    write.revoke(self.probe);
-                }
-                Err(e)
-            }
+            Err(failure) => Err(self.fail(failure, cell, &issue, &place)),
         }
+    }
+
+    /// 失敗したときの片付け。詳しいことは手元の記録（`error.txt`）とtickの出力に残し、
+    /// 公開のIssueには、決まった短い文だけを書いて人間に回す。
+    /// プロセスを止めきれなかったときは、トークンを作らず、GitHubには何も書かない。
+    fn fail(&self, failure: Failure, cell: &Cell, issue: &Issue, place: &Place) -> Error {
+        let (e, write_to_github) = match failure {
+            Failure::Error(e) => (e, true),
+            Failure::Unstopped(e) => (e, false),
+        };
+        let _ = std::fs::create_dir_all(&place.run);
+        let _ = std::fs::write(
+            place.run.join("error.txt"),
+            format!("{}\n{}\n", e.message, e.hint.clone().unwrap_or_default()),
+        );
+        if !write_to_github {
+            return e;
+        }
+        let text = format!(
+            "実行できませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください。\n\n直したら、ラベル「{}」を付け直すと、もう一度動きます。",
+            place.run_name(),
+            cell.label
+        );
+        // round 0 の目印は、往復の回数に数えない
+        if let Ok(write) = self.write_credentials(issue.repo) {
+            let _ = issue.comment(&write, &marker::comment(&cell.name, 0, &text));
+            let _ = issue.edit_labels(&write, &[NEEDS_HUMAN], &[&cell.label, WORKING]);
+            write.revoke(self.probe);
+        }
+        e
     }
 
     fn write_credentials(&self, repo: &RepoName) -> Result<Credentials> {
@@ -138,7 +164,7 @@ impl Runner<'_> {
         cell: &Cell,
         issue: &Issue,
         place: &mut Place,
-    ) -> Result<Report> {
+    ) -> std::result::Result<Report, Failure> {
         let work_repo = place_repo(product)?;
         // claudeを動かす前に作ったトークンは、動かす前にすべて取り消す
         let issue_read = github::credentials(self.config, self.probe, &work.repo, Purpose::Read)?;
@@ -167,13 +193,16 @@ impl Runner<'_> {
             Prepared::Ready(ready) => ready,
         };
 
-        let finished = ready.claude(self, cell, place).run()?;
+        let finished = match ready.claude(self, cell, place).run()? {
+            ClaudeEnd::Unstopped(e) => return Err(Failure::Unstopped(e)),
+            other => other,
+        };
 
         // AIの動かしたものをすべて止めたあとで、書き込みのトークンを作る
         let write = self.write_credentials(&work.repo)?;
         let result = self.finish(work, product, cell, issue, place, &ready, finished, &write);
         write.revoke(self.probe);
-        result
+        Ok(result?)
     }
 
     /// claudeを動かす前の用意。ガードで見送るときは `Skipped`。
@@ -337,6 +366,7 @@ impl Runner<'_> {
                 Ok(value) => Outcome::from_result(&value),
                 Err(e) => Err(format!("AIの出力を読めません: {e}")),
             },
+            ClaudeEnd::Unstopped(e) => return Err(e),
         };
         let (requested, text) = match outcome {
             Ok(outcome) => (outcome.next, outcome.comment),
@@ -754,6 +784,8 @@ struct ClaudeRun<'a> {
 enum ClaudeEnd {
     Exited(String),
     TimedOut,
+    /// AIが動かしたプロセスを止めきれなかった
+    Unstopped(Error),
 }
 
 /// claudeに渡す環境変数。使う人の環境変数（`SSH_AUTH_SOCK`、`AWS_*`、ほかのツールのトークンなど）は、
@@ -769,6 +801,15 @@ const PASSED_ENV: &[&str] = &[
     "TMPDIR",
     "CLAUDE_CONFIG_DIR",
     "ANTHROPIC_API_KEY",
+    // 社内のproxyやCAの下で、claudeがAPIにつながるように（URLに資格情報を書いていれば、コマンドからも見える）
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
 ];
 
 impl ClaudeRun<'_> {
@@ -891,7 +932,9 @@ impl ClaudeRun<'_> {
         }
         let stopped = seen.stop_all(pid);
         let _ = child.wait();
-        stopped?;
+        if let Err(e) = stopped {
+            return Ok(ClaudeEnd::Unstopped(e));
+        }
         if timed_out {
             return Ok(ClaudeEnd::TimedOut);
         }
@@ -1032,7 +1075,8 @@ impl Processes {
                     continue;
                 }
                 let parent_known = self.same(&rows, *ppid);
-                if parent_known || self.groups.contains(pgid) {
+                // グループの番号は使い回されるので、覚えたプロセスがまだいるグループだけを見る
+                if parent_known || (self.groups.contains(pgid) && self.valid_group(&rows, *pgid)) {
                     self.known.entry(*pid).or_insert_with(|| started.clone());
                     // 自分のグループを作ったもの（Claude CodeのBashなど）は、そのグループも覚える
                     if *pgid > 1 {
@@ -1045,6 +1089,11 @@ impl Processes {
             }
         }
         rows
+    }
+
+    /// グループに、覚えているものと同じプロセスがまだいるか（いなければ、番号が使い回されたかもしれない）。
+    fn valid_group(&self, rows: &[(u32, u32, u32, String)], group: u32) -> bool {
+        rows.iter().any(|r| r.2 == group && self.same(rows, r.0))
     }
 
     /// `pid` が、覚えているものと同じプロセス（始まった時刻も同じ）か。
@@ -1074,7 +1123,7 @@ impl Processes {
             if alive.is_empty() {
                 return Ok(());
             }
-            for group in &self.groups {
+            for group in self.groups.iter().filter(|g| self.valid_group(&rows, **g)) {
                 let _ = Command::new("kill")
                     .args(["-KILL", "--", &format!("-{group}")])
                     .stderr(Stdio::null())
@@ -1088,10 +1137,12 @@ impl Processes {
             }
             std::thread::sleep(Duration::from_millis(300));
         }
-        Err(
-            Error::new("AIが動かしたプロセスを止めきれませんでした。書き込みをせずに止めます")
-                .with_hint("残ったプロセスを止めてから、ラベルを付け直してください"),
+        Err(Error::new(
+            "AIが動かしたプロセスを止めきれませんでした。GitHubには何も書かずに止めます",
         )
+        .with_hint(
+            "残ったプロセスを止めてから、Issue/PRの ac:working を外し、ラベルを付け直してください",
+        ))
     }
 }
 
@@ -1316,6 +1367,76 @@ mod tests {
         assert!(unsupported(&work(Target::Issue, "triage"), &cell("triage")).is_none());
         assert!(unsupported(&work(Target::Issue, "implement"), &cell("implement")).is_some());
         assert!(unsupported(&work(Target::PullRequest, "review"), &cell("review")).is_some());
+    }
+
+    #[test]
+    fn unstopped_processes_mean_nothing_is_written_to_github() {
+        use crate::probe::fake::FakeProbe;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join(".agentcells"));
+        let config = Config::default();
+        let probe = FakeProbe::default()
+            .with("gh auth token --hostname github.com", true, "gho_test\n")
+            .with_fallback(true);
+        let actors = Actors {
+            operator: "me".to_string(),
+            writer: "me".to_string(),
+        };
+        let runner = Runner {
+            home: &home,
+            config: &config,
+            probe: &probe,
+            actors: &actors,
+            claude: Path::new("/x"),
+            agentcells: Path::new("/x"),
+            scanner: Path::new("/x"),
+            model: None,
+        };
+        let repo = RepoName::parse("octo/app").unwrap();
+        let issue = Issue {
+            probe: &probe,
+            repo: &repo,
+            number: 3,
+        };
+        let place = Place::new(&home, &repo, 3);
+        let cell = Cell {
+            name: "triage".to_string(),
+            on: vec![Target::Issue],
+            label: "ac:triage".to_string(),
+            prompt: None,
+            next: vec![],
+            review: false,
+            max_rounds: 3,
+            timeout_minutes: 30,
+        };
+        let e = runner.fail(
+            Failure::Unstopped(Error::new("止めきれませんでした")),
+            &cell,
+            &issue,
+            &place,
+        );
+        assert!(e.message.contains("止めきれません"));
+        // トークンを作るghもgitも、何も動かしていない
+        assert!(
+            probe.calls.borrow().is_empty(),
+            "{:?}",
+            probe.calls.borrow()
+        );
+        assert!(place.run.join("error.txt").exists());
+
+        // ふつうの失敗なら、人間に回すコメントとラベルを書く
+        runner.fail(Failure::Error(Error::new("失敗")), &cell, &issue, &place);
+        let calls = probe.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c.contains("issue comment 3")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("--add-label ac:needs-human")),
+            "{calls:?}"
+        );
     }
 
     #[test]

@@ -139,6 +139,7 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
 - このとき、リポジトリの CLAUDE.md は読み込まれない（`project` を読むときだけ読まれる。確かめた）。そこで、システムプロンプトで「CLAUDE.md や AGENTS.md があれば、始める前に読む」ように頼む
 - 環境変数は、要るもの（`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`CLAUDE_CONFIG_DIR`、`ANTHROPIC_API_KEY`）だけを渡す。使う人の環境変数（`SSH_AUTH_SOCK`、`AWS_*`、ほかのツールのトークンなど）を、AIとビルドに使わせないため。`PATH` の先頭には、AIが呼ぶ `agentcells` の場所を足す。claudeの認証は、macOSならキーチェーンを使うので、環境変数は要らない（確かめた）
 - `claude`、`betterleaks` の場所は、sandboxの外でPATHから探して決める
+- 社内のproxyやCAの下でも claude がAPIにつながるよう、`HTTPS_PROXY`、`HTTP_PROXY`、`NO_PROXY`（小文字も）、`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE` も渡す。proxyのURLに資格情報を書いていると、AIの動かすコマンドからも見える
 - 時間の上限は、cellの `timeout_minutes`。超えたらTERMを送り、3秒待ってから、下のとおりすべて止める
 
 AIが動かしたプロセスを止める:
@@ -148,7 +149,8 @@ AIが動かしたプロセスを止める:
 - Claude CodeのBashのシェルはすぐ終わり、残した子は `launchd`（PID 1）に付け替えられる。その前に一覧で見えないこともある（確かめた）。そこで、終わったときに、次のものも止める
   - 作業のディレクトリ（cwd）が、この仕事の場所（worktree、`.git` の実体、一時ディレクトリ、キャッシュ）の中にあるもの（macOSは `lsof -d cwd`、Linuxは `/proc/<pid>/cwd`）
   - 環境変数に、実行ごとの目印 `AGENTCELLS_RUN=<目印>` を持つもの（Linuxだけ。macOSでは、sandboxの中のプロセスの環境変数を読めない。確かめた）
-- 止めたあとに残っていないことを確かめる。止めきれなければ、書き込みをせずにエラーにする
+- 止めたあとに残っていないことを確かめる。止めきれなければ、書き込みのトークンを作らず、GitHubには何も書かずにエラーにする（コメントもラベルの付け替えもしない）。`ac:working` は付いたままなので、次のtickもその仕事を拾わない。人が残ったプロセスを止め、`ac:working` を外して、cellのラベルを付け直す
+- プロセスグループの番号も使い回されるので、覚えたプロセス（始まった時刻も同じもの）がまだいるグループだけを止める
 - 本物の `claude -p` で、AIが `nohup ... &` で残したプロセスが止まることを確かめるテストがある（`cargo test -- --ignored real_claude`。haikuを使う）
 
 残る危険:

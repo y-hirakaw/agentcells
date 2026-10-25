@@ -112,6 +112,7 @@ cellの定義（拾う条件、プロンプト、止まる条件、往復の上�
 - betterleaksが秘密でないものを見つけたとき（誤検知）に、人間が見逃してよいと決める方法。今はコミットできず、人間に回る
 - sandboxで止めた通信の先を、AIの報告に任せず、CLIがClaude Codeの出力（`<sandbox_violations>`）から拾って、人間へのコメントに足すとよい設定を書く
 - Claude Desktopのルーティン（A）で、sandboxの設定（読ませる場所、通信してよい先）をどう渡すか。`--settings` を渡せないので、ユーザー設定か作業フォルダの設定に書くことになる（実機で確かめる）
+- implementをつなぐときに、`agentcells cell commit` で、人がそのブランチを開いたときに自動で動くもの（`.claude/`、`.mcp.json`、`.vscode/tasks.json`、`.devcontainer/`、`.envrc`、`.husky/`）の変更を断る。Editのdenyでは、ビルドの中から書くのを止められないため
 - PRのブランチに、cellを使う人とagentcells以外の人がpushしたコミットがあれば止める。今は確かめていない（GitHubのAPIでは、誰がpushしたかを確かめにくい。agentcellsがpushしたコミットを覚えておき、それと違えば止める形を考えている）
 
 ## 決まっていないこと
