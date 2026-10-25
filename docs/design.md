@@ -107,12 +107,56 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
 
 ## tick
 
-`agentcells tick` を定期実行で呼ぶ。今は `--dry-run` で、仕事を探して表示するところまで。
+`agentcells tick` を定期実行で呼ぶ。仕事を探し、1回のtickでは1件だけcellを動かす。`--dry-run` なら、探して表示するだけ。今動かせるのは、コミットを要らないIssueのcell（triageなど）だけ。implementとPRの仕事は、pushとPRの作成、レビューの投稿をつなぐときに動かす（見つかっても「まだ動かせません」と出して飛ばす）。
 
 - 仕事は、cellのラベルが付いていて、`ac:working` も `ac:needs-human` も付いていない、開いているIssue/PR。Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す
-- productとcellを設定の順に見て、同じcellの中では番号の小さい順に並べる。1回のtickでは1件ずつ動かす（予定）
+- productとcellを設定の順に見て、同じcellの中では番号の小さい順に並べる。1回のtickでは、そのうち今動かせる最初の1件を動かす
 - 一覧を読むときも、リポジトリごとの読み取り用のトークンと空のghの設定を使う
 - `~/.agentcells/tick.lock` をロックして、tickを同時に2つ動かさない。ほかのtickが動いていれば、何もせずに終わる
+- 試すときは、環境変数 `AGENTCELLS_MODEL`（`haiku` など）で `claude -p` のモデルを変えられる
+
+### 1件を動かす流れ
+
+`src/run.rs`。
+
+1. `ac:working` を付ける
+2. Issueを読み、もう一度ガード（「動かすIssue/PRを決める」）を通す。確かめてから読むまでの間の書き換えを見逃さないため。見送るときは、コメントをせずに `ac:working` だけ外す（外せなくても、コメントはしない）
+3. 作業の場所を作る。`repos/<owner>/<repo>` に作業するリポジトリのbareのcloneを作るか最新にし（`+refs/heads/*:refs/heads/*`）、そこから `git clone --shared --separate-git-dir=gitdirs/<owner>/<repo>/<番号>` で `worktrees/<owner>/<repo>/<番号>` を作る。毎回空にして作り直す。`files/` のファイルを置き、その中身のハッシュを覚える
+4. 今の仕事のファイル（`runs/<owner>/<repo>/<番号>/context.json`）と、`--settings` で渡す設定（`settings.json`）を書く。コミットの作者は、書き込みのアカウントの名前と `<id>+<ログイン>@users.noreply.github.com`
+5. ここまでに作ったGitHub Appのトークン（ラベル、読み取り）を取り消す（`DELETE /installation/token`）
+6. `claude -p` を動かす（下）。終わったら、claudeとその子孫のプロセスをすべて止める
+7. 止めたことを確かめてから、新しい書き込みのトークンを作る。AIの結果を読み、実行の前後で `ac:` のラベルが変わっていないかを確かめる（変わっていれば人間に回す）
+8. 投稿する本文の全体を、betterleaksで調べる。秘密らしいものがあれば、決まった文だけにして人間に回す。目印（`[agentcells] <cell> round <n>`）を付けてコメントする
+9. 次のcellのラベルを付けてから、今のcellのラベルと `ac:working` を外す。`done` なら閉じる
+10. 作業の場所（worktree、`.git` の実体、一時ディレクトリ）を消す。うまくいかなかったときも消す（置いた秘密のファイルを残さないため）。`runs/` の記録（AIの出力 `claude.json`、`claude.err`、エラー `error.txt`）は残す
+
+途中で失敗したら、`[agentcells] <cell> round 0`（往復の回数に数えない）で「実行できませんでした。手元の記録（`~/.agentcells/runs/<owner>/<repo>/<番号>`）を確かめてください」とだけコメントし、`ac:needs-human` に回す。公開のIssueに、手元の絶対パスやエラーの中身（gitやghの標準エラー）を書かないため。詳しいことは、手元の記録とtickの出力に残す。
+
+`claude -p` の動かし方:
+
+- `--settings <runs/.../settings.json> --setting-sources "" --strict-mcp-config --append-system-prompt <システムプロンプト> --json-schema <結果の形> --output-format json`。プロンプトは標準入力で渡す
+- `--setting-sources ""` で、使う人の設定も、作業するリポジトリの設定（`.claude/settings.json`、`.claude/settings.local.json`）も読まない。リポジトリの設定のhooksは、sandboxの外で動き（確かめた）、AIがブランチに書けるため。設定に `disableAllHooks: true` も入れる。worktreeの `.claude/` への書き込みも止める
+- このとき、リポジトリの CLAUDE.md は読み込まれない（`project` を読むときだけ読まれる。確かめた）。そこで、システムプロンプトで「CLAUDE.md や AGENTS.md があれば、始める前に読む」ように頼む
+- 環境変数は、要るもの（`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`CLAUDE_CONFIG_DIR`、`ANTHROPIC_API_KEY`）だけを渡す。使う人の環境変数（`SSH_AUTH_SOCK`、`AWS_*`、ほかのツールのトークンなど）を、AIとビルドに使わせないため。`PATH` の先頭には、AIが呼ぶ `agentcells` の場所を足す。claudeの認証は、macOSならキーチェーンを使うので、環境変数は要らない（確かめた）
+- `claude`、`betterleaks` の場所は、sandboxの外でPATHから探して決める
+- 時間の上限は、cellの `timeout_minutes`。超えたらTERMを送り、3秒待ってから、下のとおりすべて止める
+
+AIが動かしたプロセスを止める:
+
+- Claude Codeは、Bashのコマンドを、自分とは別のプロセスグループで動かす。そのため、claudeのプロセスグループを止めても、ビルドやテストとその子は止まらない
+- 動いている間、0.1秒ごとにプロセスの一覧（`ps -A -o pid,ppid,pgid,lstart`）を読み、claudeの子孫と、そのプロセスグループを覚える。PIDは使い回されるので、始まった時刻と組にして覚え、同じものだけを止める
+- Claude CodeのBashのシェルはすぐ終わり、残した子は `launchd`（PID 1）に付け替えられる。その前に一覧で見えないこともある（確かめた）。そこで、終わったときに、次のものも止める
+  - 作業のディレクトリ（cwd）が、この仕事の場所（worktree、`.git` の実体、一時ディレクトリ、キャッシュ）の中にあるもの（macOSは `lsof -d cwd`、Linuxは `/proc/<pid>/cwd`）
+  - 環境変数に、実行ごとの目印 `AGENTCELLS_RUN=<目印>` を持つもの（Linuxだけ。macOSでは、sandboxの中のプロセスの環境変数を読めない。確かめた）
+- 止めたあとに残っていないことを確かめる。止めきれなければ、書き込みをせずにエラーにする
+- 本物の `claude -p` で、AIが `nohup ... &` で残したプロセスが止まることを確かめるテストがある（`cargo test -- --ignored real_claude`。haikuを使う）
+
+残る危険:
+
+- 環境変数を消し、作業の場所の外に移り、0.1秒より短い間に親から離れたプロセスは、止められないことがある。cellを専用のOSのユーザーで動かすと、確かに分けられる（concept.md）
+- 使う人が作業の場所にシェルで入っていると、そのシェルも止まる
+- `ANTHROPIC_API_KEY` で認証していると、その値がAIの動かすコマンドからも見える。`claude` にログインして使うことを勧める
+- ghのアカウントで書き込むときは、トークンは使う人のものなので取り消さない
 
 ### 動かすIssue/PRを決める
 
@@ -206,7 +250,7 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 
 - 原本はこのリポジトリで管理し、`agentcells setup` が `~/.agentcells` に置く
 - このリポジトリの `.claude/` は、agentcellsを開発するエージェントのための設定。cellとして動くエージェントの設定とは分ける
-- B（`claude -p`）は、worktreeの中で `--settings` にagentcellsの設定を渡し、`--setting-sources project,local` でグローバル設定を外して起動する。作業するリポジトリ自身の設定とCLAUDE.mdの上に、agentcellsの設定を重ねる形になる
+- B（`claude -p`）は、worktreeの中で `--settings` にagentcellsの設定を渡し、`--setting-sources ""` で、使う人の設定も作業するリポジトリの設定も読まずに起動する（「tick」の「1件を動かす流れ」）
 - A（ルーティン）は、作業フォルダを `~/.agentcells` にする。そこの `.claude/settings.json` とCLAUDE.mdが効く
 
 ### AIに許すこと
@@ -278,7 +322,7 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - `Read(//絶対パス)` の形でdenyを書ける。Readを禁止したファイルは、`Bash(cat:*)` を許していても `cat` で読めなかった（ただし、ほかのコマンドで読めないとまでは言えないので、秘密を守る仕組みの1つとして扱う）
 - `Bash(gh label:*)` や `Bash(gh api:*)` のdenyは、allowに同じものがあっても効いた（`gh repo view` のような許したコマンドは動く）
 - `--json-schema` の `enum` にない値は、AIに強く指示しても返せなかった。そのときは結果の `structured_output` が null になる
-- `--setting-sources project,local` でグローバル設定のhooksが止まるかは、まだ確かめていない
+- 作業するリポジトリの `.claude/settings.json` のhooksは、`--setting-sources project,local` だと動いた。`disableAllHooks: true` を `--settings` で渡すか、`--setting-sources ""` にすると、動かなかった（2026-10-25）
 
 ### sandboxに開ける場所
 
@@ -376,10 +420,10 @@ gitで書き込むとき（push）は、worktreeの `.git/config` をAIが書き
 - `GIT_TERMINAL_PROMPT=0` で、パスワードの入力を求めて止まらないようにする
 - テストでは本物のgitを動かし、書き換えた設定（`ext::`、`insteadOf`、URLごとのsslVerifyとproxy、hooksPath、helper）があっても、トークンが漏れないことを確かめる。守りを外すとテストが落ちることも確かめた
 
-ここまでは、どれも守りを重ねるためのもの。AIのBashは使う人と同じ権限で動くので、次がいちばんの守りになる（どちらも `tick` を作るときに入れる。予定）。
+ここまでは、どれも守りを重ねるためのもの。AIのBashは使う人と同じ権限で動くので、次がいちばんの守りになる。
 
 - 許すコマンドを絞る（`--settings` のallow）
-- `claude -p` のプロセスグループを終わらせてから、JWTやトークンを作る。AIが残したプロセスが生きていると、一時ディレクトリを書き換えたり、Linuxでは `/proc/<pid>/environ` からトークンを読んだりできるため
+- AIが動かしたプロセスをすべて止めてから、書き込みのトークンを作る。claudeを動かす前に作ったトークンは、動かす前に取り消す。AIが残したプロセスが生きていると、一時ディレクトリを書き換えたり、Linuxでは `/proc/<pid>/environ` からトークンを読んだりできるため（「tick」の「1件を動かす流れ」）
 
 ## gitignoreされたファイルの配置
 
