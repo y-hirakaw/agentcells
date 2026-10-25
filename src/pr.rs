@@ -692,11 +692,14 @@ mod tests {
                 git_in(&work, &["add", "-A"]);
                 git_in(&work, &["commit", "-q", "-m", "main"]);
                 git_in(&work, &["checkout", "-q", "ac/x"]);
+                // ぶつかって失敗で終わる（CIには使う人のgitの設定がないので、作者を渡す）
                 let _ = Command::new("git")
                     .arg("-C")
                     .arg(&work)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
                     .args(["merge", "-q", "main"])
                     .output();
+                assert!(work.join(".git/MERGE_HEAD").exists());
                 std::fs::write(work.join("a.txt"), resolved).unwrap();
                 if let Some((path, content)) = extra {
                     let full = work.join(path);
