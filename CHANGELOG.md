@@ -6,6 +6,12 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.10.0] - 2026-10-25
+
+### 追加
+
+- tickが、仕事を探す前に、閉じたIssue/PRに残ったagentcellsのラベル（`ac:in-review` など）を外す。検品を待っていたPRをマージすると `ac:in-review` が残り、ラベルで一覧を絞ったときに、終わったものが混ざるため。`--dry-run` なら、外す予定を出すだけ
+
 ## [0.9.1] - 2026-10-25
 
 ### 直したこと

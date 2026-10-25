@@ -18,6 +18,7 @@ use agentcells::run;
 use agentcells::setup;
 use agentcells::status;
 use agentcells::tick;
+use agentcells::tidy;
 
 #[derive(Parser)]
 #[command(version, about = "Issueを作ると、AIエージェントのcellが仕事を進める")]
@@ -263,6 +264,30 @@ fn run(command: Commands) -> Result<ExitCode> {
                 ),
                 Ok(_) => {}
                 Err(e) => println!("注意: ラベルを確かめられません: {}\n", e.message),
+            }
+            // 閉じたものに残ったラベルを片付ける。できなくても、仕事は進める
+            let (leftovers, errors) = tidy::find(&config, &SystemProbe, &credentials_for);
+            for error in &errors {
+                println!("注意: 片付けるものを探せません: {error}");
+            }
+            if dry_run {
+                for l in &leftovers {
+                    println!("片付ける予定: {} を外す", l.describe());
+                }
+            } else if !leftovers.is_empty() {
+                let write_for = |repo: &RepoName| {
+                    github::credentials(&config, &SystemProbe, repo, Purpose::Work)
+                };
+                let results = tidy::remove(&SystemProbe, &leftovers, &write_for);
+                for (l, result) in leftovers.iter().zip(results) {
+                    match result {
+                        Ok(()) => println!("片付け: {} を外しました", l.describe()),
+                        Err(e) => println!("注意: {} を外せません: {}", l.describe(), e.message),
+                    }
+                }
+            }
+            if !errors.is_empty() || !leftovers.is_empty() {
+                println!();
             }
             let mut quiet = tick::Quiet::load(&home);
             let found = tick::find(&config, &SystemProbe, &credentials_for, &actors, &mut quiet)?;

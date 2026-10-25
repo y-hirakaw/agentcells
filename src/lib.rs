@@ -19,4 +19,5 @@ pub mod settings;
 pub mod setup;
 pub mod status;
 pub mod tick;
+pub mod tidy;
 pub mod transition;
