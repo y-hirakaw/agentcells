@@ -59,6 +59,9 @@ enum Commands {
         /// 仕事が残っていれば、始めてからこの分数がたつまで、続けて動かす（0なら1件だけ）
         #[arg(long, default_value_t = 30)]
         max_minutes: u64,
+        /// 使用量の上限などで止まっている間でも動かす
+        #[arg(long)]
+        ignore_pause: bool,
     },
     /// tickの記録を調べてラインの不具合を見つけ、原因と直し方の案を書く（[inspector] を書いたとき。
     /// tickも、1日に1回、最後にこれを動かす）
@@ -298,6 +301,13 @@ fn run(command: Commands) -> Result<ExitCode> {
             if let Some(note) = run::stuck(&home) {
                 println!("  ※{note}");
             }
+            if let Some(pause) = agentcells::limit::active(&home, unix_now()) {
+                println!(
+                    "  ※{}のため、あと{}は、tickが新しく始めません",
+                    pause.reason,
+                    agentcells::running::elapsed(pause.until.saturating_sub(unix_now()))
+                );
+            }
             println!();
             let config = Config::load(&home.config_path())?;
             let credentials_for =
@@ -342,6 +352,7 @@ fn run(command: Commands) -> Result<ExitCode> {
         Commands::Tick {
             dry_run,
             max_minutes,
+            ignore_pause,
         } => {
             schedule::rotate_log(&home);
             let Some(_lock) = tick::lock(&home)? else {
@@ -350,6 +361,19 @@ fn run(command: Commands) -> Result<ExitCode> {
             };
             // ロックを取れたので、動いているcellはない。殺されたtickが残した印を片付ける
             agentcells::running::finish(&home);
+            // 使用量の上限などで止まっている間は、新しく始めない（試すだけなら、知らせて続ける）
+            if let Some(pause) = agentcells::limit::active(&home, unix_now())
+                && !ignore_pause
+            {
+                println!(
+                    "{}のため、あと{}は新しく始めません（急ぐときは `agentcells tick --ignore-pause`）",
+                    pause.reason,
+                    agentcells::running::elapsed(pause.until.saturating_sub(unix_now()))
+                );
+                if !dry_run {
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
             // 動いたことを記録する（inspectorの材料）。試すだけ（--dry-run）なら記録しない
             record::rotate(&home);
             let recorder = (!dry_run).then(|| record::Recorder::new(&home, unix_now()));
@@ -532,6 +556,11 @@ fn run(command: Commands) -> Result<ExitCode> {
                     let skipped = report.destination == "skipped";
                     match &report.reason {
                         Some(reason) if skipped => println!("見送りました: {reason}"),
+                        Some(reason) if report.destination == "paused" => {
+                            println!(
+                                "止めました: {reason}（人間には回さず、元のラベルに戻しました）"
+                            )
+                        }
                         Some(reason) => println!("{} に進めました（{reason}）", report.destination),
                         None => println!("{} に進めました", report.destination),
                     }
@@ -539,6 +568,25 @@ fn run(command: Commands) -> Result<ExitCode> {
                     runs = session.runs();
                     if report.ai_failed {
                         session.halt();
+                        // 使用量の上限なら戻る時刻まで、ほかの仕事も同じように失敗しそうなら（ログインの切れなど）
+                        // しばらく、新しく始めない
+                        let now = unix_now();
+                        let until = report.limited_until.or_else(|| {
+                            agentcells::limit::pauses_after(report.failure.as_deref())
+                                .then_some(now + agentcells::limit::AFTER_FAILURE)
+                        });
+                        if let Some(until) = until {
+                            let reason = if report.limited_until.is_some() {
+                                "使用量の上限"
+                            } else {
+                                "AIの実行の失敗"
+                            };
+                            agentcells::limit::pause(&home, until, reason);
+                            println!(
+                                "{reason}のため、あと{}は新しく始めません",
+                                agentcells::running::elapsed(until.saturating_sub(now))
+                            );
+                        }
                     }
                 }
                 Ok(config)

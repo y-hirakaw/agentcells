@@ -59,7 +59,8 @@ impl Masks {
     fn cell(&mut self, name: &str) -> String {
         let known = crate::prompt::builtin(name).is_some()
             || crate::transition::is_reserved(name)
-            || name == "skipped";
+            || name == "skipped"
+            || name == "paused";
         if known {
             name.to_string()
         } else {
@@ -145,7 +146,11 @@ pub fn find(lines: &[Line]) -> (Vec<Finding>, Value) {
                     );
                 }
                 last.insert(key, (cell.clone(), to.clone(), line.at));
-                if *ai_failed {
+                // 使用量の上限は、agentcellsの不具合ではない（戻るまで止まる）
+                let limited = failure
+                    .as_deref()
+                    .is_some_and(|f| f.starts_with("rate_limit"));
+                if *ai_failed && !limited {
                     add(
                         "ai-failed",
                         "AIの実行そのものが失敗した（failure: timeout は時間切れ、unreadable は出力を読めない、error:<種類> はclaudeが失敗を返した、no_output と bad_output は決まった形で返さなかった）",

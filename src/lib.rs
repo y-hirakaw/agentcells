@@ -11,6 +11,7 @@ pub mod guard;
 pub mod home;
 pub mod inspect;
 pub mod labels;
+pub mod limit;
 pub mod marker;
 pub mod pr;
 pub mod probe;

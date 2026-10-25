@@ -51,8 +51,11 @@ pub struct Report {
     pub round: u32,
     /// AIが選んだ先（結果が返らなかったときは `None`）
     pub requested: Option<String>,
-    /// AIの実行が失敗したときの種類（`timeout`、`unreadable`、`error:<claudeのsubtype>`、`no_output`、`bad_output`）
+    /// AIの実行が失敗したときの種類（`timeout`、`unreadable`、`error:<claudeのsubtype>`、`no_output`、`bad_output`、
+    /// 使用量の上限なら `rate_limit:<種類>`）
     pub failure: Option<String>,
+    /// 使用量の上限に当たったときの、戻る時刻（UNIXの秒）
+    pub limited_until: Option<u64>,
     /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
     pub pr: Option<u64>,
     /// 使ったモデル（指定しなかったら `None`）
@@ -381,6 +384,7 @@ impl Runner<'_> {
                     round: 0,
                     requested: None,
                     failure: None,
+                    limited_until: None,
                     pr: None,
                     model: None,
                     usage: Usage::default(),
@@ -700,6 +704,39 @@ impl Runner<'_> {
                 }
             }
         };
+        // 使用量の上限に当たったなら、人間には回さない。ac:working だけを外して元のラベルに戻し、
+        // 上限が戻ってから、同じ仕事をまた動かす（目印のコメントを書かないので、往復の回数にも数えない）
+        let limit = crate::limit::last_event(&place.run.join(CLAUDE_LOG));
+        // claudeがAPIの状態の番号として429を返したときも、上限とみなす
+        let too_many = failure.as_deref().is_some_and(|f| f.ends_with(":429"));
+        if ai_failed && (limit.as_ref().is_some_and(|l| l.rejected()) || too_many) {
+            let kind: String = limit
+                .as_ref()
+                .and_then(|l| l.kind.as_deref())
+                .unwrap_or("unknown")
+                .chars()
+                .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                .take(40)
+                .collect();
+            // 動いている間に人が外していれば、外さない（外すのに失敗して、人間に回らないように）
+            issue.edit_labels(write, &[], &present(&labels_after, &[WORKING], &[]))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            return Ok(Report {
+                destination: "paused".to_string(),
+                reason: Some(format!("使用量の上限（{kind}）に当たりました")),
+                ai_failed: true,
+                round,
+                requested: None,
+                failure: Some(format!("rate_limit:{kind}")),
+                limited_until: Some(crate::limit::until(limit.and_then(|l| l.resets_at), now)),
+                pr: None,
+                model: self.model.or(cell.model.as_deref()).map(str::to_string),
+                usage,
+            });
+        }
         if let Some(changed) = transition::tampered(&ready.labels_before, &labels_after) {
             overridden = Some(changed);
         }
@@ -847,6 +884,7 @@ impl Runner<'_> {
             round,
             requested: (!ai_failed).then(|| outcome.next.clone()),
             failure,
+            limited_until: None,
             pr: pr_number,
             model: self.model.or(cell.model.as_deref()).map(str::to_string),
             usage,
