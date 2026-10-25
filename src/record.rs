@@ -110,6 +110,9 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         ai_failed: bool,
+        /// AIの実行が失敗したときの種類（決まった語）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// claudeが実際に使ったモデル（claudeの結果の `modelUsage`）
@@ -128,6 +131,18 @@ pub enum Event {
         started: u64,
         seconds: u64,
         error: String,
+    },
+    /// inspectorが動いた
+    Inspected {
+        /// 規則で見つけた気になることの数
+        findings: usize,
+        /// 作ったIssueと、また起きたとコメントしたIssueの番号
+        created: Vec<u64>,
+        commented: Vec<u64>,
+        /// 出さずに手元に残した案の数
+        kept: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// tickが終わった。`why` は `no_work`、`limit`、`ai_failed`、`stuck`、`error`（`error` と `stuck` ならその中身）
     Ended {
@@ -150,6 +165,7 @@ impl Event {
             pr: report.pr,
             reason: report.reason.clone(),
             ai_failed: report.ai_failed,
+            failure: report.failure.clone(),
             model: report.model.clone(),
             models: report.usage.models.clone(),
             turns: report.usage.turns,
@@ -214,13 +230,17 @@ fn append(path: &Path, line: &Line) -> std::io::Result<()> {
         .write_all(text.as_bytes())
 }
 
-/// 記録を読む。読めない行は飛ばす。
+/// 記録を読む（回した `events.jsonl.1` から順に）。読めない行は飛ばす。
 pub fn read(home: &Home) -> Vec<Line> {
-    let Ok(text) = std::fs::read_to_string(path(home)) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
+    let path = path(home);
+    [path.with_extension("jsonl.1"), path]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect::<Vec<Line>>()
+        })
         .collect()
 }
 
@@ -253,6 +273,7 @@ mod tests {
             ai_failed: false,
             round: 2,
             requested: Some("review".into()),
+            failure: None,
             pr: None,
             model: Some("sonnet".into()),
             usage: Usage {

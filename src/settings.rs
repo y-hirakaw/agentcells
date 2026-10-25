@@ -370,6 +370,20 @@ fn user_home_or_root() -> PathBuf {
     user_home().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// ファイルを読むだけのclaude（inspector）の設定。`-p` では作業場所の外は読めないが、念のため、
+/// cellと同じ守る場所（agentcellsの置き場所、Appの鍵、ghの設定、~/.ssh など）のReadも断る。
+pub fn reader_settings(home: &Home, config: &Config) -> Result<serde_json::Value> {
+    let mut deny = vec!["WebFetch".to_string(), "WebSearch".to_string()];
+    for place in protected_places(home, config)? {
+        rule(&mut deny, "Read", &place, "")?;
+        rule(&mut deny, "Read", &place, "/**")?;
+    }
+    Ok(json!({
+        "disableAllHooks": true,
+        "permissions": { "allow": [], "deny": deny },
+    }))
+}
+
 /// 開けた場所の中にあっても読ませない場所。
 fn protected_places(home: &Home, config: &Config) -> Result<Vec<PathBuf>> {
     let mut places = vec![home.root().to_path_buf()];

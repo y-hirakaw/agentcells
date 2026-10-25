@@ -11,6 +11,7 @@ use agentcells::files;
 use agentcells::github::{self, Purpose};
 use agentcells::guard;
 use agentcells::home::{Home, RepoName};
+use agentcells::inspect;
 use agentcells::labels;
 use agentcells::probe::SystemProbe;
 use agentcells::prompt;
@@ -58,6 +59,13 @@ enum Commands {
         /// 仕事が残っていれば、始めてからこの分数がたつまで、続けて動かす（0なら1件だけ）
         #[arg(long, default_value_t = 30)]
         max_minutes: u64,
+    },
+    /// tickの記録を調べてラインの不具合を見つけ、原因と直し方の案を書く（[inspector] を書いたとき。
+    /// tickも、1日に1回、最後にこれを動かす）
+    Inspect {
+        /// AIは動かさずに、規則で見つけたもの（AIに渡す、伏せ字にした記録）だけを表示する
+        #[arg(long)]
+        dry_run: bool,
     },
     /// 動いているcellと、agentcellsが扱っているIssueごとに、今どこまで進んでいるかを出す（読むだけ）
     Status {
@@ -357,7 +365,7 @@ fn run(command: Commands) -> Result<ExitCode> {
             // 終わった理由を記録する。ここから先でエラーになったら error とその中身
             let mut why = "error";
             let mut runs = 0;
-            let result = (|| -> Result<()> {
+            let result = (|| -> Result<Config> {
                 // 前の実行でAIのプロセスを止めきれなかったら、それが残っている間は何も動かさない
                 // （次の仕事の書き込みのトークンを、残ったプロセスに読ませないため）
                 if let Some(note_text) = run::stuck(&home) {
@@ -533,14 +541,54 @@ fn run(command: Commands) -> Result<ExitCode> {
                         session.halt();
                     }
                 }
-                Ok(())
+                Ok(config)
             })();
             note(record::Event::Ended {
                 runs,
                 why: why.to_string(),
                 error: result.as_ref().err().map(|e| e.message.clone()),
             });
-            result?;
+            let config = result?;
+            // 1日に1回（設定した間隔ごとに）、最後にinspectorを動かす。AIの失敗や残ったプロセスで止まったときは動かさない
+            if let Some(inspector) = &config.inspector
+                && matches!(why, "no_work" | "limit")
+                && inspect::due(&home, inspector, unix_now())
+            {
+                println!("\n--- inspector");
+                match inspect_now(&home, &config, inspector, &note) {
+                    Ok(summary) => print_inspection(&summary),
+                    Err(e) => println!("注意: inspectorが動けませんでした: {}", e.message),
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Inspect { dry_run } => {
+            if dry_run {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&inspect::preview(&home)).unwrap_or_default()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            let config = Config::load(&home.config_path())?;
+            let Some(inspector) = &config.inspector else {
+                return Err(Error::new("config.toml に [inspector] がありません")
+                    .with_hint("雛形のコメント（`agentcells setup` で作ったもの）を見て、[inspector] を書いてください"));
+            };
+            // tickと重ならないように、同じロックを取る
+            let Some(_lock) = tick::lock(&home)? else {
+                println!("tickが動いているので、終わってからもう一度実行してください");
+                return Ok(ExitCode::SUCCESS);
+            };
+            if let Some(note_text) = run::stuck(&home) {
+                return Err(
+                    Error::new(note_text).with_hint("`agentcells doctor` でも確かめられます")
+                );
+            }
+            let recorder = record::Recorder::new(&home, unix_now());
+            let note = |event: record::Event| recorder.write(unix_now(), event);
+            let summary = inspect_now(&home, &config, inspector, &note)?;
+            print_inspection(&summary);
             Ok(ExitCode::SUCCESS)
         }
         Commands::Prompt {
@@ -628,6 +676,75 @@ fn schedule_plist() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .map(|home| schedule::plist_path(Path::new(&home)))
+}
+
+/// inspectorを動かし、記録に残す。
+fn inspect_now(
+    home: &Home,
+    config: &Config,
+    inspector: &agentcells::config::Inspector,
+    note: &dyn Fn(record::Event),
+) -> Result<inspect::Summary> {
+    let result = (|| {
+        let claude = find_program("claude").ok_or_else(|| {
+            Error::new("claudeが見つかりません").with_hint("`agentcells doctor` で確かめてください")
+        })?;
+        let scanner = find_program("betterleaks").ok_or_else(|| {
+            Error::new("betterleaksが見つかりません")
+                .with_hint("`agentcells doctor` で確かめてください")
+        })?;
+        let writer = prompt::writer_login(config, &SystemProbe)?;
+        inspect::run(&inspect::Context {
+            home,
+            config,
+            inspector,
+            probe: &SystemProbe,
+            claude: &claude,
+            scanner: &scanner,
+            writer: &writer,
+            now: unix_now(),
+        })
+    })();
+    note(match &result {
+        Ok(s) => record::Event::Inspected {
+            findings: s.findings,
+            created: s.created.clone(),
+            commented: s.commented.clone(),
+            kept: s.kept,
+            error: None,
+        },
+        Err(e) => record::Event::Inspected {
+            findings: 0,
+            created: Vec::new(),
+            commented: Vec::new(),
+            kept: 0,
+            error: Some(e.message.clone()),
+        },
+    });
+    result
+}
+
+fn print_inspection(summary: &inspect::Summary) {
+    if summary.findings == 0 {
+        println!("気になることはありませんでした");
+        return;
+    }
+    println!("気になること: {}件", summary.findings);
+    for number in &summary.created {
+        println!("  Issueを作りました: #{number}");
+    }
+    for number in &summary.commented {
+        println!("  また起きたとコメントしました: #{number}");
+    }
+    if summary.kept > 0 {
+        println!("  出さずに手元に残した案: {}件", summary.kept);
+    }
+    for note in &summary.notes {
+        println!("  注意: {note}");
+    }
+    if let Some(report) = &summary.report {
+        println!("  記録: {}", report.display());
+    }
 }
 
 /// PATHから、プログラムの絶対パスを探す。AIに別のものを動かされないよう、sandboxの外で決めておく。

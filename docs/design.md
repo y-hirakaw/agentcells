@@ -201,6 +201,47 @@ tickは、動いたことを `~/.agentcells/logs/events.jsonl` に、1行に1件
 - 5MBを超えたら、tickの最初に `events.jsonl.1` に回す（前の `.1` は消える）。書けなくても、tickは止めない
 - `--dry-run` のときは書かない
 
+### inspector
+
+ラインそのものの不具合を見つける（concept.md の「監視と改善」の1段目）。`[inspector]` を書いたときだけ動く。
+
+```toml
+[inspector]
+issues = "your-login/agentcells"  # agentcells自体の不具合をIssueにして出す先（書かなければ手元に残すだけ）
+every_hours = 24                  # 何時間ごとに動かすか（省略すると24）
+model = "sonnet"
+timeout_minutes = 30
+```
+
+- tickの最後に、前回から `every_hours` がたっていれば動く（仕事がなくなったか、上限で終わったときだけ。AIの失敗や残ったプロセスで止まったときは動かさない）。tickのロックの中で動くので、cellとは重ならない。そのぶん、tickは `--max-minutes` を超えて（最大で inspector の `timeout_minutes` だけ）続き、その間の定期実行は何もしない。`agentcells inspect` で、今すぐ動かせる（ロックを取る）
+- 動き始めたら、うまくいかなくても「最後に動いた時刻」を進める。失敗し続けるときに、tickのたびにAIを動かし直したり、公開のIssueにコメントを重ねたりしないため（次に動くのは、間隔がたってから）。調べたところは、終わりまで行けたときだけ進めるので、失敗した分は次に調べ直す。記録が `events.jsonl.1` に回っていても、続けて読む
+- 前回より後の記録（`events.jsonl`）を、決まった規則で調べる（AIなし）
+
+| 目印 | 規則 |
+| --- | --- |
+| `same-cell-twice` | 同じtickで、同じIssue/PRに、同じcellが続けて動いた（人間の返事で動いたものは除く） |
+| `ai-failed` | AIの実行そのものが失敗した（種類も渡す: `timeout`、`unreadable`、`error:<claudeのsubtype>`（APIの状態の番号があれば `error:<subtype>:<番号>`。使用量の上限なら429など）、`no_output`、`bad_output`。記録の `ran` の `failure`） |
+| `routed-to-human` | AIが選んだ先ではなく、CLIが人間に回した |
+| `run-failed` | cellを動かしている途中で、エラーで止まった |
+| `skipped-repeatedly` | 同じIssue/PRが、3回以上のtickで、動かす前の確かめで見送られた |
+| `tidy-failed` | 閉じたものに残ったラベルを外せなかった |
+| `tick-error` / `tick-stuck` / `tick-killed` | tickがエラーで終わった / 残ったプロセスで動けなかった / 終わりの記録がない |
+
+- 何も見つからなければ、AIは動かさない
+- 前に出したIssue（書き込みのアカウントが作り、本文に `<!-- agentcells inspector <目印> -->` があるもの。新しいものから500件まで）を見て、目印ごとに決める。目印はCLIが本文の最後に足し、AIの本文にある目印の形の行は取り除くので、本文の最後の目印を使う（人が後ろに書き足しても見つける）
+  - 開いている: 新しく作らずに、最後に「また N 件ありました」とコメントする（ほかがすべて終わってから）
+  - 直さないと決めて閉じた（not planned）か、重複として閉じた: 作り直さない
+  - 直して閉じた: また起きたので、AIに聞き直す（作るときは、前のIssueの番号を書く）
+  - AIが前に見送った目印は、7日のあいだ聞き直さない（`inspector/state.json`）
+- 残りを、AI（`claude -p`）に渡す。AIは、動いているものと同じ版のagentcellsのソース（タグ `v<版>` を一時ディレクトリに浅くclone。使う人のgitの設定は読まない。タグがなければ既定のブランチ）を読み、目印ごとに、Issueにする（題、起きたこと、原因、直し方の案、確かめ方）か、不具合ではないとして見送るかを決める
+  - 使えるツールは Read、Grep、Glob だけ（`--tools`）。`-p` では作業場所の外を読むには許しが要り、許していないので、cloneの外は読めない（2026-10-25に、外のファイルへのRead、Grep、Globが断られることを確かめた）。念のため、cellと同じ守る場所のReadも断る。hooksは動かさず、使う人とリポジトリの設定は読まない
+  - 止めきれないプロセスが残れば、cellと同じく `stuck.json` を残し、次のtickは動かない
+- 公開の場所に出すので、AIに渡す記録は伏せ字にする（`repo-1`、`item-1`、`tick-1`、使う人が足したcellは `cell-1`）。product名、リポジトリ名、番号、理由やエラーの文は渡さない（標準のcellの名前、進め先、秒数、モデル、失敗の種類は渡す）
+- 出す前に、題と本文に、productやリポジトリの名前（出す先のリポジトリの名前は除く。大文字・小文字は区別せず、語として現れるものだけ。`app` が `application` に当たらないように）と、秘密らしいもの（betterleaks）がないかを確かめる。あれば、または調べられなければ、出さずに手元に残す
+- 作ったIssueにはラベルを付けない。operatorがラベルを付けたもの（assessなど）だけが、cellに流れる
+- 手元に、AIに渡したもの、AIの答え、出したものと残したものを `~/.agentcells/inspector/runs/<時刻>/report.json` に残す（claudeの出力も同じ場所。権限は600）。どこまで調べたかは `inspector/state.json`。記録には `inspected` を書く
+- 1日に1回、見つけたものがあるときだけAIを動かすので、使用量は小さい
+
 ### 1件を動かす流れ
 
 `src/run.rs`。

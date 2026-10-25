@@ -51,6 +51,8 @@ pub struct Report {
     pub round: u32,
     /// AIが選んだ先（結果が返らなかったときは `None`）
     pub requested: Option<String>,
+    /// AIの実行が失敗したときの種類（`timeout`、`unreadable`、`error:<claudeのsubtype>`、`no_output`、`bad_output`）
+    pub failure: Option<String>,
     /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
     pub pr: Option<u64>,
     /// 使ったモデル（指定しなかったら `None`）
@@ -77,6 +79,28 @@ impl Usage {
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default(),
         }
+    }
+}
+
+/// claudeの結果から、失敗の種類を決まった語で返す。claudeの `subtype` は、英小文字と _ だけを使う。
+fn failure_kind(result: &serde_json::Value) -> String {
+    if result["is_error"].as_bool() == Some(true) {
+        let subtype: String = result["subtype"]
+            .as_str()
+            .unwrap_or("unknown")
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || *c == '_')
+            .take(40)
+            .collect();
+        // 使用量の上限などは、APIの状態の番号（429など）で見分けられる
+        match result["api_error_status"].as_u64() {
+            Some(status) => format!("error:{subtype}:{status}"),
+            None => format!("error:{subtype}"),
+        }
+    } else if result["structured_output"].is_null() {
+        "no_output".to_string()
+    } else {
+        "bad_output".to_string()
     }
 }
 
@@ -356,6 +380,7 @@ impl Runner<'_> {
                     ai_failed: false,
                     round: 0,
                     requested: None,
+                    failure: None,
                     pr: None,
                     model: None,
                     usage: Usage::default(),
@@ -638,17 +663,29 @@ impl Runner<'_> {
         let mut overridden: Option<String> = None;
         let mut ai_failed = false;
         let mut usage = Usage::default();
+        // AIの実行が失敗したときの種類（決まった語だけ。inspectorが、自由な文を読まずに数えるため）
+        let mut failure = None;
         let outcome = match finished {
-            ClaudeEnd::TimedOut => Err(format!(
-                "時間の上限（{}分）を超えたので、止めました",
-                cell.timeout_minutes
-            )),
+            ClaudeEnd::TimedOut => {
+                failure = Some("timeout".to_string());
+                Err(format!(
+                    "時間の上限（{}分）を超えたので、止めました",
+                    cell.timeout_minutes
+                ))
+            }
             ClaudeEnd::Exited(stdout) => match serde_json::from_str::<serde_json::Value>(&stdout) {
                 Ok(value) => {
                     usage = Usage::from_result(&value);
-                    Outcome::from_result(&value)
+                    let outcome = Outcome::from_result(&value);
+                    if outcome.is_err() {
+                        failure = Some(failure_kind(&value));
+                    }
+                    outcome
                 }
-                Err(e) => Err(format!("AIの出力を読めません: {e}")),
+                Err(e) => {
+                    failure = Some("unreadable".to_string());
+                    Err(format!("AIの出力を読めません: {e}"))
+                }
             },
         };
         let outcome = match outcome {
@@ -809,6 +846,7 @@ impl Runner<'_> {
             ai_failed,
             round,
             requested: (!ai_failed).then(|| outcome.next.clone()),
+            failure,
             pr: pr_number,
             model: self.model.or(cell.model.as_deref()).map(str::to_string),
             usage,
@@ -1038,6 +1076,7 @@ impl Ready {
             path_prefix: runner.agentcells.parent(),
             // 試すときの指定（AGENTCELLS_MODEL）を、cellの設定より先にする
             model: runner.model.or(cell.model.as_deref()),
+            tools: None,
             timeout: Duration::from_secs(u64::from(cell.timeout_minutes) * 60),
             log_dir: &place.run,
             job_dirs: &self.job_dirs,
@@ -1372,6 +1411,8 @@ struct ClaudeRun<'a> {
     /// AIが呼ぶ `agentcells` を、PATHの先頭で見つけさせる
     path_prefix: Option<&'a Path>,
     model: Option<&'a str>,
+    /// 使えるツール（`--tools`）。`None` なら標準のまま（設定のallowとdenyで絞る）
+    tools: Option<&'a str>,
     timeout: Duration,
     /// 標準出力と標準エラーを残す場所
     log_dir: &'a Path,
@@ -1438,6 +1479,9 @@ impl ClaudeRun<'_> {
         .collect();
         if let Some(model) = self.model {
             args.extend(["--model".to_string(), model.to_string()]);
+        }
+        if let Some(tools) = self.tools {
+            args.extend(["--tools".to_string(), tools.to_string()]);
         }
         args
     }
@@ -1565,6 +1609,70 @@ impl ClaudeRun<'_> {
         let stdout = std::fs::read_to_string(&stdout_path)
             .map_err(|e| Error::new(format!("claudeの出力を読めません: {e}")))?;
         Ok(ClaudeEnd::Exited(result_line(&stdout).to_string()))
+    }
+}
+
+/// cellの外で、ファイルを読むだけのclaudeを動かす（inspector）。使えるツールは Read、Grep、Glob だけで、
+/// 読めるのは `cwd` の中だけ（`-p` では、作業場所の外を読むには許しが要り、許していないので止まる）。
+pub struct Reader<'a> {
+    pub home: &'a Home,
+    pub claude: &'a Path,
+    pub cwd: &'a Path,
+    /// `--settings` に渡すファイル
+    pub settings: &'a Path,
+    pub system: &'a str,
+    pub schema: &'a serde_json::Value,
+    pub prompt: &'a str,
+    pub model: Option<&'a str>,
+    pub timeout: Duration,
+    /// 出力（`claude.jsonl`）を残す場所
+    pub log_dir: &'a Path,
+}
+
+impl Reader<'_> {
+    /// 動かして、結果の行（`"type":"result"`）を返す。時間切れなら `None`。止めきれなかったプロセスがあれば、
+    /// `stuck.json` を残してエラーを返す（cellと同じく、それが残っている間は次のtickが動かない）。
+    pub fn run(&self) -> Result<Option<serde_json::Value>> {
+        let context = self.log_dir.join("context.json");
+        let job_dirs = [self.cwd.to_path_buf()];
+        let run = ClaudeRun {
+            program: self.claude,
+            cwd: self.cwd,
+            settings: self.settings,
+            system: self.system,
+            schema: self.schema,
+            prompt: self.prompt,
+            context: &context,
+            path_prefix: None,
+            model: self.model,
+            tools: Some("Read,Grep,Glob"),
+            timeout: self.timeout,
+            log_dir: self.log_dir,
+            job_dirs: &job_dirs,
+            record: Some((stuck_path(self.home), "inspector".to_string())),
+        };
+        match run.run() {
+            Ok(ClaudeEnd::Exited(line)) => serde_json::from_str(&line)
+                .map(Some)
+                .map_err(|e| Error::new(format!("AIの出力を読めません: {e}"))),
+            Ok(ClaudeEnd::TimedOut) => Ok(None),
+            Err(Failure::Error(e)) => Err(e),
+            Err(Failure::Unstopped(leftovers)) => {
+                // tickを書かずに残し、tickが動いていても残ったものとして扱わせる（cellの失敗と同じ）
+                let stuck = Stuck {
+                    job: "inspector".to_string(),
+                    processes: leftovers,
+                    tick: None,
+                };
+                if let Ok(text) = serde_json::to_string_pretty(&stuck) {
+                    let _ = std::fs::write(stuck_path(self.home), text);
+                }
+                Err(Error::new(
+                    "claudeが動かしたプロセスを止めきれませんでした。残っている間は、次のtickは動きません",
+                )
+                .with_hint("`agentcells doctor` で確かめてください"))
+            }
+        }
     }
 }
 
@@ -1869,6 +1977,7 @@ mod tests {
             context: Path::new("/c.json"),
             path_prefix: Some(Path::new("/opt/agentcells/bin")),
             model: Some("haiku"),
+            tools: None,
             timeout,
             log_dir: dir,
             job_dirs: &[],
@@ -2010,6 +2119,7 @@ mod tests {
             context: Path::new("/nonexistent"),
             path_prefix: None,
             model: Some("haiku"),
+            tools: None,
             timeout: Duration::from_secs(300),
             log_dir: dir.path(),
             job_dirs: &job_dirs,

@@ -58,6 +58,14 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # confirm = false                    # true にすると、人間が着手を認めるまで次のcellに進めない（assess は省略すると true）
 # timeout_minutes = 30               # 1回の実行の上限（省略すると30）
 #
+# inspector: tickの記録（~/.agentcells/logs/events.jsonl）を1日に1回調べ、ラインの不具合（同じcellが続けて動いた、
+# AIの実行が失敗した、など）を見つけて、原因と直し方の案を書く。書かなければ動かさない
+#
+# [inspector]
+# issues = "your-login/agentcells"   # agentcells自体の不具合をIssueにして出す先（書かなければ手元に残すだけ。本家に出すと、ほかの人にも見える）
+# every_hours = 24                   # 何時間ごとに動かすか
+# model = "sonnet"
+#
 # github_app: GitHubへの書き込み（コメント、ラベル、push、PR）に使うGitHub App（推奨）
 # 書かなければ、ghにログインしているあなたのアカウントで書き込みます。
 # Appで書き込むと、コメントやPRが「<Appの名前>[bot]」になり、人間の発言と見分けられます。
@@ -88,6 +96,30 @@ pub struct Config {
     /// 書き込みに使うGitHub App。なければghにログインしているアカウントで書き込む
     #[serde(default)]
     pub github_app: Option<GithubApp>,
+    /// tickの記録を調べて、ラインの不具合を見つける（書かなければ動かさない）
+    #[serde(default)]
+    pub inspector: Option<Inspector>,
+}
+
+/// inspectorの設定（`[inspector]`）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inspector {
+    /// agentcells自体の不具合を、Issueにして出すリポジトリ。書かなければ、手元に残すだけ
+    #[serde(default)]
+    pub issues: Option<RepoName>,
+    /// 何時間ごとに動かすか（tickの最後に、前回からこれだけたっていれば動く）
+    #[serde(default = "default_inspector_hours")]
+    pub every_hours: u32,
+    /// `claude -p` の `--model`
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_timeout_minutes")]
+    pub timeout_minutes: u32,
+}
+
+fn default_inspector_hours() -> u32 {
+    24
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -583,6 +615,21 @@ impl Config {
                 problems.push(format!(
                     "cell「{}」の timeout_minutes は1以上にしてください",
                     c.name
+                ));
+            }
+        }
+        if let Some(inspector) = &self.inspector {
+            if inspector.every_hours == 0 {
+                problems.push("[inspector] の every_hours は1以上にしてください".to_string());
+            }
+            if inspector.timeout_minutes == 0 {
+                problems.push("[inspector] の timeout_minutes は1以上にしてください".to_string());
+            }
+            if let Some(model) = &inspector.model
+                && !is_valid_model(model)
+            {
+                problems.push(format!(
+                    "[inspector] の model「{model}」に使えない文字があります（英数字・-・.・_・[]）"
                 ));
             }
         }
