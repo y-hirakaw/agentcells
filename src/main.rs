@@ -227,24 +227,11 @@ fn run(command: Commands) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             println!("仕事: {}件", work.len());
-            // 1回のtickでは1件だけ動かす。今は動かせない種類の仕事は飛ばす
-            let mut next = None;
+            // 1回のtickでは1件だけ動かす
             for w in &work {
-                let note = config
-                    .cell(&w.cell)
-                    .and_then(|cell| run::unsupported(w, cell));
-                match note {
-                    Some(note) => println!("  {}（{note}）", w.describe()),
-                    None => {
-                        println!("  {}", w.describe());
-                        next = next.or(Some(w));
-                    }
-                }
+                println!("  {}", w.describe());
             }
-            let Some(next) = next else {
-                println!("\n今動かせる仕事はありません");
-                return Ok(ExitCode::SUCCESS);
-            };
+            let next = &work[0];
             println!("\n次に動かすもの: {}", next.describe());
             if dry_run {
                 return Ok(ExitCode::SUCCESS);

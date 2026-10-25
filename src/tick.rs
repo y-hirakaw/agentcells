@@ -155,6 +155,11 @@ pub fn find(
                             found.skipped.push((work, reason));
                             continue;
                         }
+                        let author = i
+                            .author
+                            .as_ref()
+                            .map(|a| rest_login(&a.login))
+                            .unwrap_or_else(|| "ghost".to_string());
                         let original = match item {
                             Target::PullRequest => crate::prompt::closes(&i.body, repo),
                             Target::Issue => None,
@@ -179,11 +184,7 @@ pub fn find(
                                 number: i.number,
                                 env: &env,
                             },
-                            author: i
-                                .author
-                                .as_ref()
-                                .map(|a| a.login.as_str())
-                                .unwrap_or("ghost"),
+                            author: &author,
                             label: &cell.label,
                             cell_labels: &cell_labels,
                             original: original.as_ref().zip(original_env.as_ref()).map(
@@ -208,6 +209,15 @@ pub fn find(
         }
     }
     Ok(found)
+}
+
+/// `gh pr list --json author` は、GitHub Appの作者を `app/<slug>` と返す。REST APIやeventsと同じ
+/// `<slug>[bot]` に読み替える（`[bot]` を外して比べると、同じ名前の人のアカウントと見分けられない）。
+fn rest_login(login: &str) -> String {
+    match login.strip_prefix("app/") {
+        Some(slug) => format!("{slug}[bot]"),
+        None => login.to_string(),
+    }
 }
 
 fn list(
@@ -433,7 +443,7 @@ next = ["done"]
                 &list("pr", "octo/app", "ac:review"),
                 true,
                 &format!(
-                    r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME},"author":{{"login":"bot[bot]"}},"body":"Closes octo/issues#3"}}]"#
+                    r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME},"author":{{"login":"app/bot"}},"body":"Closes octo/issues#3"}}]"#
                 ),
             )
             .with(&list("pr", "octo/web", "ac:review"), true, "[]");

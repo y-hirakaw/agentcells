@@ -79,7 +79,8 @@ pub fn push_branch(
 }
 
 /// worktreeのブランチを、新しく作ったbareリポジトリに移す。トークンは渡さない。
-fn stage(probe: &dyn Probe, worktree: &Path, branch: &str) -> Result<TempDir> {
+/// 移した先の設定はCLIが作ったまっさらなものなので、push の前の確かめもここでする。
+pub fn stage(probe: &dyn Probe, worktree: &Path, branch: &str) -> Result<TempDir> {
     let staging = tempfile::Builder::new()
         .prefix("agentcells-push-")
         .tempdir()
@@ -106,7 +107,7 @@ fn stage(probe: &dyn Probe, worktree: &Path, branch: &str) -> Result<TempDir> {
 }
 
 /// bareリポジトリに移したブランチを、トークンを使ってGitHubにpushする。
-fn push_staged(
+pub fn push_staged(
     probe: &dyn Probe,
     credentials: &Credentials,
     staging: &Path,
@@ -120,6 +121,195 @@ fn push_staged(
     args.extend(git_args.iter().map(String::as_str));
     args.extend(["push", "-q", &url, &refspec]);
     git(probe, &args, &credentials.git_env())
+}
+
+/// 人がそのブランチを開いたときに、自動で動くもの。AIのビルドが書いても、コミットに入れさせない。
+/// `.github/workflows` は、GitHub Appに権限を付けていないうえ、pushされるとCIで動く。
+pub const AUTORUN_PATHS: &[&str] = &[
+    ".claude",
+    ".mcp.json",
+    ".vscode/tasks.json",
+    ".vscode/settings.json",
+    ".devcontainer",
+    ".envrc",
+    ".husky",
+    ".github/workflows",
+];
+
+/// pushする前に、ブランチに足したコミット（`base` から `branch` まで）をすべて確かめる。
+/// AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る。
+/// 問題があれば、その理由（秘密そのものは書かない）。
+///
+/// - 置いた秘密のファイルと同じ中身のファイル（名前を変えたり、途中のコミットだけに入れたりしても）
+/// - 人が開いたときに自動で動くファイル（`AUTORUN_PATHS`）の変更
+/// - betterleaksが見つけた秘密らしいもの（足した行。途中のコミットで足して消したものも）
+pub fn verify(
+    probe: &dyn Probe,
+    staging: &Path,
+    base: &str,
+    branch: &str,
+    placed_blobs: &[String],
+    scanner: &Path,
+) -> Result<Option<String>> {
+    let staging_path = path_str(staging)?;
+    let range = format!("{base}..refs/heads/{branch}");
+    let objects = git_out(
+        probe,
+        &["-C", staging_path, "rev-list", "--objects", &range],
+        ISOLATED_GIT_ENV,
+    )?;
+    for line in objects.lines() {
+        let mut parts = line.splitn(2, ' ');
+        let (Some(sha), path) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if placed_blobs.iter().any(|b| b == sha) {
+            return Ok(Some(format!(
+                "置いた秘密のファイルと同じ中身のファイル（{}）がコミットに入っています",
+                path.unwrap_or("?")
+            )));
+        }
+    }
+    let changed = git_out(
+        probe,
+        &[
+            "-C",
+            staging_path,
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "--no-renames",
+            "--name-only",
+            "--format=",
+            &range,
+        ],
+        ISOLATED_GIT_ENV,
+    )?;
+    for path in changed.lines().filter(|l| !l.is_empty()) {
+        let lower = path.to_lowercase();
+        if let Some(guarded) = AUTORUN_PATHS
+            .iter()
+            .find(|g| lower == **g || lower.starts_with(&format!("{g}/")))
+        {
+            return Ok(Some(format!(
+                "人が開いたときに自動で動くファイル（{guarded}）を変えるコミットがあります: {path}"
+            )));
+        }
+    }
+    let patches = git_out(
+        probe,
+        &[
+            "-C",
+            staging_path,
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "-p",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--text",
+            "--no-renames",
+            "--unified=0",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--format=",
+            &range,
+        ],
+        ISOLATED_GIT_ENV,
+    )?;
+    let lines = crate::actions::added_lines(&patches);
+    if !lines.is_empty() {
+        let input: String = lines.iter().map(|l| format!("{}\n", l.text)).collect();
+        let found = crate::actions::scan_text(scanner, &input)?;
+        if let Some((line, rule)) = found.first() {
+            let place = lines
+                .get(line.wrapping_sub(1))
+                .map(|l| format!("{}:{}", l.path, l.line))
+                .unwrap_or_else(|| "場所不明".to_string());
+            return Ok(Some(format!(
+                "コミットに秘密らしいもの（{rule}、{place}）が入っています"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// ブランチから開いているPRの番号。なければ `None`。
+pub fn find_open(
+    probe: &dyn Probe,
+    credentials: &Credentials,
+    repo: &RepoName,
+    branch: &str,
+) -> Result<Option<u64>> {
+    let repo_arg = repo.to_string();
+    let out = gh(
+        probe,
+        credentials,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            &repo_arg,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--jq",
+            ".[0].number",
+        ],
+    )?;
+    let number = out.trim();
+    if number.is_empty() || number == "null" {
+        return Ok(None);
+    }
+    number
+        .parse()
+        .map(Some)
+        .map_err(|e| Error::new(format!("PRの番号を読めません（{number}）: {e}")))
+}
+
+/// PRを作り、その番号を返す（`gh pr create` はPRのURLを出す）。
+pub fn create(probe: &dyn Probe, credentials: &Credentials, args: &[String]) -> Result<u64> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = gh(probe, credentials, &args)?;
+    out.trim()
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| Error::new(format!("作ったPRの番号を読めません: {}", out.trim())))
+}
+
+fn gh(probe: &dyn Probe, credentials: &Credentials, args: &[&str]) -> Result<String> {
+    let env = credentials.gh_env()?;
+    let out = probe.run_with_env("gh", args, &env).ok_or_else(|| {
+        Error::new("ghが見つかりません").with_hint("`agentcells doctor` で確かめてください")
+    })?;
+    if !out.success {
+        return Err(Error::new(format!(
+            "gh {} {} が失敗しました: {}",
+            args.first().unwrap_or(&""),
+            args.get(1).unwrap_or(&""),
+            out.stderr.trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+fn git_out(probe: &dyn Probe, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let out = probe.run_with_env("git", args, env).ok_or_else(|| {
+        Error::new("gitが見つかりません").with_hint("`agentcells doctor` で確かめてください")
+    })?;
+    if out.success {
+        Ok(out.stdout)
+    } else {
+        Err(Error::new(format!(
+            "gitが失敗しました: {}",
+            out.stderr.trim()
+        )))
+    }
 }
 
 fn git(probe: &dyn Probe, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
@@ -223,6 +413,95 @@ mod tests {
 
         fn token() -> Credentials {
             Credentials::new(crate::github::Source::App, "ghs_test".to_string()).unwrap()
+        }
+
+        /// 偽のbetterleaks。「FAKE-SECRET」を含む行を見つけたことにする。
+        fn fake_scanner(dir: &Path) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("fake-betterleaks");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nn=$(grep -n FAKE-SECRET | head -1 | cut -d: -f1)\nif [ -n \"$n\" ]; then echo \"[{\\\"RuleID\\\":\\\"fake\\\",\\\"StartLine\\\":$n}]\"; exit 1; fi\necho '[]'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        /// 既定のブランチに1つ、仕事のブランチに `files` を足したコミットを1つ作り、bareリポジトリに移す。
+        fn staged(dir: &Path, files: &[(&str, &str)]) -> (TempDir, String) {
+            let work = dir.join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            git_in(&work, &["init", "-q", "-b", "main"]);
+            std::fs::write(work.join("a.txt"), "a").unwrap();
+            git_in(&work, &["add", "-A"]);
+            git_in(&work, &["commit", "-q", "-m", "base"]);
+            let base = git_in(&work, &["rev-parse", "HEAD"]);
+            git_in(&work, &["checkout", "-q", "-b", "ac/x"]);
+            for (path, content) in files {
+                let full = work.join(path);
+                std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+                std::fs::write(full, content).unwrap();
+            }
+            git_in(&work, &["add", "-A"]);
+            git_in(&work, &["commit", "-q", "-m", "change"]);
+            (stage(&SystemProbe, &work, "ac/x").unwrap(), base)
+        }
+
+        #[test]
+        fn verify_passes_ordinary_commits() {
+            let dir = tempfile::tempdir().unwrap();
+            let scanner = fake_scanner(dir.path());
+            let (staging, base) = staged(dir.path(), &[("src/b.txt", "hello")]);
+            let found = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner).unwrap();
+            assert_eq!(found, None);
+        }
+
+        #[test]
+        fn verify_refuses_placed_secrets_autorun_files_and_leaks() {
+            let dir = tempfile::tempdir().unwrap();
+            let scanner = fake_scanner(dir.path());
+            // 置いた秘密のファイルと同じ中身を、別の名前で
+            let (staging, base) = staged(dir.path(), &[("copy.txt", "keystore-bytes")]);
+            let hash = {
+                let out = Command::new("git")
+                    .args(["hash-object", "--stdin"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .and_then(|mut c| {
+                        use std::io::Write;
+                        c.stdin.take().unwrap().write_all(b"keystore-bytes")?;
+                        c.wait_with_output()
+                    })
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            let reason = verify(
+                &SystemProbe,
+                staging.path(),
+                &base,
+                "ac/x",
+                &[hash],
+                &scanner,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(reason.contains("copy.txt"), "{reason}");
+
+            for (path, content, expect) in [
+                (".claude/settings.json", "{}", ".claude"),
+                (".github/workflows/ci.yml", "on: push", ".github/workflows"),
+                ("src/config.rs", "token = FAKE-SECRET", "fake"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let scanner = fake_scanner(dir.path());
+                let (staging, base) = staged(dir.path(), &[(path, content)]);
+                let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
+                    .unwrap()
+                    .unwrap();
+                assert!(reason.contains(expect), "{path}: {reason}");
+            }
         }
 
         /// トークンを環境変数から書き出すスクリプト。これが動いたら漏れたことになる。

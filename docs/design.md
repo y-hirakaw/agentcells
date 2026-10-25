@@ -99,7 +99,7 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
   - implementで実装してみたが、環境のせいでビルドが通らない（やったこと、結果、人間にやってほしいことを書く）
 - 人間はIssueにコメントで答え、ラベルを付け替えて再開する。次の実行では、最後の目印のあとの人間のコメントをプロンプトに入れる（予定）
 - 往復の回数は、この目印を数える。そのIssue/PRで、そのcellの目印にあるroundの最大値が、動いた回数になる
-- PRへのレビュー（`review = true` のcell）は、GitHubのPRレビューとして投稿する
+- PRへのレビュー（`review = true` のcell）は、GitHubのPRレビューとして投稿する（`POST /repos/{owner}/{repo}/pulls/{number}/reviews`）。差分は、CLIだけが書くbareのキャッシュで、ベースとPRのブランチから読む
   - レビュー本文の1行目に目印を書き、その下にまとめを書く
   - コードへの指摘は1件につき1コメントで、コードの行に付ける。行コメントはそのレビューに付くので、GitHubの画面でもレビューの下にまとまる
   - 差分の外の行にはGitHubが行コメントを付けられないので、そうした指摘はレビュー本文にまとめて書く
@@ -107,10 +107,10 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
 
 ## tick
 
-`agentcells tick` を定期実行で呼ぶ。仕事を探し、1回のtickでは1件だけcellを動かす。`--dry-run` なら、探して表示するだけ。今動かせるのは、コミットを要らないIssueのcell（triageなど）だけ。implementとPRの仕事は、pushとPRの作成、レビューの投稿をつなぐときに動かす（見つかっても「まだ動かせません」と出して飛ばす）。
+`agentcells tick` を定期実行で呼ぶ。仕事を探し、1回のtickでは1件だけcellを動かす。`--dry-run` なら、探して表示するだけ。
 
 - 仕事は、cellのラベルが付いていて、`ac:working` も `ac:needs-human` も付いていない、開いているIssue/PR。Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す
-- productとcellを設定の順に見て、同じcellの中では番号の小さい順に並べる。1回のtickでは、そのうち今動かせる最初の1件を動かす
+- productとcellを設定の順に見て、同じcellの中では番号の小さい順に並べる。1回のtickでは、その最初の1件を動かす
 - 一覧を読むときも、リポジトリごとの読み取り用のトークンと空のghの設定を使う
 - `~/.agentcells/tick.lock` をロックして、tickを同時に2つ動かさない。ほかのtickが動いていれば、何もせずに終わる
 - 試すときは、環境変数 `AGENTCELLS_MODEL`（`haiku` など）で `claude -p` のモデルを変えられる
@@ -121,16 +121,32 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
 
 1. `ac:working` を付ける
 2. Issueを読み、もう一度ガード（「動かすIssue/PRを決める」）を通す。確かめてから読むまでの間の書き換えを見逃さないため。見送るときは、コメントをせずに `ac:working` だけ外す（外せなくても、コメントはしない）
-3. 作業の場所を作る。`repos/<owner>/<repo>` に作業するリポジトリのbareのcloneを作るか最新にし（`+refs/heads/*:refs/heads/*`）、そこから `git clone --shared --separate-git-dir=gitdirs/<owner>/<repo>/<番号>` で `worktrees/<owner>/<repo>/<番号>` を作る。毎回空にして作り直す。`files/` のファイルを置き、その中身のハッシュを覚える
+3. 作業の場所を作り、仕事のブランチを用意する（「ブランチとpush」）。`repos/<owner>/<repo>` に作業するリポジトリのbareのcloneを作るか最新にし（`+refs/heads/*:refs/heads/*`）、そこから `git clone --shared --separate-git-dir=gitdirs/<owner>/<repo>/<番号>` で `worktrees/<owner>/<repo>/<番号>` を作る。毎回空にして作り直す。`files/` のファイルを置き、その中身のハッシュを覚える
 4. 今の仕事のファイル（`runs/<owner>/<repo>/<番号>/context.json`）と、`--settings` で渡す設定（`settings.json`）を書く。コミットの作者は、書き込みのアカウントの名前と `<id>+<ログイン>@users.noreply.github.com`
 5. ここまでに作ったGitHub Appのトークン（ラベル、読み取り）を取り消す（`DELETE /installation/token`）
 6. `claude -p` を動かす（下）。終わったら、claudeとその子孫のプロセスをすべて止める
 7. 止めたことを確かめてから、新しい書き込みのトークンを作る。AIの結果を読み、実行の前後で `ac:` のラベルが変わっていないかを確かめる（変わっていれば人間に回す）
-8. 投稿する本文の全体を、betterleaksで調べる。秘密らしいものがあれば、決まった文だけにして人間に回す。目印（`[agentcells] <cell> round <n>`）を付けてコメントする
-9. 次のcellのラベルを付けてから、今のcellのラベルと `ac:working` を外す。`done` なら閉じる
-10. 作業の場所（worktree、`.git` の実体、一時ディレクトリ）を消す。うまくいかなかったときも消す（置いた秘密のファイルを残さないため）。`runs/` の記録（AIの出力 `claude.json`、`claude.err`、エラー `error.txt`）は残す
+8. AIがコミットしていれば、確かめてからpushし、IssueからならPRを作る（「ブランチとpush」）
+9. 投稿する本文の全体を、betterleaksで調べる。秘密らしいものがあれば、決まった文だけにして人間に回す。目印（`[agentcells] <cell> round <n>`）を付けてコメントする。レビューのcell（`review = true`）は、PRのレビューとして投稿する（「コメントとレビュー」）
+10. 次のcellのラベルを付けてから、今のcellのラベルと `ac:working` を外す。作ったPRに次のcellのラベルを付ける。`done` なら閉じる
+11. 作業の場所（worktree、`.git` の実体、一時ディレクトリ）を消す。うまくいかなかったときも消す（置いた秘密のファイルを残さないため）。`runs/` の記録（AIの出力 `claude.json`、`claude.err`、エラー `error.txt`）は残す
 
 途中で失敗したら、`[agentcells] <cell> round 0`（往復の回数に数えない）で「実行できませんでした。手元の記録（`~/.agentcells/runs/<owner>/<repo>/<番号>`）を確かめてください」とだけコメントし、`ac:needs-human` に回す。公開のIssueに、手元の絶対パスやエラーの中身（gitやghの標準エラー）を書かないため。詳しいことは、手元の記録とtickの出力に残す。
+
+### ブランチとpush
+
+- Issueの仕事は、`ac/<owner>-<repo>-<番号>` のブランチで作業する。前の実行でpushしていれば、その続きから始める。ベースは作業するリポジトリの既定のブランチ
+- PRの仕事は、PRのブランチで作業する。フォークからのPRは動かさない（人間に回す）
+- ブランチの用意は、claudeを動かす前に、CLIが作ったばかりのcloneで行う
+- claudeのあと、AIが足したコミット（動かす前のブランチの先から）があれば、次のとおりにする
+  - CLIがその場で作ったbareリポジトリにブランチを移し（`pr::stage`）、そこで確かめる。AIが書き換えられる `.git/config` を読まないため
+  - 確かめること（`pr::verify`）: 足したコミットのどれかに、置いた秘密のファイルと同じ中身のファイルがない（名前を変えても、途中のコミットだけでも）。人が開いたときに自動で動くファイル（`.claude/`、`.mcp.json`、`.vscode/tasks.json`、`.vscode/settings.json`、`.devcontainer/`、`.envrc`、`.husky/`、`.github/workflows/`）を変えていない。足した行に、betterleaksが見つける秘密らしいものがない（途中のコミットで足して消したものも）。AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る
+  - 問題があれば、pushせずに人間に回す（理由に秘密そのものは書かない）
+  - pushは、そのbareリポジトリから、書き込みのトークンで行う
+- Issueの仕事で、AIが進めた先がPRを扱うcell（review）なら、そのブランチのPRを作る（開いているPRがあれば、それを使う）。PRの本文は目印、AIのコメント、`Closes <owner>/<repo>#<番号>`。作るときにoperatorを割り当てる（ガードが、agentcellsが作ったPRとして扱う）。本文もbetterleaksで調べる
+- PRを作らないcell（triageなど）が足したコミットは、pushしない
+- PRの仕事で、新しいコミットがないのにレビューへ進もうとしたら、人間に回す（同じものを何度もレビューしないため）
+- レビューのcellは、pushしない
 
 `claude -p` の動かし方:
 

@@ -6,6 +6,23 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.7.0] - 2026-10-25
+
+### 追加
+
+- **implementとreviewを動かす**
+  - Issueのimplementは `ac/<owner>-<repo>-<番号>` のブランチで作業し、AIがコミットしたら、CLIが確かめてからpushし、PRを作って次のcell（review）のラベルを付ける。PRのimplementは、PRのブランチに足してpushする
+  - reviewは、指摘をPRのレビューとして、コードの行ごとに投稿する
+- **pushの前に、ブランチ全体を確かめる**
+  - 足したコミットのどれかに、置いた秘密のファイルと同じ中身、人が開いたときに自動で動くファイル（`.claude/`、`.mcp.json`、`.github/workflows/` など）の変更、betterleaksが見つける秘密らしいものがあれば、pushせずに人間に回す。AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるため
+  - 確かめもpushも、CLIがその場で作ったbareリポジトリで行う。AIが書き換えられる `.git/config` を読まないため
+- フォークからのPRは動かさない
+- プロンプトで、実行していないコマンドやテストを実行したと書かないよう頼む。本物で動かしたとき、実行できるテストがないのに「実行して通った」と書いたため
+
+### 直したこと
+
+- `gh pr list` がGitHub Appの作者を `app/<slug>` と返すため、agentcellsが作ったPRと見分けられず、reviewが見送られていた。`<slug>[bot]` に読み替える
+
 ## [0.6.0] - 2026-10-25
 
 ### 追加

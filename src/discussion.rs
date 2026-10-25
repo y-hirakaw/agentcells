@@ -46,6 +46,8 @@ pub struct Discussion {
     /// PRのベースブランチとブランチ
     pub base: Option<String>,
     pub head: Option<String>,
+    /// PRのブランチがあるリポジトリ（`owner/repo`）。フォークからのPRなら、作業するリポジトリと違う
+    pub head_repo: Option<String>,
     /// 古い順
     pub posts: Vec<Post>,
     pub line_comments: Vec<LineComment>,
@@ -70,6 +72,13 @@ struct RawItem {
 struct RawBranch {
     #[serde(rename = "ref")]
     name: String,
+    #[serde(default)]
+    repo: Option<RawRepo>,
+}
+
+#[derive(Deserialize)]
+struct RawRepo {
+    full_name: String,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +160,7 @@ pub fn fetch(
         let pull: RawPull = api_one(probe, env, &format!("/repos/{repo}/pulls/{number}"))?;
         discussion.base = Some(pull.base.name);
         discussion.head = Some(pull.head.name);
+        discussion.head_repo = pull.head.repo.map(|r| r.full_name);
 
         let reviews: Vec<RawComment> =
             api_list(probe, env, &format!("/repos/{repo}/pulls/{number}/reviews"))?;

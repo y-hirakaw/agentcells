@@ -529,15 +529,15 @@ pub fn scan_text(scanner: &Path, text: &str) -> Result<Vec<(usize, String)>> {
 }
 
 /// 足した1行。
-struct AddedLine {
-    path: String,
+pub(crate) struct AddedLine {
+    pub(crate) path: String,
     /// 新しいファイルでの行番号
-    line: usize,
-    text: String,
+    pub(crate) line: usize,
+    pub(crate) text: String,
 }
 
 /// `git diff --unified=0` から、足した行を取り出す。
-fn added_lines(diff: &str) -> Vec<AddedLine> {
+pub(crate) fn added_lines(diff: &str) -> Vec<AddedLine> {
     let mut lines = Vec::new();
     let mut path = String::new();
     let mut next = 0;

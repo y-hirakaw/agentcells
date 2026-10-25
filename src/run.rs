@@ -11,8 +11,8 @@
 //! 8. コメントをbetterleaksで調べてから、目印を付けて投稿する
 //! 9. ラベルを付け替える（付けてから外す）。どこかで失敗したら、人間に回す
 //!
-//! 今は、コミットを要らないIssueのcell（triageなど）だけを動かす。implementとreviewは、pushとPRの作成、
-//! レビューの投稿をつなぐときに動かす。
+//! コミットしたcell（implement）は、CLIがそのブランチ全体を確かめてからpushし、IssueからならPRを作る。
+//! レビューのcell（`review = true`）は、指摘をPRのレビューとして、コードの行ごとに投稿する。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -111,17 +111,6 @@ impl From<Error> for Failure {
     }
 }
 
-/// 今は動かせない仕事なら、その理由。
-pub fn unsupported(work: &Work, cell: &Cell) -> Option<String> {
-    if work.item != Target::Issue {
-        return Some("PRの仕事は、まだ動かせません".to_string());
-    }
-    if cell.name == "implement" {
-        return Some("implementは、pushとPRの作成をつなぐまで動かせません".to_string());
-    }
-    None
-}
-
 /// 実行に使うもの。テストでは、claudeを偽のスクリプトにする。
 pub struct Runner<'a> {
     pub home: &'a Home,
@@ -155,6 +144,7 @@ impl Runner<'_> {
             probe: self.probe,
             repo: &work.repo,
             number: work.number,
+            kind: work.item,
         };
         {
             let write = self.write_credentials(&work.repo)?;
@@ -246,12 +236,20 @@ impl Runner<'_> {
         place: &mut Place,
     ) -> std::result::Result<Report, Failure> {
         let work_repo = place_repo(product)?;
-        // claudeを動かす前に作ったトークンは、動かす前にすべて取り消す
-        let issue_read = github::credentials(self.config, self.probe, &work.repo, Purpose::Read)?;
-        let work_read = github::credentials(self.config, self.probe, &work_repo, Purpose::Read)?;
-        let result = self.prepare(work, product, cell, place, &issue_read, &work_read, issue);
-        issue_read.revoke(self.probe);
-        work_read.revoke(self.probe);
+        // claudeを動かす前に作ったトークンは、動かす前にすべて取り消す。
+        // 読むリポジトリ（仕事のリポジトリ、作業するリポジトリ、Issueのリポジトリ）ごとに1つ作る
+        let mut reads: Vec<(RepoName, Credentials)> = Vec::new();
+        for repo in [&work.repo, &work_repo, &product.issues] {
+            if !reads.iter().any(|(r, _)| r == repo) {
+                let credentials =
+                    github::credentials(self.config, self.probe, repo, Purpose::Read)?;
+                reads.push((repo.clone(), credentials));
+            }
+        }
+        let result = self.prepare(work, product, cell, place, &reads, issue);
+        for (_, credentials) in &reads {
+            credentials.revoke(self.probe);
+        }
         let ready = match result? {
             Prepared::Skipped(reason) => {
                 // 勝手に始めようとした人に反応しないよう、コメントはせずに ac:working だけ外す。
@@ -283,29 +281,28 @@ impl Runner<'_> {
     }
 
     /// claudeを動かす前の用意。ガードで見送るときは `Skipped`。
-    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &self,
         work: &Work,
         product: &Product,
         cell: &Cell,
         place: &mut Place,
-        issue_read: &Credentials,
-        work_read: &Credentials,
+        reads: &[(RepoName, Credentials)],
         issue: &Issue,
     ) -> Result<Prepared> {
         let work_repo = place_repo(product)?;
-        let read = |repo: &RepoName| {
-            if repo == &work.repo {
-                issue_read.reuse()
-            } else if repo == &work_repo {
-                work_read.reuse()
-            } else {
-                Err(Error::new(format!(
-                    "{repo} は、この仕事で読むリポジトリではありません"
-                )))
-            }
+        let read_for = |repo: &RepoName| -> Result<&Credentials> {
+            reads
+                .iter()
+                .find(|(r, _)| r == repo)
+                .map(|(_, c)| c)
+                .ok_or_else(|| {
+                    Error::new(format!("{repo} は、この仕事で読むリポジトリではありません"))
+                })
         };
+        let item_read = read_for(&work.repo)?;
+        let work_read = read_for(&work_repo)?;
+        let read = |repo: &RepoName| read_for(repo)?.reuse();
         let mut task = prompt::fetch_task(
             self.probe,
             &read,
@@ -317,13 +314,28 @@ impl Runner<'_> {
         )?;
 
         // 確かめてから読むまでの間に書き換えられていないか、読んだあとにもう一度確かめる
-        let env = issue_read.gh_env()?;
+        let env = item_read.gh_env()?;
         let cell_labels: Vec<String> = product
             .cells
             .iter()
             .filter_map(|name| self.config.cell(name))
             .map(|c| c.label.clone())
             .collect();
+        let original = match work.item {
+            Target::PullRequest => prompt::closes(&task.discussion.body, &work.repo),
+            Target::Issue => None,
+        };
+        let original_env = match &original {
+            Some((repo, _)) => match read_for(repo) {
+                Ok(credentials) => Some(credentials.gh_env()?),
+                Err(_) => {
+                    return Ok(Prepared::Skipped(format!(
+                        "元のIssueのリポジトリ {repo} が、このproductにありません"
+                    )));
+                }
+            },
+            None => None,
+        };
         let request = guard::Request {
             kind: work.item,
             subject: guard::Subject {
@@ -334,13 +346,21 @@ impl Runner<'_> {
             author: &task.discussion.author,
             label: &cell.label,
             cell_labels: &cell_labels,
-            original: None,
+            original: original
+                .as_ref()
+                .zip(original_env.as_ref())
+                .map(|((repo, number), env)| guard::Subject {
+                    repo,
+                    number: *number,
+                    env,
+                }),
         };
         if let Some(reason) = guard::check(self.probe, &request, self.actors)? {
             return Ok(Prepared::Skipped(reason));
         }
 
         place.prepare(self.probe, work_read, self.home, &work_repo)?;
+        let branch = self.checkout(work, &task, place)?;
         task.worktree = Some(place.worktree.clone());
 
         // gitignoreされたファイルを置き、その中身のハッシュを、コミットさせないために覚えておく
@@ -362,8 +382,8 @@ impl Runner<'_> {
             worktree: place.worktree.clone(),
             commands: product.commands.clone(),
             placed: placed.clone(),
-            placed_blobs,
-            identity: self.identity(issue_read)?,
+            placed_blobs: placed_blobs.clone(),
+            identity: self.identity(item_read)?,
             scanner: self.scanner.to_path_buf(),
             tmp: place.tmp.clone(),
             caches: cache_dirs.clone(),
@@ -401,7 +421,7 @@ impl Runner<'_> {
             schema: transition::output_schema(cell),
             settings_path,
             context_path,
-            labels_before: issue.labels(issue_read)?,
+            labels_before: issue.labels(item_read)?,
             job_dirs: [
                 place.worktree.clone(),
                 place.git_dir.clone(),
@@ -410,11 +430,71 @@ impl Runner<'_> {
             .into_iter()
             .chain(cache_list)
             .collect(),
+            branch,
+            placed_blobs,
             task,
         })))
     }
 
-    /// claudeが終わったあと。結果を読んで投稿し、ラベルを付け替える。
+    /// 作業の場所で、仕事のブランチを用意する（claudeを動かす前の、CLIが作ったばかりのcloneで行う）。
+    /// - Issue: `ac/<owner>-<repo>-<番号>`。前の実行でpushしていれば、その続きから始める
+    /// - PR: PRのブランチ。フォークからのPRは動かさない
+    /// - レビューのcellも、PRのブランチを見る（pushはしない）
+    fn checkout(&self, work: &Work, task: &prompt::Task, place: &Place) -> Result<Option<Branch>> {
+        let wt = path_str(&place.worktree)?;
+        let (name, base) = match work.item {
+            Target::Issue => {
+                let base = git_out(self.probe, &["-C", &wt, "symbolic-ref", "--short", "HEAD"])?;
+                (
+                    crate::pr::branch_name(&work.repo, work.number),
+                    base.trim().to_string(),
+                )
+            }
+            Target::PullRequest => {
+                let d = &task.discussion;
+                let (Some(head), Some(base)) = (&d.head, &d.base) else {
+                    return Err(Error::new("PRのブランチを読めません"));
+                };
+                if d.head_repo.as_deref() != Some(&work.repo.to_string()) {
+                    return Err(Error::new(format!(
+                        "フォーク（{}）からのPRは、動かせません",
+                        d.head_repo.as_deref().unwrap_or("不明")
+                    )));
+                }
+                (head.clone(), base.clone())
+            }
+        };
+        let remote = format!("refs/remotes/origin/{name}");
+        let exists = git_out(
+            self.probe,
+            &["-C", &wt, "rev-parse", "-q", "--verify", &remote],
+        )
+        .is_ok();
+        if work.item == Target::PullRequest && !exists {
+            return Err(Error::new(format!("PRのブランチ {name} が見つかりません")));
+        }
+        let mut args = vec![
+            "-C",
+            wt.as_str(),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "checkout",
+            "-q",
+            "-B",
+            name.as_str(),
+        ];
+        let origin = format!("origin/{name}");
+        if exists {
+            args.push(origin.as_str());
+        }
+        git_out(self.probe, &args)?;
+        let start = git_out(self.probe, &["-C", &wt, "rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        Ok(Some(Branch { name, base, start }))
+    }
+
+    /// claudeが終わったあと。結果を読み、pushとPRの作成、投稿をして、ラベルを付け替える。
     #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
@@ -444,61 +524,120 @@ impl Runner<'_> {
                 Err(e) => Err(format!("AIの出力を読めません: {e}")),
             },
         };
-        let (requested, text) = match outcome {
-            Ok(outcome) => (outcome.next, outcome.comment),
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
             Err(reason) => {
                 overridden = Some(reason);
-                (transition::NEEDS_HUMAN.to_string(), String::new())
+                Outcome {
+                    next: transition::NEEDS_HUMAN.to_string(),
+                    comment: String::new(),
+                    findings: Vec::new(),
+                }
             }
         };
         if let Some(changed) = transition::tampered(&ready.labels_before, &labels_after) {
             overridden = Some(changed);
         }
+
+        // コミットを確かめてpushし、IssueからならPRを作る（レビューのcellはpushしない）
+        let mut pr_number: Option<u64> = None;
+        if overridden.is_none()
+            && !cell.review
+            && let Some(branch) = &ready.branch
+        {
+            match self.push(
+                work, cell, task, place, ready, branch, &outcome, round, write,
+            )? {
+                Pushed::Nothing => {
+                    if work.item == Target::PullRequest
+                        && outcome.next != transition::NEEDS_HUMAN
+                        && outcome.next != transition::DONE
+                    {
+                        overridden = Some(format!(
+                            "新しいコミットがないので「{}」には進めません",
+                            outcome.next
+                        ));
+                    }
+                }
+                Pushed::Refused(reason) => overridden = Some(reason),
+                Pushed::Done(number) => pr_number = number,
+            }
+        }
+
         let requested = if overridden.is_some() {
             transition::NEEDS_HUMAN.to_string()
         } else {
-            requested
+            outcome.next.clone()
         };
-        let finished_cell = |requested: &str| {
+        let plan_for = |requested: &str, created_pr: bool| {
             transition::plan(
                 self.config,
                 product,
                 &Finished {
                     cell,
                     item: work.item,
-                    created_pr: false,
+                    created_pr,
                     requested,
                 },
                 &runs,
             )
         };
-        let mut plan = finished_cell(&requested);
+        let mut plan = plan_for(&requested, pr_number.is_some());
         let mut reason = overridden.or(plan.overridden.clone());
-        let mut body = text.trim().to_string();
-        if let Some(reason) = &reason {
-            if !body.is_empty() {
-                body.push_str("\n\n");
-            }
-            body.push_str(&format!("人間に回しました: {reason}"));
+        let mut text = outcome.comment.trim().to_string();
+        if let Some(number) = pr_number
+            && work.item == Target::Issue
+        {
+            text.push_str(&format!("\n\nPR: #{number}"));
         }
-        let mut body = marker::comment(&cell.name, round, &body);
+        if let Some(reason) = &reason {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!("人間に回しました: {reason}"));
+        }
 
+        // レビューのcellは、指摘を行ごとにPRのレビューとして投稿する。それ以外はコメントにする
+        let review = (cell.review && work.item == Target::PullRequest && reason.is_none())
+            .then(|| self.review_payload(cell, round, &text, &outcome.findings, task, place))
+            .transpose()?;
+        let posted = match &review {
+            Some(payload) => payload.to_string(),
+            None => marker::comment(&cell.name, round, &text),
+        };
         // 投稿する本文の全体を、秘密らしいものがないか調べる。あれば、決まった文だけにして人間に回す
-        let found = actions::scan_text(self.scanner, &body)?;
-        if !found.is_empty() {
+        let found = actions::scan_text(self.scanner, &posted)?;
+        if found.is_empty() {
+            match &review {
+                Some(payload) => issue.review(write, payload)?,
+                None => issue.comment(write, &posted)?,
+            }
+        } else {
             let rules: Vec<String> = found.iter().map(|(_, rule)| rule.clone()).collect();
             let note = format!(
                 "コメントに秘密らしいもの（{}）があったので、投稿しませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください",
                 rules.join("、"),
                 place.run_name()
             );
-            body = marker::comment(&cell.name, round, &format!("人間に回しました: {note}"));
-            plan = finished_cell(transition::NEEDS_HUMAN);
+            let body = marker::comment(&cell.name, round, &format!("人間に回しました: {note}"));
+            issue.comment(write, &body)?;
+            plan = plan_for(transition::NEEDS_HUMAN, pr_number.is_some());
             reason = Some(note);
         }
-        issue.comment(write, &body)?;
 
         // 付けてから外す（guardが、ac:working が付いている間のラベルをagentcellsの付け替えとみなすため）
+        if let Some(number) = pr_number
+            && !plan.add_to_created_pr.is_empty()
+        {
+            let created = Issue {
+                probe: self.probe,
+                repo: &work.repo,
+                number,
+                kind: Target::PullRequest,
+            };
+            let add: Vec<&str> = plan.add_to_created_pr.iter().map(String::as_str).collect();
+            created.edit_labels(write, &add, &[])?;
+        }
         let add: Vec<&str> = plan.add.iter().map(String::as_str).collect();
         let remove: Vec<&str> = plan.remove.iter().map(String::as_str).collect();
         issue.edit_labels(write, &add, &[])?;
@@ -514,6 +653,138 @@ impl Runner<'_> {
             },
             reason,
         })
+    }
+
+    /// AIが足したコミットを確かめてpushする。IssueからでPRに進むなら、PRを作る（あれば、それを使う）。
+    /// 確かめもpushも、CLIがその場で作ったbareリポジトリから行う（AIが書き換えられる .git/config を読まない）。
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &self,
+        work: &Work,
+        cell: &Cell,
+        task: &prompt::Task,
+        place: &Place,
+        ready: &Ready,
+        branch: &Branch,
+        outcome: &Outcome,
+        round: u32,
+        write: &Credentials,
+    ) -> Result<Pushed> {
+        let staging = crate::pr::stage(self.probe, &place.worktree, &branch.name)?;
+        let staging_path = path_str(staging.path())?;
+        let mut env = ISOLATED_GIT_ENV.to_vec();
+        env.push(("GIT_ALLOW_PROTOCOL", "file"));
+        let base_ref = format!("+refs/heads/{0}:refs/heads/{0}", branch.base);
+        git(
+            self.probe,
+            &[
+                "-C",
+                &staging_path,
+                "fetch",
+                "-q",
+                "--no-tags",
+                &path_str(&place.cache)?,
+                &base_ref,
+            ],
+            &env,
+        )?;
+        let range = format!("{}..refs/heads/{}", branch.start, branch.name);
+        let count = git_out(
+            self.probe,
+            &["-C", &staging_path, "rev-list", "--count", &range],
+        )?;
+        if count.trim() == "0" {
+            return Ok(Pushed::Nothing);
+        }
+        // IssueからPRに進まないcell（triageなど）が足したコミットは、pushしない
+        let wants_pr = work.item == Target::Issue
+            && self
+                .config
+                .cell(&outcome.next)
+                .is_some_and(|next| !next.on.contains(&Target::Issue));
+        if work.item == Target::Issue && !wants_pr {
+            return Ok(Pushed::Nothing);
+        }
+        if let Some(reason) = crate::pr::verify(
+            self.probe,
+            staging.path(),
+            &branch.start,
+            &branch.name,
+            &ready.placed_blobs,
+            self.scanner,
+        )? {
+            return Ok(Pushed::Refused(format!("pushしませんでした: {reason}")));
+        }
+        crate::pr::push_staged(self.probe, write, staging.path(), &work.repo, &branch.name)?;
+        if work.item == Target::PullRequest {
+            return Ok(Pushed::Done(None));
+        }
+        let number = match crate::pr::find_open(self.probe, write, &work.repo, &branch.name)? {
+            Some(number) => number,
+            None => {
+                let body = crate::pr::body(
+                    &cell.name,
+                    round,
+                    outcome.comment.trim(),
+                    &work.repo,
+                    work.number,
+                );
+                let found = actions::scan_text(self.scanner, &body)?;
+                if !found.is_empty() {
+                    return Ok(Pushed::Refused(format!(
+                        "PRの本文に秘密らしいものがあったので、PRを作りませんでした（ブランチ {} はpushしました）。agentcellsを動かしている人は、手元の記録（{}）を確かめてください",
+                        branch.name,
+                        place.run_name()
+                    )));
+                }
+                let args = crate::pr::create_args(
+                    &work.repo,
+                    &branch.base,
+                    &branch.name,
+                    &task.discussion.title,
+                    &body,
+                    &self.actors.operator,
+                );
+                crate::pr::create(self.probe, write, &args)?
+            }
+        };
+        Ok(Pushed::Done(Some(number)))
+    }
+
+    /// PRのレビューとして送る内容。差分の中の行への指摘は、行コメントにする。
+    fn review_payload(
+        &self,
+        cell: &Cell,
+        round: u32,
+        summary: &str,
+        findings: &[crate::review::Finding],
+        task: &prompt::Task,
+        place: &Place,
+    ) -> Result<serde_json::Value> {
+        let d = &task.discussion;
+        let (Some(base), Some(head)) = (&d.base, &d.head) else {
+            return Err(Error::new("PRのブランチを読めません"));
+        };
+        // CLIだけが書くbareのキャッシュで、差分を読む
+        let range = format!("refs/heads/{base}...refs/heads/{head}");
+        let diff = git_out(
+            self.probe,
+            &[
+                "--git-dir",
+                &path_str(&place.cache)?,
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                &range,
+            ],
+        )?;
+        let lines = crate::review::DiffLines::parse(&diff);
+        Ok(crate::review::payload(
+            &cell.name, round, summary, findings, &lines,
+        ))
     }
 
     /// コミットの作者。書き込みのアカウントの名前と、GitHubのnoreplyのアドレス。
@@ -563,6 +834,29 @@ struct Ready {
     task: prompt::Task,
     /// worktree、一時ディレクトリ、キャッシュ
     job_dirs: Vec<PathBuf>,
+    /// 仕事のブランチ
+    branch: Option<Branch>,
+    /// 置いた秘密のファイルの中身のハッシュ（pushの前の確かめに使う）
+    placed_blobs: Vec<String>,
+}
+
+/// 仕事のブランチ。
+struct Branch {
+    name: String,
+    /// PRのベース（Issueなら、既定のブランチ）
+    base: String,
+    /// 動かす前のブランチの先（ここから先が、AIが足したコミット）
+    start: String,
+}
+
+/// pushの結果。
+enum Pushed {
+    /// 新しいコミットがない（か、pushしないcell）
+    Nothing,
+    /// 確かめで止めた。人間に回す理由
+    Refused(String),
+    /// pushした。IssueからならPRの番号
+    Done(Option<u64>),
 }
 
 impl Ready {
@@ -591,14 +885,34 @@ fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
         .map_err(|e| Error::new(format!("{} を書けません: {e}", path.display())))
 }
 
-/// GitHubのIssueへの読み書き。トークンは、そのたびに渡す（作る時を、AIが動いていないときに限るため）。
+/// GitHubのIssue/PRへの読み書き。トークンは、そのたびに渡す（作る時を、AIが動いていないときに限るため）。
 struct Issue<'a> {
     probe: &'a dyn Probe,
     repo: &'a RepoName,
     number: u64,
+    kind: Target,
 }
 
 impl Issue<'_> {
+    /// `gh issue` か `gh pr`。
+    fn sub(&self) -> &'static str {
+        match self.kind {
+            Target::Issue => "issue",
+            Target::PullRequest => "pr",
+        }
+    }
+
+    /// PRのレビューを投稿する（`POST /repos/{owner}/{repo}/pulls/{number}/reviews`）。
+    fn review(&self, credentials: &Credentials, payload: &serde_json::Value) -> Result<()> {
+        let path = format!("repos/{}/pulls/{}/reviews", self.repo, self.number);
+        self.gh(
+            credentials,
+            &["api", "-X", "POST", &path, "--input", "-", "--silent"],
+            Some(&payload.to_string()),
+        )
+        .map(|_| ())
+    }
+
     fn gh(&self, credentials: &Credentials, args: &[&str], input: Option<&str>) -> Result<String> {
         let env = credentials.gh_env()?;
         let out = self
@@ -626,7 +940,7 @@ impl Issue<'_> {
         let number = self.number.to_string();
         let add = add.join(",");
         let remove = remove.join(",");
-        let mut args = vec!["issue", "edit", number.as_str(), "--repo", repo.as_str()];
+        let mut args = vec![self.sub(), "edit", number.as_str(), "--repo", repo.as_str()];
         if !add.is_empty() {
             args.extend(["--add-label", add.as_str()]);
         }
@@ -642,7 +956,7 @@ impl Issue<'_> {
         self.gh(
             credentials,
             &[
-                "issue",
+                self.sub(),
                 "comment",
                 number.as_str(),
                 "--repo",
@@ -672,7 +986,7 @@ impl Issue<'_> {
         let out = self.gh(
             credentials,
             &[
-                "issue",
+                self.sub(),
                 "view",
                 number.as_str(),
                 "--repo",
@@ -824,6 +1138,23 @@ fn git(probe: &dyn Probe, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
     })?;
     if out.success {
         Ok(())
+    } else {
+        Err(Error::new(format!(
+            "gitが失敗しました: {}",
+            out.stderr.trim()
+        )))
+    }
+}
+
+/// gitを、使う人とシステムの設定を読まずに動かし、標準出力を返す。
+fn git_out(probe: &dyn Probe, args: &[&str]) -> Result<String> {
+    let out = probe
+        .run_with_env("git", args, ISOLATED_GIT_ENV)
+        .ok_or_else(|| {
+            Error::new("gitが見つかりません").with_hint("`agentcells doctor` で確かめてください")
+        })?;
+    if out.success {
+        Ok(out.stdout)
     } else {
         Err(Error::new(format!(
             "gitが失敗しました: {}",
@@ -1441,31 +1772,6 @@ mod tests {
     }
 
     #[test]
-    fn only_issue_cells_other_than_implement_run_for_now() {
-        let work = |item, cell: &str| Work {
-            product: "app".to_string(),
-            cell: cell.to_string(),
-            item,
-            repo: RepoName::parse("octo/app").unwrap(),
-            number: 1,
-            title: "t".to_string(),
-        };
-        let cell = |name: &str| Cell {
-            name: name.to_string(),
-            on: vec![Target::Issue],
-            label: format!("ac:{name}"),
-            prompt: None,
-            next: vec![],
-            review: false,
-            max_rounds: 3,
-            timeout_minutes: 30,
-        };
-        assert!(unsupported(&work(Target::Issue, "triage"), &cell("triage")).is_none());
-        assert!(unsupported(&work(Target::Issue, "implement"), &cell("implement")).is_some());
-        assert!(unsupported(&work(Target::PullRequest, "review"), &cell("review")).is_some());
-    }
-
-    #[test]
     fn unstopped_processes_mean_nothing_is_written_to_github() {
         use crate::probe::fake::FakeProbe;
         let dir = tempfile::tempdir().unwrap();
@@ -1493,6 +1799,7 @@ mod tests {
             probe: &probe,
             repo: &repo,
             number: 3,
+            kind: Target::Issue,
         };
         let place = Place::new(&home, &repo, 3);
         let cell = Cell {
