@@ -136,8 +136,13 @@ pub const AUTORUN_PATHS: &[&str] = &[
     ".envrc",
     ".husky",
     ".gitattributes",
+    ".gitmodules",
+    ".devcontainer.json",
     ".github/workflows",
 ];
+
+/// 下のディレクトリにあっても効くもの。パスのどこかの部分がこの名前なら断る。
+const AUTORUN_NAMES: &[&str] = &[".envrc", ".gitattributes", ".claude", ".mcp.json"];
 
 /// pushする前に、ブランチに足したコミット（`base` から `branch` まで）をすべて確かめる。
 /// AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る。
@@ -205,11 +210,15 @@ pub fn verify(
         // ":<古いmode> <新しいmode> <古いhash> <新しいhash> <状態>\t<パス>"
         let mut fields = line.split_whitespace();
         let new_mode = fields.nth(1);
+        let path = line.split('\t').nth(1).unwrap_or("?");
         if new_mode == Some("120000") {
-            let path = line.split('\t').nth(1).unwrap_or("?");
             return Ok(Some(format!(
                 "シンボリックリンクを足すコミットがあります: {path}"
             )));
+        }
+        // submoduleの中身はこのリポジトリにないので、確かめられない（人が --recursive でcloneすると入る）
+        if new_mode == Some("160000") {
+            return Ok(Some(format!("submoduleを足すコミットがあります: {path}")));
         }
     }
     let changed = git_out(
@@ -229,10 +238,15 @@ pub fn verify(
     )?;
     for path in changed.lines().filter(|l| !l.is_empty()) {
         let lower = path.to_lowercase();
-        if let Some(guarded) = AUTORUN_PATHS
+        let guarded = AUTORUN_PATHS
             .iter()
             .find(|g| lower == **g || lower.starts_with(&format!("{g}/")))
-        {
+            .or_else(|| {
+                AUTORUN_NAMES
+                    .iter()
+                    .find(|n| lower.split('/').any(|part| part == **n))
+            });
+        if let Some(guarded) = guarded {
             return Ok(Some(format!(
                 "人が開いたときに自動で動くファイル（{guarded}）を変えるコミットがあります: {path}"
             )));
@@ -547,6 +561,7 @@ mod tests {
             let scanner = fake_scanner(dir.path());
             let (staging, base) = staged(dir.path(), &[("tools/v/tasks.json", "{}")]);
             let work = dir.path().join("work");
+            // 名前を問わず、シンボリックリンクは断る
             std::os::unix::fs::symlink("tools/v", work.join(".vsc")).unwrap();
             git_in(&work, &["add", "-A"]);
             git_in(&work, &["commit", "-q", "-m", "link"]);
@@ -602,6 +617,7 @@ mod tests {
             for (path, content, expect) in [
                 (".claude/settings.json", "{}", ".claude"),
                 (".vscode/tasks.json", "{}", ".vscode"),
+                ("app/sub/.envrc", "export X=1", ".envrc"),
                 (".github/workflows/ci.yml", "on: push", ".github/workflows"),
                 ("src/config.rs", "token = FAKE-SECRET", "fake"),
             ] {

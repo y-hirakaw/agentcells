@@ -140,7 +140,7 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
 - ブランチの用意は、claudeを動かす前に、CLIが作ったばかりのcloneで行う
 - claudeのあと、AIが足したコミット（動かす前のブランチの先から）があれば、次のとおりにする
   - CLIがその場で作ったbareリポジトリにブランチを移し（`pr::stage`）、そこで確かめる。AIが書き換えられる `.git/config` を読まないため
-  - 確かめること（`pr::verify`）: 足したコミットのどれかに、置いた秘密のファイルと同じ中身のファイルがない（名前を変えても、途中のコミットだけでも）。人が開いたときに自動で動くファイル（`.claude/`、`.mcp.json`、`.vscode/tasks.json`、`.vscode/settings.json`、`.devcontainer/`、`.envrc`、`.husky/`、`.github/workflows/`）を変えていない。足した行に、betterleaksが見つける秘密らしいものがない（途中のコミットで足して消したものも）。AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る
+  - 確かめること（`pr::verify`）: 足したコミットのどれかに、置いた秘密のファイルと同じ中身のファイルがない（名前を変えても、途中のコミットだけでも）。人が開いたときに自動で動くファイル（`.claude/`、`.mcp.json`、`.vscode/`、`.idea/`、`.zed/`、`.cursor/`、`.devcontainer/`、`.devcontainer.json`、`.envrc`、`.husky/`、`.gitattributes`、`.gitmodules`、`.github/workflows/`。`.envrc`、`.gitattributes`、`.claude`、`.mcp.json` は下のディレクトリにあっても）を変えていない。シンボリックリンクとsubmoduleを足していない。足した行に、betterleaksが見つける秘密らしいものがない（途中のコミットで足して消したものも）。AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る
   - 問題があれば、pushせずに人間に回す（理由に秘密そのものは書かない）
   - pushは、そのbareリポジトリから、書き込みのトークンで行う
 - Issueの仕事で、AIが進めた先がPRを扱うcell（review）なら、そのブランチのPRを作る（開いているPRがあれば、それを使う）。PRの本文は目印、AIのコメント、`Closes <owner>/<repo>#<番号>`。作るときにoperatorを割り当てる（ガードが、agentcellsが作ったPRとして扱う）。本文もbetterleaksで調べる
