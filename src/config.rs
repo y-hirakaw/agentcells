@@ -62,6 +62,9 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # private_key = "github-app.pem"     # 秘密鍵（このファイルからの相対パス。権限は600にする）
 "#;
 
+/// ファイルの全体にかかる項目（見出しの外に書くもの）。
+const TOP_LEVEL_KEYS: &[&str] = &["operator"];
+
 /// 往復の上限。これより多く往復させず、人間に回す。
 pub const MAX_ROUNDS_LIMIT: u32 = 3;
 const DEFAULT_MAX_ROUNDS: u32 = MAX_ROUNDS_LIMIT;
@@ -256,8 +259,19 @@ impl Config {
     /// TOMLを読み、ファイルのパスを `base` からの相対パスとして解決する。
     fn read(text: &str, base: &Path) -> Result<Self> {
         let mut config: Config = toml::from_str(text).map_err(|e| {
-            Error::new(e.to_string().trim_end().to_string())
-                .with_hint("TOMLの書き方と項目名を確かめてください")
+            let message = e.to_string().trim_end().to_string();
+            // TOMLでは、[github_app] のような見出しのあとの行は、その見出しの中の項目になる。
+            // ファイルの全体にかかる項目を最後に書き足すと、見出しの中の知らない項目として断られる
+            let hint = match TOP_LEVEL_KEYS
+                .iter()
+                .find(|key| message.contains(&format!("unknown field `{key}`")))
+            {
+                Some(key) => format!(
+                    "{key} は、ファイルのいちばん上（最初の [ で始まる行より前）に書いてください。[...] の見出しのあとに書くと、その見出しの中の項目として読まれます"
+                ),
+                None => "TOMLの書き方と項目名を確かめてください".to_string(),
+            };
+            Error::new(message).with_hint(hint)
         })?;
         for cell in &mut config.cells {
             if let Some(prompt) = &mut cell.prompt {
@@ -719,6 +733,16 @@ timeout_minutes = 10
         let err = Config::parse("[[cell]]\nnmae = \"x\"\n", Path::new("/")).unwrap_err();
         assert!(err.message.contains("nmae"), "{}", err.message);
         assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn operator_written_under_a_table_points_to_the_top_of_the_file() {
+        let text = format!(
+            "{}\n[github_app]\nid = \"1\"\nprivate_key = \"k.pem\"\noperator = \"me\"\n",
+            VALID.replace("operator = \"y-hirakaw\"\n", "")
+        );
+        let err = Config::parse(&text, Path::new("/")).unwrap_err();
+        assert!(err.hint.unwrap().contains("ファイルのいちばん上"));
     }
 
     #[test]
