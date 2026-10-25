@@ -6,8 +6,10 @@
 //!
 //! 確かめる起点は、operatorが「承認」した時刻（operator自身が、productのどれかのcellのラベルを最後に付けた時刻）。
 //! agentcellsが次のcellのラベルを付けた時刻を起点にすると、cellが動いている間のほかの人の書き換えを見逃すため。
-//! ghのアカウントで書き込むと、agentcellsが付けたラベルもoperatorのログインで残る。agentcellsは、次のcellの
-//! ラベルを付けるのと同時に `ac:working` を外すので、同じ人が数秒以内に `ac:working` を外したラベルは、承認とみなさない。
+//! ghのアカウントで書き込むと、agentcellsが付けたラベルもoperatorのログインで残る。agentcellsは、動かす前に
+//! `ac:working` を付け、次のcellのラベルを付けてから `ac:working` を外す。そこで、同じ人が `ac:working` を
+//! 付けてから外すまでの間（両端を含む）に付けたcellのラベルは、承認とみなさない。時刻の差ではなく順序で
+//! 見分けるので、付け替えが遅れても、承認とみなす側には倒れない。
 //!
 //! Issueの仕事:
 //! - Assigneesにoperatorがいて、operatorを最後に割り当てたのがoperator自身
@@ -31,9 +33,6 @@ use crate::error::{Error, Result};
 use crate::home::RepoName;
 use crate::labels::WORKING;
 use crate::probe::Probe;
-
-/// agentcellsが付けたラベルと、同時に外した `ac:working` の時刻の差の上限（秒）。
-const TRANSITION_WINDOW_SECONDS: i64 = 5;
 
 /// 動かしてよい人。
 #[derive(Debug, Clone)]
@@ -232,7 +231,7 @@ impl History {
     }
 
     /// operatorが、cellのラベルのどれかを最後に付けた時刻。agentcellsが次のcellへ進めたもの
-    /// （同じ人が、数秒以内に `ac:working` を外している）は除く。
+    /// （同じ人の `ac:working` が付いている間に付けたもの）は除く。
     fn approved_at(&self, cell_labels: &[String], actors: &Actors) -> Option<&str> {
         self.events
             .iter()
@@ -248,20 +247,29 @@ impl History {
             .map(|e| e.created_at.as_str())
     }
 
-    /// agentcellsが次のcellへ進めたときのラベルか（同じ人が、数秒以内に `ac:working` を外している）。
-    /// 時刻を読めなければ、承認とみなさない側に倒す。
+    /// agentcellsが次のcellへ進めたときのラベルか。同じ人が `ac:working` を付けてから外すまでの間
+    /// （両端を含む。まだ外していなければ、付けてから今まで）に付けたものなら、そうみなす。
     fn is_transition(&self, labeled: &Event) -> bool {
-        let Some(at) = seconds(&labeled.created_at) else {
-            return true;
-        };
-        self.events.iter().any(|e| {
-            e.event == "unlabeled"
-                && login(&e.actor).eq_ignore_ascii_case(login(&labeled.actor))
+        let actor = login(&labeled.actor);
+        let working = |e: &Event, kind: &str| {
+            e.event == kind
+                && login(&e.actor).eq_ignore_ascii_case(actor)
                 && e.label
                     .as_ref()
                     .is_some_and(|l| l.name.eq_ignore_ascii_case(WORKING))
-                && seconds(&e.created_at)
-                    .is_none_or(|t| (t - at).abs() <= TRANSITION_WINDOW_SECONDS)
+        };
+        let at = labeled.created_at.as_str();
+        self.events.iter().enumerate().any(|(i, start)| {
+            if !working(start, "labeled") || start.created_at.as_str() > at {
+                return false;
+            }
+            match self.events[i + 1..]
+                .iter()
+                .find(|e| working(e, "unlabeled"))
+            {
+                Some(end) => at <= end.created_at.as_str(),
+                None => true,
+            }
         })
     }
 
@@ -324,25 +332,6 @@ fn edited_by_others(
         .page_info
         .more()
         .then(|| "書き換えが多すぎて確かめきれません".to_string())
-}
-
-/// `2026-10-25T02:00:00Z` の形の時刻を、1970年からの秒にする。
-fn seconds(at: &str) -> Option<i64> {
-    let at = at.strip_suffix('Z')?;
-    let (date, time) = at.split_once('T')?;
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
-    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
-    let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
-    let (h, mi, s) = (t.next()??, t.next()??, t.next()??);
-    // 暦の日付から日数を求める（Howard Hinnant の days_from_civil）
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + h * 3_600 + mi * 60 + s)
 }
 
 /// 見送る理由に、「見直して、ラベルを付け直すと動きます」を足す。
@@ -812,10 +801,12 @@ mod tests {
             writer: "y-hirakaw".to_string(),
         };
         let mut events = approved_issue();
-        // T3 に書き換えられ、T4 にagentcellsが ac:working を外して次のcellへ進めた
+        // T2 の承認のあと、agentcellsが ac:working を付けて動かし、T3 に書き換えられ、
+        // T4 にagentcellsが次のcellのラベルを付けてから ac:working を外した（時刻が離れていても見分ける）
+        events.push(labeled("y-hirakaw", "ac:working", "2026-10-25T02:30:00Z"));
         events.push(unlabeled("y-hirakaw", "ac:triage", T4));
-        events.push(unlabeled("y-hirakaw", "ac:working", T4));
         events.push(labeled("y-hirakaw", "ac:implement", T4));
+        events.push(unlabeled("y-hirakaw", "ac:working", "2026-10-25T04:05:00Z"));
         let probe = with_history(
             FakeProbe::default(),
             "octo/app",
@@ -839,6 +830,18 @@ mod tests {
         };
         let reason = check(&probe, &request, &same).unwrap().unwrap();
         assert!(reason.contains("本文を、eager"), "{reason}");
+
+        // ac:working を外したあとに、operatorが付け直したものは承認になる
+        let mut events = events.clone();
+        events.push(labeled("y-hirakaw", "ac:implement", "2026-10-25T05:00:00Z"));
+        let probe = with_history(
+            FakeProbe::default(),
+            "octo/app",
+            3,
+            &events,
+            &body_edit("eager", T3),
+        );
+        assert_eq!(check(&probe, &request, &same).unwrap(), None);
     }
 
     #[test]
@@ -859,14 +862,6 @@ mod tests {
                 .unwrap()
                 .contains("Assignees に y-hirakaw がいません")
         );
-    }
-
-    #[test]
-    fn reads_timestamps() {
-        assert_eq!(seconds("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(seconds("2026-10-25T02:00:05Z"), Some(1_792_893_605));
-        assert_eq!(seconds("2000-03-01T00:00:00Z"), Some(951_868_800));
-        assert_eq!(seconds("bad"), None);
     }
 
     #[test]

@@ -122,7 +122,7 @@ cellを使う人（`config.toml` の `operator`）が自分で決めたIssue/PR�
 operator = "y-hirakaw"   # cellを使うあなたのGitHubのログイン（productがあれば必ず書く）
 ```
 
-Issue/PRの履歴（events API）と編集の履歴（GraphQLの `userContentEdits`）は、書いた人をあとから変えられないので、それで確かめる。確かめる起点は、operatorが「承認」した時刻（operator自身が、productのどれかのcellのラベルを最後に付けた時刻）にする。agentcellsが次のcellのラベルを付けた時刻を起点にすると、cellが動いている間（最大で `timeout_minutes`）のほかの人の書き換えを、次のcellで見逃すため。ghのアカウントで書き込むと、agentcellsが付けたラベルもoperatorのログインで残る。agentcellsは次のcellのラベルを付けるのと同時に `ac:working` を外すので、同じ人が5秒以内に `ac:working` を外したラベルは、承認とみなさない。
+Issue/PRの履歴（events API）と編集の履歴（GraphQLの `userContentEdits`）は、書いた人をあとから変えられないので、それで確かめる。確かめる起点は、operatorが「承認」した時刻（operator自身が、productのどれかのcellのラベルを最後に付けた時刻）にする。agentcellsが次のcellのラベルを付けた時刻を起点にすると、cellが動いている間（最大で `timeout_minutes`）のほかの人の書き換えを、次のcellで見逃すため。ghのアカウントで書き込むと、agentcellsが付けたラベルもoperatorのログインで残る。agentcellsは、動かす前に `ac:working` を付け、次のcellのラベルを付けてから `ac:working` を外す（この順にする）。そこで、同じ人が `ac:working` を付けてから外すまでの間（両端を含む）に付けたcellのラベルは、承認とみなさない。時刻の差ではなく順序で見分けるので、付け替えが遅れても承認とみなす側には倒れない。ghのアカウントで書き込んでいて、動かし直すときは、`ac:working` を外してから、別の操作でラベルを付け直す（一度にすると、付け替えに見えて承認にならない）
 
 Issueの仕事は、次のすべてを満たすものだけを動かす。
 

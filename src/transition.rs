@@ -125,6 +125,9 @@ pub struct Plan {
 
 /// AIが選んだ先を確かめて、ラベルの付け替えを決める。
 ///
+/// 付け替えるときは、`add` を付けてから `remove`（`ac:working` を含む）を外す順にする。guardは、
+/// `ac:working` が付いている間に付いたcellのラベルを、agentcellsの付け替えとして承認から除くため。
+///
 /// `runs` は、そのcellがこのIssue/PRですでに何回動いたかを返す（往復の上限に使う）。
 pub fn plan(
     config: &Config,

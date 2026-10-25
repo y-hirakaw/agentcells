@@ -13,7 +13,7 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - **cellを使う人が自分で決めたIssue/PRだけを動かす**
   - `config.toml` に、cellを使う人のGitHubのログイン（`operator`）を書く。productがあれば必ず書く
   - Assigneesにoperatorがいて、operatorを割り当てたのがoperator自身で、cellのラベルを最後に付けたのがoperatorかagentcells自身のものだけを動かす。operatorが承認した（cellのラベルを自分で付けた）あとに、ほかの人がタイトル・本文・operatorのコメントやレビューを書き換えていたら止める。公開リポジトリで、書き込みの権限を持つほかの人がラベルやAssigneesを変えて、勝手に始めさせないため
-  - 起点をoperatorの承認の時刻にし、agentcellsが次のcellのラベルを付けた時刻にはしない。cellが動いている間の書き換えを、次のcellで見逃さないため。ghのアカウントで書き込むとagentcellsのラベルもoperatorの名前で残るので、同時に `ac:working` を外したラベルは承認とみなさない
+  - 起点をoperatorの承認の時刻にし、agentcellsが次のcellのラベルを付けた時刻にはしない。cellが動いている間の書き換えを、次のcellで見逃さないため。ghのアカウントで書き込むとagentcellsのラベルもoperatorの名前で残るので、`ac:working` が付いている間に同じ人が付けたラベルは承認とみなさない
   - agentcellsが作ったPRには、作るときにoperatorを割り当て、元のIssueの承認を引き継ぐ。元のIssueも同じように確かめる。元のIssueが閉じたり、operatorが外れたりしたら、PRも動かさない
   - 確かめきれないとき（履歴が多すぎる、読めない）は動かさない。1件の履歴を読めなくても、ほかの仕事は進める
   - 見送ったものは、`tick --dry-run` に理由を出す。Issue/PRにはコメントしない
