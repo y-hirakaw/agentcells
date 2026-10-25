@@ -2,6 +2,7 @@
 //!
 //! 仕事は、cellのラベルが付いていて、処理中（`ac:working`）でも人間待ち（`ac:needs-human`）でもない、
 //! 開いているIssue/PR。Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す。
+//! そのうち、cellを使う人（operator）が自分で決めたものだけを動かす（[`guard`]）。
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,6 +12,7 @@ use serde::Deserialize;
 use crate::config::{Config, Target};
 use crate::error::{Error, Result};
 use crate::github::Credentials;
+use crate::guard::{self, Actors};
 use crate::home::{Home, RepoName};
 use crate::labels::{NEEDS_HUMAN, WORKING};
 use crate::probe::Probe;
@@ -57,12 +59,21 @@ pub fn lock(home: &Home) -> Result<Option<Lock>> {
     }
 }
 
+/// 見つかった仕事と、見送ったもの（理由つき）。
+#[derive(Debug, Default)]
+pub struct Found {
+    pub work: Vec<Work>,
+    pub skipped: Vec<(Work, String)>,
+}
+
 #[derive(Deserialize)]
 struct Listed {
     number: u64,
     title: String,
     #[serde(default)]
     labels: Vec<ListedLabel>,
+    #[serde(default)]
+    assignees: Vec<ListedUser>,
 }
 
 #[derive(Deserialize)]
@@ -70,16 +81,23 @@ struct ListedLabel {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct ListedUser {
+    login: String,
+}
+
 /// 仕事を探す。productとcellを設定の順に見て、同じcellの中では番号の小さい順に並べる。
 ///
 /// `credentials_for` は、リポジトリを読むための認証を返す（ghの設定はAIが書き換えられるので、
 /// 読むときもトークンと空の設定のghを使う）。
+/// Assigneesにoperatorがいないものと、[`guard::check`] が止めたものは、理由を付けて見送る。
 pub fn find(
     config: &Config,
     probe: &dyn Probe,
     credentials_for: &dyn Fn(&RepoName) -> Result<Credentials>,
-) -> Result<Vec<Work>> {
-    let mut found = Vec::new();
+    actors: &Actors,
+) -> Result<Found> {
+    let mut found = Found::default();
     // Appのトークンはリポジトリごとなので、1回のtickの中ではリポジトリごとに1つだけ作って使い回す
     let mut cache: HashMap<RepoName, Credentials> = HashMap::new();
     for product in &config.products {
@@ -99,25 +117,36 @@ pub fn find(
                     let env = cache[repo].gh_env()?;
                     let mut items = list(probe, &env, item, repo, &cell.label)?;
                     items.sort_by_key(|i| i.number);
-                    found.extend(
-                        items
-                            .into_iter()
-                            .filter(|i| {
-                                // GitHubのラベル名は大文字・小文字を区別しない
-                                !i.labels.iter().any(|l| {
-                                    l.name.eq_ignore_ascii_case(WORKING)
-                                        || l.name.eq_ignore_ascii_case(NEEDS_HUMAN)
-                                })
-                            })
-                            .map(|i| Work {
-                                product: product.name.clone(),
-                                cell: cell.name.clone(),
-                                item,
-                                repo: repo.clone(),
-                                number: i.number,
-                                title: i.title,
-                            }),
-                    );
+                    for i in items {
+                        // GitHubのラベル名は大文字・小文字を区別しない
+                        if i.labels.iter().any(|l| {
+                            l.name.eq_ignore_ascii_case(WORKING)
+                                || l.name.eq_ignore_ascii_case(NEEDS_HUMAN)
+                        }) {
+                            continue;
+                        }
+                        let work = Work {
+                            product: product.name.clone(),
+                            cell: cell.name.clone(),
+                            item,
+                            repo: repo.clone(),
+                            number: i.number,
+                            title: i.title,
+                        };
+                        if !i
+                            .assignees
+                            .iter()
+                            .any(|a| a.login.eq_ignore_ascii_case(&actors.operator))
+                        {
+                            let reason = format!("Assignees に {} がいません", actors.operator);
+                            found.skipped.push((work, reason));
+                            continue;
+                        }
+                        match guard::check(probe, &env, repo, i.number, &cell.label, actors)? {
+                            None => found.work.push(work),
+                            Some(reason) => found.skipped.push((work, reason)),
+                        }
+                    }
                 }
             }
         }
@@ -147,7 +176,7 @@ fn list(
         "--state",
         "open",
         "--json",
-        "number,title,labels",
+        "number,title,labels,assignees",
         "--limit",
         "100",
     ];
@@ -169,11 +198,33 @@ fn list(
 mod tests {
     use super::*;
     use crate::github::Source;
+    use crate::guard::fake::{NO_EDITS, assigned, labeled, with_history};
     use crate::probe::fake::FakeProbe;
+
+    fn actors() -> Actors {
+        Actors {
+            operator: "me".to_string(),
+            writer: "bot[bot]".to_string(),
+        }
+    }
+
+    const ME: &str = r#""assignees":[{"login":"me"}]"#;
+
+    /// operatorが自分を割り当て、ラベルを付けた履歴。
+    fn approved(probe: FakeProbe, repo: &str, number: u64, label: &str) -> FakeProbe {
+        let events = [
+            assigned("me", "me", "2026-10-25T01:00:00Z"),
+            labeled("me", label, "2026-10-25T02:00:00Z"),
+        ];
+        let events: Vec<&str> = events.iter().map(String::as_str).collect();
+        with_history(probe, repo, number, &events, NO_EDITS)
+    }
 
     fn config() -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
         let text = r#"
+operator = "me"
+
 [[product]]
 name = "app"
 issues = "octo/issues"
@@ -205,24 +256,51 @@ next = ["done"]
         let (_dir, config) = config();
         let probe = FakeProbe::default()
             .with(
-                "gh issue list --repo octo/issues --label ac:triage --state open --json number,title,labels --limit 100",
+                "gh issue list --repo octo/issues --label ac:triage --state open --json number,title,labels,assignees --limit 100",
                 true,
-                r#"[{"number":9,"title":"後","labels":[{"name":"ac:triage"}]},
-                    {"number":3,"title":"先","labels":[{"name":"ac:triage"}]},
-                    {"number":4,"title":"処理中","labels":[{"name":"ac:triage"},{"name":"ac:working"}]},
-                    {"number":5,"title":"人間待ち","labels":[{"name":"ac:triage"},{"name":"AC:Needs-Human"}]}]"#,
+                &format!(r#"[{{"number":9,"title":"後","labels":[{{"name":"ac:triage"}}],{ME}}},
+                    {{"number":3,"title":"先","labels":[{{"name":"ac:triage"}}],{ME}}},
+                    {{"number":4,"title":"処理中","labels":[{{"name":"ac:triage"}},{{"name":"ac:working"}}],{ME}}},
+                    {{"number":5,"title":"人間待ち","labels":[{{"name":"ac:triage"}},{{"name":"AC:Needs-Human"}}],{ME}}},
+                    {{"number":6,"title":"他人の","labels":[{{"name":"ac:triage"}}],"assignees":[{{"login":"other"}}]}},
+                    {{"number":7,"title":"勝手に","labels":[{{"name":"ac:triage"}}],{ME}}}]"#),
             )
             .with(
-                "gh pr list --repo octo/app --label ac:review --state open --json number,title,labels --limit 100",
+                "gh pr list --repo octo/app --label ac:review --state open --json number,title,labels,assignees --limit 100",
                 true,
-                r#"[{"number":12,"title":"PR","labels":[{"name":"ac:review"}]}]"#,
+                &format!(r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME}}}]"#),
             )
             .with(
-                "gh pr list --repo octo/web --label ac:review --state open --json number,title,labels --limit 100",
+                "gh pr list --repo octo/web --label ac:review --state open --json number,title,labels,assignees --limit 100",
                 true,
                 "[]",
             );
-        let work = find(&config, &probe, &token).unwrap();
+        let probe = approved(probe, "octo/issues", 9, "ac:triage");
+        let probe = approved(probe, "octo/issues", 3, "ac:triage");
+        let probe = approved(probe, "octo/app", 12, "ac:review");
+        // ほかの人がラベルを付けた
+        let eager = [
+            assigned("me", "me", "2026-10-25T01:00:00Z"),
+            labeled("eager", "ac:triage", "2026-10-25T02:00:00Z"),
+        ];
+        let eager: Vec<&str> = eager.iter().map(String::as_str).collect();
+        let probe = with_history(probe, "octo/issues", 7, &eager, NO_EDITS);
+        let found = find(&config, &probe, &token, &actors()).unwrap();
+        let skipped: Vec<String> = found
+            .skipped
+            .iter()
+            .map(|(w, reason)| format!("{} {reason}", w.number))
+            .collect();
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(
+            skipped[0].starts_with("6 Assignees に me がいません"),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped[1].starts_with("7 ラベル「ac:triage」を最後に付けたのが eager"),
+            "{skipped:?}"
+        );
+        let work = found.work;
         let described: Vec<String> = work.iter().map(Work::describe).collect();
         assert_eq!(
             described,
@@ -234,8 +312,12 @@ next = ["done"]
         );
         // リポジトリごとのトークンで、空のghの設定を使って読む
         for (call, env) in probe.calls.borrow().iter().zip(probe.envs.borrow().iter()) {
-            let repo = call.split("--repo octo/").nth(1).unwrap();
-            let name = repo.split(' ').next().unwrap();
+            // 一覧は --repo、履歴は /repos/ のパス、編集の履歴はGraphQLの name でリポジトリを渡す
+            let rest = ["--repo octo/", "/repos/octo/", "-F name="]
+                .iter()
+                .find_map(|key| call.split(key).nth(1))
+                .unwrap();
+            let name = rest.split([' ', '/']).next().unwrap();
             assert!(
                 env.contains(&("GH_TOKEN".to_string(), format!("ghs_{name}"))),
                 "{call}: {env:?}"
@@ -258,7 +340,7 @@ next = ["done"]
         ] {
             probe = probe.with(
                 &format!(
-                    "gh {kind} list --repo octo/issues --label {label} --state open --json number,title,labels --limit 100"
+                    "gh {kind} list --repo octo/issues --label {label} --state open --json number,title,labels,assignees --limit 100"
                 ),
                 true,
                 "[]",
@@ -269,7 +351,12 @@ next = ["done"]
             made.set(made.get() + 1);
             token(repo)
         };
-        assert!(find(&config, &probe, &counting).unwrap().is_empty());
+        assert!(
+            find(&config, &probe, &counting, &actors())
+                .unwrap()
+                .work
+                .is_empty()
+        );
         assert_eq!(probe.calls.borrow().len(), 3);
         assert_eq!(made.get(), 1);
     }
@@ -278,7 +365,7 @@ next = ["done"]
     fn list_failures_point_to_doctor() {
         let (_dir, config) = config();
         let probe = FakeProbe::default().with_fallback(false);
-        let err = find(&config, &probe, &token).unwrap_err();
+        let err = find(&config, &probe, &token, &actors()).unwrap_err();
         assert!(err.hint.unwrap().contains("agentcells doctor"));
     }
 

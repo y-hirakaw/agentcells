@@ -6,6 +6,16 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.4.0] - 2026-10-25
+
+### 追加
+
+- **cellを使う人が自分で決めたIssue/PRだけを動かす**
+  - `config.toml` に、cellを使う人のGitHubのログイン（`operator`）を書く。productがあれば必ず書く
+  - Assigneesにoperatorがいて、operatorを割り当てたのがoperator自身で、cellのラベルを最後に付けたのがoperatorかagentcells自身のものだけを動かす。そのラベルを付けたあとに、ほかの人がタイトル・本文・operatorのコメントを書き換えていたら止める。公開リポジトリで、書き込みの権限を持つほかの人がラベルやAssigneesを変えて、勝手に始めさせないため
+  - 見送ったものは、`tick --dry-run` に理由を出す。Issue/PRにはコメントしない
+  - プロンプトで指示として扱う人間のコメントを、operatorのものだけにした。ほかの人のものは、リポジトリのメンバーでも、参考として分けて渡す。ラベルを付けずに、コメントで指示を足せてしまうため
+
 ## [0.3.0] - 2026-10-25
 
 ### 追加

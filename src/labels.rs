@@ -170,6 +170,8 @@ mod tests {
             std::fs::write(dir.path().join(name), "prompt").unwrap();
         }
         let text = r#"
+operator = "me"
+
 [[product]]
 name = "a"
 issues = "octo/issues"

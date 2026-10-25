@@ -208,7 +208,7 @@ fn api_one<T: for<'de> Deserialize<'de>>(
 }
 
 /// 一覧を、ページをまたいで全部読む。`--jq .[]` で1行に1件ずつ出させる。
-fn api_list<T: for<'de> Deserialize<'de>>(
+pub(crate) fn api_list<T: for<'de> Deserialize<'de>>(
     probe: &dyn Probe,
     env: &[(&str, &str)],
     path: &str,

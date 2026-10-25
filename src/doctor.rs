@@ -432,6 +432,8 @@ mod tests {
     }
 
     const CONFIG: &str = r#"
+operator = "me"
+
 [[product]]
 name = "app"
 issues = "octo/app"

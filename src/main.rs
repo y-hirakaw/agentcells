@@ -9,6 +9,7 @@ use agentcells::doctor::{self, Status};
 use agentcells::error::{Error, Result};
 use agentcells::files;
 use agentcells::github::{self, Purpose};
+use agentcells::guard;
 use agentcells::home::{Home, RepoName};
 use agentcells::labels;
 use agentcells::probe::SystemProbe;
@@ -194,7 +195,16 @@ fn run(command: Commands) -> Result<ExitCode> {
             let config = Config::load(&home.config_path())?;
             let credentials_for =
                 |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
-            let work = tick::find(&config, &SystemProbe, &credentials_for)?;
+            let actors = guard::Actors {
+                // 設定を読むときに、productがあれば operator は必ずある
+                operator: config.operator.clone().unwrap_or_default(),
+                writer: prompt::writer_login(&config, &SystemProbe)?,
+            };
+            let found = tick::find(&config, &SystemProbe, &credentials_for, &actors)?;
+            for (w, reason) in &found.skipped {
+                println!("見送り: {}（{reason}）", w.describe());
+            }
+            let work = found.work;
             if work.is_empty() {
                 println!("仕事はありません");
                 return Ok(ExitCode::SUCCESS);

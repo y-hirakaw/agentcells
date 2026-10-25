@@ -255,6 +255,8 @@ mod tests {
     use super::*;
 
     const CONFIG: &str = r#"
+operator = "me"
+
 [[product]]
 name = "app"
 issues = "octo/app"

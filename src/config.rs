@@ -17,6 +17,11 @@ use crate::transition;
 /// `agentcells setup` が、設定ファイルがないときに置く雛形。
 pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://github.com/y-hirakaw/agentcells を見てください。
 #
+# operator: cellを使うあなたのGitHubのログイン。あなたがAssigneesに自分を入れ、cellのラベルを付けたIssue/PRだけが動きます
+# （ほかの人がラベルやAssigneesを変えても、勝手に始まりません）
+#
+# operator = "your-login"
+#
 # product: どのリポジトリのIssueを、どのリポジトリで作業するか
 #
 # [[product]]
@@ -65,6 +70,9 @@ const DEFAULT_TIMEOUT_MINUTES: u32 = 30;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// cellを使う人のGitHubのログイン。この人が自分で決めたIssue/PRだけを動かす
+    #[serde(default)]
+    pub operator: Option<String>,
     #[serde(default, rename = "product")]
     pub products: Vec<Product>,
     #[serde(default, rename = "cell")]
@@ -303,6 +311,17 @@ impl Config {
     fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
 
+        match &self.operator {
+            Some(login) if !is_valid_login(login) => problems.push(format!(
+                "operator の「{login}」はGitHubのログインではありません（英数字と -、39文字まで）"
+            )),
+            None if !self.products.is_empty() => problems.push(
+                "operator に、cellを使うあなたのGitHubのログインを書いてください（あなたが自分で決めたIssue/PRだけを動かすため）"
+                    .to_string(),
+            ),
+            _ => {}
+        }
+
         let mut product_names = HashSet::new();
         for p in &self.products {
             if !is_valid_name(&p.name) {
@@ -503,6 +522,15 @@ fn is_valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// GitHubのログイン（英数字と -、39文字まで。- で始まったり終わったりしない）。
+fn is_valid_login(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 39
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 fn has_parent_dir(path: &Path) -> bool {
     path.components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -527,6 +555,8 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"
+operator = "y-hirakaw"
+
 [[product]]
 name = "agentcells"
 issues = "y-hirakaw/agentcells"
@@ -847,6 +877,19 @@ timeout_minutes = 10
         let config = Config::parse(VALID, dir.path()).unwrap();
         assert!(config.products[0].sandbox.read.is_empty());
         assert!(config.products[0].sandbox.network.is_empty());
+    }
+
+    #[test]
+    fn operator_is_required_with_products_and_must_be_a_login() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(VALID, dir.path()).unwrap();
+        assert_eq!(config.operator.as_deref(), Some("y-hirakaw"));
+
+        let message = problems_of(&VALID.replace("operator = \"y-hirakaw\"\n", ""));
+        assert!(message.contains("operator に"), "{message}");
+        let message =
+            problems_of(&VALID.replace("y-hirakaw\"\n\n[[product]]", "bad login\"\n\n[[product]]"));
+        assert!(message.contains("「bad login」"), "{message}");
     }
 
     #[test]
