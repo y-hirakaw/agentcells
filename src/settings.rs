@@ -55,6 +55,14 @@ pub const SECRET_PLACES: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".config/gcloud",
+    ".config/hub",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".android/adbkey",
+    ".gradle/gradle.properties",
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
+    ".gem/credentials",
     "Library/Keychains",
 ];
 

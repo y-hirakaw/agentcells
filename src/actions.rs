@@ -647,6 +647,7 @@ fn run_command(
         .stderr(std::process::Stdio::piped());
     let maven_opts = std::env::var("MAVEN_OPTS").ok();
     for (name, dir) in &context.caches {
+        crate::caches::clean(name, dir)?;
         cmd.envs(crate::caches::env(name, dir, maven_opts.as_deref()));
     }
     let mut child = cmd
@@ -751,7 +752,8 @@ fn blocked_places(line: &str, user_home: &Path) -> Vec<PathBuf> {
 
 /// 止められた場所から、`[product.sandbox]` に足すとよい書き方を作る。
 /// - 使う人のビルドツールのキャッシュなら、agentcellsが持つキャッシュ（`caches`）を勧める
-/// - それ以外は、ホームのすぐ下の名前（`~/Library` などは、もう1つ下）を `read` で勧める
+/// - それ以外は、止められたパスそのもの（`bin/` の下なら、その `bin`）を `read` で勧める。広く丸めると、
+///   同じ場所にある秘密（`~/.cargo/credentials.toml`、`~/.android/adbkey` など）まで開けることになるため
 ///   （止められたのが読むことか書くことかは、出力からはわからない。書かせると手元のツールに効くので、まず読ませる）
 /// - 開けられない場所（秘密がよく置かれる場所、書かせない場所、agentcellsの置き場所）は勧めない
 fn suggestions(blocked: &[PathBuf], user_home: &Path, worktree: &Path) -> Vec<String> {
@@ -774,24 +776,23 @@ fn suggestions(blocked: &[PathBuf], user_home: &Path, worktree: &Path) -> Vec<St
         let Ok(relative) = path.strip_prefix(user_home) else {
             continue;
         };
-        let mut parts = relative
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy());
-        let Some(first) = parts.next() else {
-            continue;
-        };
-        let mut place = PathBuf::from(first.as_ref());
-        if matches!(first.as_ref(), "Library" | ".config" | ".local")
-            && let Some(second) = parts.next()
-        {
-            place.push(second.as_ref());
+        let mut place = PathBuf::new();
+        for part in relative.components() {
+            place.push(part);
+            if part.as_os_str() == "bin" {
+                break;
+            }
         }
-        let resolved = user_home
-            .join(&place)
+        if place.as_os_str().is_empty() {
+            continue;
+        }
+        // 作業の場所と同じ、ホームのすぐ下の場所（~/.agentcells）の中は開けられない
+        let top: PathBuf = relative.components().take(1).collect();
+        let top = user_home
+            .join(&top)
             .canonicalize()
-            .unwrap_or_else(|_| user_home.join(&place));
-        // 作業の場所を含む場所（~/.agentcells）は開けられない
-        if worktree.starts_with(&resolved) || guarded(relative) {
+            .unwrap_or_else(|_| user_home.join(&top));
+        if worktree.starts_with(&top) || guarded(relative) {
             continue;
         }
         let suggestion = match crate::caches::for_place(relative) {
@@ -800,7 +801,7 @@ fn suggestions(blocked: &[PathBuf], user_home: &Path, worktree: &Path) -> Vec<St
                 relative.display()
             ),
             None => format!(
-                "~/{} → read = [\"~/{}\"]（読むだけ。ファイル1つだけでもよい）",
+                "~/{} → read = [\"~/{}\"]（読むだけ）",
                 relative.display(),
                 place.display()
             ),
@@ -1127,14 +1128,26 @@ echo "[]"
             ".ssh/id_ed25519",
             ".zshrc",
             ".agentcells/files/octo/app/key.jks",
+            ".cargo/bin/cargo",
+            ".android/debug.keystore",
+            ".cargo/credentials.toml",
         ]
         .iter()
         .map(|p| home.join(p))
         .collect();
         let out = suggestions(&blocked, home, worktree);
-        assert_eq!(out.len(), 2, "{out:?}");
+        // 広く丸めない（~/.cargo や ~/.android には、秘密も置かれている）
+        assert_eq!(out.len(), 4, "{out:?}");
         assert!(out[0].contains("caches = [\"gradle\"]"), "{out:?}");
-        assert!(out[1].contains("read = [\"~/Library/Android\"]"), "{out:?}");
+        assert!(
+            out[1].contains("read = [\"~/Library/Android/sdk/licenses\"]"),
+            "{out:?}"
+        );
+        assert!(out[2].contains("read = [\"~/.cargo/bin\"]"), "{out:?}");
+        assert!(
+            out[3].contains("read = [\"~/.android/debug.keystore\"]"),
+            "{out:?}"
+        );
     }
 
     #[test]

@@ -11,5 +11,5 @@ agentcells は、GitHub の Issue と PR を、AI の cell（triage、implement�
 - comment は、Issue/PR を読む人間に向けて書きます。Issue と同じ言語で、何をしたか、なぜその進め先にしたかが分かるように、短く書いてください。人を `@` で呼ばないでください（通知が飛びます）
 - 作業は、今いるディレクトリ（この仕事のための worktree）の中だけでしてください。git の設定（`git config`、hooks）、gh などのツールの設定、worktree の外のファイルは変えないでください
 - 読めないようにしてあるファイル（秘密の設定など）は、読もうとしないでください
-- コマンド（`agentcells cell run` のビルドやテストを含む）は sandbox の中で動きます。ホームの下は決まった場所しか読めず、外へは決まった先にしか通信できません。読み書きできないこと（`Operation not permitted`。`agentcells cell run` が、足すとよい場所を最後に出します）や、通信を止められたこと（`deny network-outbound <ホスト>:<ポート>`）で進められないときは、別の道を探さずに needs-human にしてください。comment には、止まった場所やホストと、`config.toml` の `[product.sandbox]` に足すとよい行（例: `caches = ["gradle"]`、`read = ["~/Library/Android"]`、`network = ["services.gradle.org"]`）を書いてください。足すかどうかは人間が決めます
+- コマンド（`agentcells cell run` のビルドやテストを含む）は sandbox の中で動きます。ホームの下は決まった場所しか読めず、外へは決まった先にしか通信できません。読み書きできないこと（`Operation not permitted`。`agentcells cell run` が、足すとよい場所を最後に出します）や、通信を止められたこと（`deny network-outbound <ホスト>:<ポート>`）で進められないときは、別の道を探さずに needs-human にしてください。comment には、止まった場所やホストと、`config.toml` の `[product.sandbox]` に足すとよい行（例: `caches = ["gradle"]`、`read = ["~/Library/Android/sdk"]`、`network = ["services.gradle.org"]`）を書いてください。足すかどうかは人間が決めます
 - コミットに秘密らしいものがあると、`agentcells cell commit` が断ります。秘密を消してからコミットし直してください。秘密ではないと考えるときは、needs-human にして理由を書いてください

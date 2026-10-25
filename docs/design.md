@@ -201,7 +201,7 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
 - macOSの本当の一時ディレクトリ（`/var/folders/.../T`）は読める。xcrunやJavaがそこを使い、読ませないとビルドが止まるため。ほかのアプリの一時ファイルが読める（残る危険）
 - 使う人のホームの下は、読ませない。読めるのは、今の仕事の作業場所と `.git` の実体、共有している元のリポジトリのオブジェクト、今の仕事のファイル、sandboxで動かすプログラム（agentcellsとbetterleaks）、productの `[product.sandbox]` の `read` に書いた場所だけ。ホームの外（`/usr`、`/opt/homebrew` など）は読める
   - 「読ませない場所」を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまう。読ませる場所を並べる形にし、足りなければビルドが失敗して人間に回るので、何を足せばよいかがわかる。開けた場所の秘密は読まれうるので、何を開けるかは使う人が決める
-- `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は、`read` で広い場所（`~` や `~/.config`）を開けても読ませない。sandboxは、より細かく書いた決まりを優先するため。これらの中を `read` に書くと、`doctor` と実行の前に断る（細かく書くと、開ける側が優先されてしまうため）
+- `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は、`read` で広い場所（`~` や `~/.config`）を開けても読ませない。ツールの場所にある秘密（`~/.cargo/credentials.toml`、`~/.android/adbkey`、`~/.gradle/gradle.properties`、`~/.m2/settings.xml`、`~/.gem/credentials`、`~/.config/hub`）も同じ。sandboxは、より細かく書いた決まりを優先するため。これらの中を `read` に書くと、`doctor` と実行の前に断る（細かく書くと、開ける側が優先されてしまうため）
 - 置いた秘密のファイルは、読ませない。`[product.sandbox]` の `read_placed` に書いたもの（リポジトリからの相対パス）だけ、ビルドやテストに読ませる。ReadのdenyはClaude Codeがsandboxにも足すので、`read_placed` のファイルはAIのReadからも読める。ビルドに読ませれば、AIが書き換えたビルドを通して中身を取り出せるのと同じなので、分けない
 - 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない
 - 止めた通信の先は、Claude Codeがコマンドの結果に `deny network-outbound <ホスト>:<ポート>` として書き足し、AIに見える。AIは、止まった先と、足すとよい設定を書いて人間に回す（プロンプトで指示する）
@@ -262,7 +262,10 @@ write = []                                            # ホームの下で書か
 
 - ビルドツールのキャッシュは、使う人のもの（`~/.gradle` など）を書かせず、agentcellsが持つ `caches/<product>/<ツール>` を使わせる。`agentcells cell run` が環境変数でツールをそこへ向ける（gradle: `GRADLE_USER_HOME`、npm: `npm_config_cache`、yarn: `YARN_CACHE_FOLDER`、pnpm: `npm_config_store_dir`、cargo: `CARGO_HOME`、maven: `MAVEN_OPTS` の `-Dmaven.repo.local`、pip: `PIP_CACHE_DIR`、go: `GOMODCACHE` と `GOCACHE`）
   - 使う人のキャッシュを書かせると、AIが書き換えたビルドがそこにコードを置け（`~/.gradle/init.d`、`~/.gradle/gradle.properties` の `-javaagent`、`~/.cargo/config.toml` の `rustc-wrapper`、`~/.m2` のjarなど）、あとで使う人がsandboxの外で動かすツールがそれを実行する。そのコードは `~/.agentcells` のAppの秘密鍵も読める。読まれる危険より重いので、勧める形からは外す
-  - agentcellsのキャッシュは、sandboxの中のビルドしか使わない。同じproductのほかの仕事のビルドには効くが、どれもsandboxの中で動く
+  - agentcellsのキャッシュは、sandboxの中のビルドしか使わない。ただし同じproductの仕事で共有するので、ある仕事（メンバーでない人が立てたIssueに仕込まれた指示に従ったビルドなど）が置いたものは、あとのほかの仕事のビルドで動きうる。そこから、その仕事の作業場所（PRに紛れ込ませる）と、読ませたファイル（`read_placed`）に手が届く（残る危険）
+  - そのため、`agentcells cell run` は、コマンドを動かす前に毎回、キャッシュの中のコードを動かせる設定を消す（gradle: `init.d/`、`init.gradle`、`init.gradle.kts`、`gradle.properties`。cargo: `config`、`config.toml`、`credentials`、`credentials.toml`、`bin/`）
+  - キャッシュの中身（Gradle本体、jar、Goのビルドのキャッシュなど）の差し替えは残る。ビルドの側で検証する（Gradleの `distributionSha256Sum` と依存の検証の `verification-metadata.xml`。`Cargo.lock`、`go.sum`、npmの `integrity` は、すでに検証される）。キャッシュを、Issueを書いた人を信頼できるかで分けるか、仕事ごとの写しにするかは、まだ決めていない
+  - `tick` は、今の仕事のファイルとsandboxで書ける場所の両方を、同じ関数（`caches::dirs`）から作る
   - 初めは空なので、取得元のホストを `network` に書く必要がある
 - `write` は、ほかに道がないときのための上級の設定。`doctor` は、書いたものすべてに警告を出す。ホーム、`~/.config`、`~/Library`、`~/.local`、`~/Documents` のような広い場所は書けない。シェルの設定（`~/.zshrc`、`~/.zlogin` など）、`~/.claude`、`~/.gitconfig`、`~/.local/bin`、`~/bin`、`~/Library/LaunchAgents` は、書かせない（`denyWrite`）。これらの中や、agentcellsの置き場所を含む場所は、`write` に書くと断る
 - `bind_localhost` は、テストがlocalhostでサーバーを開けるようにするが、手元で動いているほかのサーバー（社内のプロキシ、`ssh -D`、DockerのTCPのAPI、DB、Ollamaなど）にもつながるようになる（確かめた）。そこを通して、`network` を通らずに外へ送ったり、DockerのAPIでsandboxの外でコードを動かしたりできる（残る危険）。`doctor` は警告を出す
@@ -270,7 +273,7 @@ write = []                                            # ホームの下で書か
 - 通信先は、取得元のホスト（`repo.maven.apache.org`、`dl.google.com` など）を具体的に書く。`*.amazonaws.com`、`*.googleapis.com`、`*.blob.core.windows.net`、`*.cloudfront.net` のようなワイルドカードは、攻撃者が用意した誰でも書ける置き場所を含み、外へ送れてしまう。`doctor` は、ワイルドカードと、広すぎる `read`（`~`、`~/.config`、`~/Library`、`~/Documents` など）を知らせる
 
 - 使う人がsandboxの仕組みを知らなくても、動かしてみれば何を足せばよいかがわかるようにする。足りないときは、こう伝わる
-  - 読み書きできない場所: `agentcells cell run` が、コマンドの出力から、止められたホームの下のパス（`Operation not permitted`、`EPERM`、`EACCES` などの行にあるもの。大文字・小文字は問わない）を拾い、足すとよい書き方を最後に出す。使う人のキャッシュなら `caches = ["gradle"]`、それ以外は `read = ["~/Library/Android"]`（止められたのが読むことか書くことかは出力からわからないので、まず読ませる）。開けられない場所（`~/.ssh`、書かせない場所、agentcellsの置き場所）は勧めない
+  - 読み書きできない場所: `agentcells cell run` が、コマンドの出力から、止められたホームの下のパス（`Operation not permitted`、`EPERM`、`EACCES` などの行にあるもの。大文字・小文字は問わない）を拾い、足すとよい書き方を最後に出す。使う人のキャッシュなら `caches = ["gradle"]`、それ以外は、止められたパスそのもの（`bin/` の下ならその `bin`）を `read = ["~/.cargo/bin"]` のように勧める（止められたのが読むことか書くことかは出力からわからないので、まず読ませる。広く丸めると、同じ場所の秘密（`~/.cargo/credentials.toml`、`~/.android/adbkey`）まで開けてしまう）。開けられない場所（`~/.ssh`、書かせない場所、agentcellsの置き場所）は勧めない
   - 出力はAIが書き換えたビルドがいくらでも作れるので、ヒントは「出力から拾ったもの。本当に要るかを確かめてから足す」と書き添える
   - 通信できない先: Claude Codeが、止めた先をコマンドの結果に書き足す
   - AIは、それを書いて人間に回す。足すかどうかは人間が決める
