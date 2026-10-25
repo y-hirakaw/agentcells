@@ -330,7 +330,7 @@ impl Config {
                 "operator の「{login}」はGitHubのログインではありません（英数字と -、39文字まで）"
             )),
             None if !self.products.is_empty() => problems.push(
-                "operator に、cellを使うあなたのGitHubのログインを書いてください（あなたが自分で決めたIssue/PRだけを動かすため）"
+                "operator に、cellを使うあなたのGitHubのログインを、ファイルのいちばん上（最初の [ で始まる行より前）に書いてください（あなたが自分で決めたIssue/PRだけを動かすため）"
                     .to_string(),
             ),
             _ => {}
@@ -743,6 +743,14 @@ timeout_minutes = 10
         );
         let err = Config::parse(&text, Path::new("/")).unwrap_err();
         assert!(err.hint.unwrap().contains("ファイルのいちばん上"));
+        // ほかの見出しの下でも同じ
+        let text = VALID.replace("operator = \"y-hirakaw\"\n", "") + "operator = \"me\"\n";
+        let err = Config::parse(&text, Path::new("/")).unwrap_err();
+        assert!(
+            err.hint.unwrap().contains("ファイルのいちばん上"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
