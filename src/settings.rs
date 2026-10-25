@@ -44,7 +44,7 @@ pub const ALLOW_BASH: &str = "Bash(agentcells cell:*)";
 
 /// 使う人のホームの下で、秘密がよく置かれる場所。ホーム全体を読ませないうえで、
 /// productの `sandbox.read` に、これらを含む場所（`~/.config` など）が書かれても読ませない。
-const SECRET_PLACES: &[&str] = &[
+pub const SECRET_PLACES: &[&str] = &[
     ".ssh",
     ".aws",
     ".gnupg",
@@ -80,6 +80,8 @@ pub struct RunPaths<'a> {
     pub programs: &'a [PathBuf],
     /// ビルドやテストの一時ディレクトリ（仕事ごと）。`agentcells cell run` が `TMPDIR` で渡す
     pub tmp: &'a Path,
+    /// productのキャッシュ（`caches/<product>/<ツール>`）。`agentcells cell run` が環境変数でツールを向ける
+    pub caches: &'a [PathBuf],
 }
 
 /// 1回の実行で渡す設定を作る。2つの守りを重ねる。
@@ -154,6 +156,10 @@ pub fn runtime_settings(
         allow_read.extend(forms(program)?);
     }
     let mut allow_write = [forms(run.git_dir)?, forms(run.tmp)?].concat();
+    for cache in run.caches {
+        allow_read.extend(forms(cache)?);
+        allow_write.extend(forms(cache)?);
+    }
     for (key, path) in product.sandbox.opened() {
         allow_read.extend(forms(path)?);
         if key == "write" {
@@ -231,6 +237,16 @@ pub fn sandbox_problems(home: &Home, config: &Config) -> Vec<String> {
                     path.display(),
                     place.display()
                 ));
+            } else if key == "write"
+                && wide_places(&user_home_or_root())
+                    .iter()
+                    .any(|w| same_path(w, path))
+            {
+                problems.push(format!(
+                    "product「{}」の sandbox.write の {} は広すぎます。書かせない場所を並べきれないので、書けません。要る場所だけを書いてください（キャッシュなら caches を使います）",
+                    product.name,
+                    path.display()
+                ));
             } else if key == "write" && contains(&written, home.root()) {
                 problems.push(format!(
                     "product「{}」の sandbox.write の {} は、agentcellsの置き場所（{}）を含むので書けません",
@@ -249,28 +265,30 @@ pub fn sandbox_warnings(config: &Config) -> Vec<String> {
     let Ok(user_home) = user_home() else {
         return Vec::new();
     };
-    // 開けると、読ませる場所を並べる形の意味がなくなる広い場所
-    let wide: Vec<PathBuf> = [
-        "",
-        ".config",
-        "Library",
-        "Documents",
-        "Desktop",
-        "Downloads",
-    ]
-    .iter()
-    .map(|p| user_home.join(p))
-    .collect();
+    let wide = wide_places(&user_home);
     let mut warnings = Vec::new();
     for product in &config.products {
-        for (key, path) in product.sandbox.opened() {
+        for path in &product.sandbox.read {
             if wide.iter().any(|w| same_path(w, path)) {
                 warnings.push(format!(
-                    "product「{}」の sandbox.{key} の {} は広すぎます。並べ忘れた場所の秘密も読めるようになります。要る場所だけを書いてください",
+                    "product「{}」の sandbox.read の {} は広すぎます。並べ忘れた場所の秘密も読めるようになります。要る場所だけを書いてください",
                     product.name,
                     path.display()
                 ));
             }
+        }
+        for path in &product.sandbox.write {
+            warnings.push(format!(
+                "product「{}」の sandbox.write の {} には、AIが書き換えたビルドがコードを置けます。手元（sandboxの外）で動かすツールがそれを実行しうるので、キャッシュなら caches を使ってください",
+                product.name,
+                path.display()
+            ));
+        }
+        if product.sandbox.bind_localhost {
+            warnings.push(format!(
+                "product「{}」の sandbox.bind_localhost を有効にすると、手元で動いているほかのサーバー（プロキシ、DockerのAPI、DBなど）にもつながります。そこを通して外へ送ったり、sandboxの外でコードを動かしたりできることがあります",
+                product.name
+            ));
         }
         for domain in &product.sandbox.network {
             if domain.starts_with("*.") {
@@ -293,24 +311,50 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// `write` で広い場所を開けても、書かせない場所。書かれると、使う人が手元で動かすClaude Codeや、
 /// ログインのたびに動くものに、AIが書いたものが効いてしまう。
+pub const WRITE_PROTECTED_PLACES: &[&str] = &[
+    ".claude",
+    ".claude.json",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".gitconfig",
+    ".config/git",
+    ".local/bin",
+    "bin",
+    "Library/LaunchAgents",
+];
+
 fn write_protected_places() -> Result<Vec<PathBuf>> {
     let user_home = user_home()?;
-    Ok([
-        ".claude",
-        ".claude.json",
-        ".zshrc",
-        ".zshenv",
-        ".zprofile",
-        ".bashrc",
-        ".bash_profile",
-        ".profile",
-        ".gitconfig",
-        ".config/git",
-        "Library/LaunchAgents",
+    Ok(WRITE_PROTECTED_PLACES
+        .iter()
+        .map(|p| user_home.join(p))
+        .collect())
+}
+
+/// 開けると、並べる形の意味がなくなる広い場所。
+fn wide_places(user_home: &Path) -> Vec<PathBuf> {
+    [
+        "",
+        ".config",
+        ".local",
+        "Library",
+        "Documents",
+        "Desktop",
+        "Downloads",
     ]
     .iter()
     .map(|p| user_home.join(p))
-    .collect())
+    .collect()
+}
+
+fn user_home_or_root() -> PathBuf {
+    user_home().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 /// 開けた場所の中にあっても読ませない場所。
@@ -477,6 +521,7 @@ mod tests {
             placed,
             programs: &programs,
             tmp: Path::new("/home/me/.agentcells/tmp/12"),
+            caches: &[],
         };
         runtime_settings(&home(), config, product, &run).unwrap()
     }
@@ -634,6 +679,7 @@ mod tests {
             placed: &[],
             programs: &[],
             tmp: Path::new("/t"),
+            caches: &[],
         };
         let settings =
             runtime_settings(&home, &config, &product(Sandbox::default()), &run).unwrap();
@@ -688,6 +734,7 @@ mod tests {
             placed: &placed,
             programs: &[],
             tmp: Path::new("/t"),
+            caches: &[],
         };
         assert!(
             runtime_settings(
@@ -805,6 +852,7 @@ mod tests {
             placed: &[],
             programs: &[],
             tmp: Path::new("/t"),
+            caches: &[],
         };
         assert!(runtime_settings(&home(), &bad, &bad.products[0], &run).is_err());
     }
@@ -850,6 +898,62 @@ mod tests {
             ..Sandbox::default()
         });
         assert!(sandbox_problems(&home(), &fine).is_empty());
+    }
+
+    #[test]
+    fn caches_are_writable_in_agentcells_home() {
+        let programs: [PathBuf; 0] = [];
+        let caches = [PathBuf::from("/home/me/.agentcells/caches/app/gradle")];
+        let run = RunPaths {
+            worktree: Path::new("/w/octo/app/12"),
+            git_dir: Path::new("/home/me/.agentcells/gitdirs/octo/app/12"),
+            shared_objects: Path::new("/home/me/.agentcells/repos/octo/app/.git/objects"),
+            context: Path::new("/home/me/.agentcells/runs/1/context.json"),
+            placed: &[],
+            programs: &programs,
+            tmp: Path::new("/home/me/.agentcells/tmp/octo/app/12"),
+            caches: &caches,
+        };
+        let settings = runtime_settings(
+            &home(),
+            &Config::default(),
+            &product(Sandbox::default()),
+            &run,
+        )
+        .unwrap();
+        let fs = &settings["sandbox"]["filesystem"];
+        let cache = "/home/me/.agentcells/caches/app/gradle".to_string();
+        assert!(strings(&fs["allowWrite"]).contains(&cache));
+        assert!(strings(&fs["allowRead"]).contains(&cache));
+    }
+
+    #[test]
+    fn wide_writes_are_refused_and_writes_and_local_binding_warn() {
+        let config = |sandbox: Sandbox| Config {
+            products: vec![product(sandbox)],
+            ..Config::default()
+        };
+        for wide in [".config", "Library", ".local"] {
+            let bad = config(Sandbox {
+                write: vec![user_home().join(wide)],
+                ..Sandbox::default()
+            });
+            let problems = sandbox_problems(&home(), &bad);
+            assert!(
+                problems.iter().any(|p| p.contains("広すぎます")),
+                "{wide}: {problems:?}"
+            );
+        }
+        let risky = config(Sandbox {
+            write: vec![user_home().join(".gradle")],
+            bind_localhost: true,
+            ..Sandbox::default()
+        });
+        assert!(sandbox_problems(&home(), &risky).is_empty());
+        let warnings = sandbox_warnings(&risky);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("caches を使って"), "{warnings:?}");
+        assert!(warnings[1].contains("DockerのAPI"), "{warnings:?}");
     }
 
     #[test]

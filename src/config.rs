@@ -31,10 +31,10 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 #
 # [product.sandbox]                  # AIが動かすコマンドに開ける場所。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない
 # read = ["~/.nvm"]                  # ホームの下で読ませる場所（ツールチェーンなど）。開けた場所の秘密は読まれうる
-# write = ["~/.npm"]                 # ホームの下で書かせる場所（キャッシュなど）。書かれたものは、手元で動かすツールにも効く
+# caches = ["npm"]                   # ビルドツールのキャッシュ（gradle npm yarn pnpm cargo maven pip go）。agentcellsが持つ場所に向ける
 # network = ["registry.npmjs.org"]   # 通信してよい先。取得元のホストを具体的に書く（*.amazonaws.com のような広いワイルドカードは、外へ送る道になる）
 # read_placed = []                   # files/ から置いたファイルのうち、ビルドに読ませるもの（リポジトリからの相対パス）
-# bind_localhost = false             # テストが localhost でサーバーを開けるようにする
+# bind_localhost = false             # テストが localhost でサーバーを開けるようにする（手元のほかのサーバーにもつながるようになる）
 #
 # cell: どのラベルが付いたIssue/PRを拾い、どのプロンプトで動くか
 #
@@ -111,8 +111,12 @@ pub struct Sandbox {
     /// 読み込んだあとは絶対パスになっている
     #[serde(default)]
     pub read: Vec<PathBuf>,
-    /// ホームの下で書かせる（読ませもする）場所（`~/.gradle` のようなキャッシュ）。書き方は `read` と同じ。
-    /// AIが書き換えたビルドがここに書いたものは、使う人が手元で動かすツールにも効く
+    /// ビルドツールのキャッシュ（`gradle`、`npm` など）。使う人のキャッシュではなく、agentcellsが持つ
+    /// productごとの場所に向けて、書かせる
+    #[serde(default)]
+    pub caches: Vec<String>,
+    /// ホームの下で書かせる（読ませもする）場所。書き方は `read` と同じ。上級の設定で、勧めない:
+    /// AIが書き換えたビルドがここに置いたコードを、使う人が手元（sandboxの外）で動かすツールが実行しうる
     #[serde(default)]
     pub write: Vec<PathBuf>,
     /// worktreeに置いたファイルのうち、ビルドやテストに読ませるもの（リポジトリからの相対パス）。
@@ -348,6 +352,15 @@ impl Config {
                         "product「{}」の sandbox.read_placed の「{}」は、リポジトリからの相対パスで書いてください（`..` は使えません）",
                         p.name,
                         path.display()
+                    ));
+                }
+            }
+            for name in &p.sandbox.caches {
+                if !crate::caches::is_known(name) {
+                    problems.push(format!(
+                        "product「{}」の sandbox.caches の「{name}」は知らないキャッシュです（使えるのは {}）",
+                        p.name,
+                        crate::caches::names().join("、")
                     ));
                 }
             }
@@ -796,7 +809,7 @@ timeout_minutes = 10
     fn products_can_open_the_sandbox() {
         let text = VALID.replace(
             "cells = [\"triage\", \"review\"]",
-            "cells = [\"triage\", \"review\"]\n\n[product.sandbox]\nread = [\"~/.cargo\", \"/opt/sdk\"]\nwrite = [\"~/.gradle\"]\nread_placed = [\"app/google-services.json\"]\nnetwork = [\"registry.npmjs.org\", \"*.gradle.org\"]",
+            "cells = [\"triage\", \"review\"]\n\n[product.sandbox]\nread = [\"~/.cargo\", \"/opt/sdk\"]\nwrite = [\"~/.gradle\"]\ncaches = [\"gradle\", \"npm\"]\nread_placed = [\"app/google-services.json\"]\nnetwork = [\"registry.npmjs.org\", \"*.gradle.org\"]",
         );
         let dir = base_with_prompts(&["triage.md", "review.md"]);
         let config = Config::parse(&text, dir.path()).unwrap();
@@ -807,6 +820,7 @@ timeout_minutes = 10
             vec![user_home.join(".cargo"), PathBuf::from("/opt/sdk")]
         );
         assert_eq!(sandbox.write, vec![user_home.join(".gradle")]);
+        assert_eq!(sandbox.caches, vec!["gradle", "npm"]);
         assert_eq!(
             sandbox.read_placed,
             vec![PathBuf::from("app/google-services.json")]
@@ -816,13 +830,18 @@ timeout_minutes = 10
         let bad = text
             .replace("\"/opt/sdk\"", "\"opt/sdk\", \"~/../etc\"")
             .replace("app/google-services.json", "../key.jks")
-            .replace("\"*.gradle.org\"", "\"https://gradle.org\", \"localhost\"");
+            .replace("\"*.gradle.org\"", "\"https://gradle.org\", \"localhost\"")
+            .replace("\"npm\"]", "\"npm\", \"bazel\"]");
         let message = problems_of(&bad);
         assert!(message.contains("sandbox.read の opt/sdk"), "{message}");
         assert!(message.contains("sandbox.read の /"), "{message}");
         assert!(message.contains("「../key.jks」"), "{message}");
         assert!(message.contains("「https://gradle.org」"), "{message}");
         assert!(message.contains("「localhost」"), "{message}");
+        assert!(
+            message.contains("「bazel」は知らないキャッシュ"),
+            "{message}"
+        );
 
         // 書かなければ、何も開けない
         let config = Config::parse(VALID, dir.path()).unwrap();

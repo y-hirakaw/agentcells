@@ -50,6 +50,11 @@ impl Home {
         self.root.join("worktrees")
     }
 
+    /// productごとの、ビルドツールのキャッシュ（`caches/<product>/<ツール>`）
+    pub fn caches_dir(&self) -> PathBuf {
+        self.root.join("caches")
+    }
+
     pub fn files_dir(&self) -> PathBuf {
         self.root.join("files")
     }

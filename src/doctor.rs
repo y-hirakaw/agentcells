@@ -254,19 +254,11 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
         let check = Check::fail(
             NAME,
             problems.join("\n"),
-            "[product.sandbox] の read から、その場所を外してください",
+            "[product.sandbox] から、その場所を外してください",
         );
         return (check, Some(config));
     }
     let warnings = settings::sandbox_warnings(&config);
-    if !warnings.is_empty() {
-        let check = Check::warn(
-            NAME,
-            warnings.join("\n"),
-            "開けた場所の秘密は、AIが書き換えたビルドを通して読まれたり、外へ送られたりしえます",
-        );
-        return (check, Some(config));
-    }
     let check = match &config {
         config if config.products.is_empty() => Check::warn(
             NAME,
@@ -275,6 +267,11 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
                 "{} に [[product]] と [[cell]] を書いてください（雛形のコメントに例があります）",
                 path.display()
             ),
+        ),
+        _ if !warnings.is_empty() => Check::warn(
+            NAME,
+            warnings.join("\n"),
+            "[product.sandbox] で開けた場所は、AIが書き換えたビルドから使えます。要るものだけにしてください",
         ),
         config => Check::ok(
             NAME,

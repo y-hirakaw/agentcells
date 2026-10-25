@@ -42,6 +42,9 @@ pub struct Context {
     /// ビルドやテストの一時ディレクトリ（仕事ごと）。Claude Codeがsandboxの中で使わせる `/tmp/claude-<uid>` は、
     /// 使う人のほかのセッションと共有なので、`run` のコマンドにはこちらを `TMPDIR` で渡す
     pub tmp: PathBuf,
+    /// ビルドツールのキャッシュ（`gradle` など）と、その場所（productごと、agentcellsが持つ）
+    #[serde(default)]
+    pub caches: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,7 +596,8 @@ pub fn blob_hash(worktree: &Path, file: &Path) -> Result<String> {
 
 /// 設定に書いたコマンドを、worktreeで実行する。標準出力と標準エラーはそのまま流し、終了コードを返す。
 ///
-/// sandboxに止められた、ホームの下の場所が出力にあれば、最後に `[product.sandbox]` に足すとよい場所を出す。
+/// ビルドツールのキャッシュは、環境変数でagentcellsが持つ場所（`Context::caches`）に向ける。
+/// sandboxに止められた、ホームの下の場所が出力にあれば、最後に `[product.sandbox]` に足すとよい書き方を出す。
 /// 使う人がsandboxの仕組みを知らなくても、動かしてみれば、何を足せばよいかがわかるようにするため。
 pub fn run(context: &Context, name: &str) -> Result<i32> {
     let command = context.commands.get(name).ok_or_else(|| {
@@ -607,23 +611,26 @@ pub fn run(context: &Context, name: &str) -> Result<i32> {
     })?;
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
     let (code, blocked) = run_command(context, command, user_home.as_deref())?;
-    if let Some(user_home) = &user_home
-        && !blocked.is_empty()
-    {
-        let list: Vec<String> = blocked
-            .iter()
-            .map(|p| format!("  - {}", tilde(p, user_home)))
-            .collect();
-        eprintln!(
-            "\nagentcells: sandboxで、ホームの下の次の場所が使えませんでした:\n{}\n\
-             ビルドやテストに要る場所なら、needs-human にして、config.toml の [product.sandbox] に足すよう人間に頼んでください。\n\
-             読むだけなら read、書きもするなら write に書きます（例: write = [\"{}\"]）。足すかどうかは人間が決めます",
-            list.join("\n"),
-            tilde(&blocked[0], user_home)
-        );
+    if let Some(user_home) = &user_home {
+        let suggestions = suggestions(&blocked, user_home, &context.worktree);
+        if !suggestions.is_empty() {
+            eprintln!(
+                "\nagentcells: sandboxで、ホームの下の次の場所が使えませんでした（コマンドの出力から拾ったものです。本当に要るかを確かめてから足してください）:\n{}\n\
+                 ビルドやテストに要るなら、needs-human にして、config.toml の [product.sandbox] に足すよう人間に頼んでください。足すかどうかは人間が決めます",
+                suggestions
+                    .iter()
+                    .map(|s| format!("  - {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
     }
     Ok(code)
 }
+
+/// コマンドが終わったあと、出力を読み切るのを待つ時間。コマンドがバックグラウンドに残したプロセス
+/// （テストのサーバーやコンパイラのデーモン）が出力を握ったままでも、ここで見切る。
+const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// コマンドを動かし、出力をそのまま流しながら、sandboxに止められたホームの下の場所を集める。
 fn run_command(
@@ -631,90 +638,110 @@ fn run_command(
     command: &str,
     user_home: Option<&Path>,
 ) -> Result<(i32, Vec<PathBuf>)> {
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(&context.worktree)
         .env("TMPDIR", &context.tmp)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let maven_opts = std::env::var("MAVEN_OPTS").ok();
+    for (name, dir) in &context.caches {
+        cmd.envs(crate::caches::env(name, dir, maven_opts.as_deref()));
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| Error::new(format!("「{command}」を実行できません: {e}")))?;
+    let (sender, receiver) = std::sync::mpsc::channel();
     let relay = |from: Box<dyn std::io::Read + Send>, to: fn() -> Box<dyn std::io::Write>| {
         let user_home = user_home.map(Path::to_path_buf);
-        let worktree = context
-            .worktree
-            .canonicalize()
-            .unwrap_or_else(|_| context.worktree.clone());
+        let sender = sender.clone();
         std::thread::spawn(move || {
             use std::io::BufRead;
             let mut reader = std::io::BufReader::new(from);
-            let mut found = Vec::new();
             let mut line = Vec::new();
             while reader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
                 let mut out = to();
                 let _ = out.write_all(&line);
                 let _ = out.flush();
                 if let Some(user_home) = &user_home {
-                    for place in blocked_places(&String::from_utf8_lossy(&line), user_home) {
-                        // 作業の場所を含む場所（~/.agentcells）は開けられないので、勧めない
-                        let resolved = place.canonicalize().unwrap_or_else(|_| place.clone());
-                        if !worktree.starts_with(&resolved) && !found.contains(&place) {
-                            found.push(place);
-                        }
+                    let places = blocked_places(&String::from_utf8_lossy(&line), user_home);
+                    if !places.is_empty() {
+                        let _ = sender.send(Some(places));
                     }
                 }
                 line.clear();
             }
-            found
-        })
+            let _ = sender.send(None);
+        });
     };
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let out = relay(Box::new(stdout), || Box::new(std::io::stdout()));
-    let err = relay(Box::new(stderr), || Box::new(std::io::stderr()));
+    relay(
+        Box::new(child.stdout.take().expect("stdout is piped")),
+        || Box::new(std::io::stdout()),
+    );
+    relay(
+        Box::new(child.stderr.take().expect("stderr is piped")),
+        || Box::new(std::io::stderr()),
+    );
+    drop(sender);
     let status = child
         .wait()
         .map_err(|e| Error::new(format!("「{command}」を待てません: {e}")))?;
-    let mut blocked = out.join().unwrap_or_default();
-    for place in err.join().unwrap_or_default() {
-        if !blocked.contains(&place) {
-            blocked.push(place);
+    // 2つのスレッドが読み終えるか、見切るまで集める
+    let mut blocked = Vec::new();
+    let mut finished = 0;
+    let deadline = std::time::Instant::now() + OUTPUT_GRACE;
+    while finished < 2 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(left) {
+            Ok(Some(places)) => {
+                for place in places {
+                    if !blocked.contains(&place) {
+                        blocked.push(place);
+                    }
+                }
+            }
+            Ok(None) => finished += 1,
+            Err(_) => break,
         }
     }
     Ok((status.code().unwrap_or(1), blocked))
 }
 
-/// sandboxに止められたときの言い方。
+/// sandboxに止められたときの言い方（大文字・小文字は問わない）。Nodeは `EPERM: operation not permitted` と出す。
 const BLOCKED_MARKERS: &[&str] = &[
-    "Operation not permitted",
-    "AccessDeniedException",
-    "Permission denied",
+    "operation not permitted",
+    "accessdeniedexception",
+    "permission denied",
+    "eperm",
+    "eacces",
 ];
 
-/// 1行の出力から、sandboxに止められた、ホームの下の場所を取り出す。ホームのすぐ下の名前（`~/.gradle`）にまとめる。
-/// `~/Library` と `~/.config` と `~/.local` は広すぎるので、もう1つ下（`~/Library/Android`）にする。
+/// 1行の出力から、sandboxに止められた、ホームの下のパスを取り出す。
 fn blocked_places(line: &str, user_home: &Path) -> Vec<PathBuf> {
-    if !BLOCKED_MARKERS.iter().any(|m| line.contains(m)) {
+    let lower = line.to_lowercase();
+    if !BLOCKED_MARKERS.iter().any(|m| lower.contains(m)) {
         return Vec::new();
     }
     let prefix = format!("{}/", user_home.display());
     let mut places = Vec::new();
     for (start, _) in line.match_indices(&prefix) {
         let rest = &line[start + prefix.len()..];
-        let end = rest
-            .find(|c: char| c.is_whitespace() || "'\":),;`".contains(c))
-            .unwrap_or(rest.len());
-        let mut parts = rest[..end].split('/').filter(|p| !p.is_empty());
-        let Some(first) = parts.next() else {
-            continue;
-        };
-        let mut place = user_home.join(first);
-        if matches!(first, "Library" | ".config" | ".local")
-            && let Some(second) = parts.next()
-        {
-            place = place.join(second);
+        // 引用符で囲まれていれば、閉じる引用符まで（空白を含むパスがある）。なければ空白や区切りまで
+        let quote = line[..start]
+            .chars()
+            .last()
+            .filter(|c| *c == '\'' || *c == '"');
+        let end = match quote {
+            Some(q) => rest.find(q),
+            None => rest.find(|c: char| c.is_whitespace() || "'\":),;`".contains(c)),
         }
+        .unwrap_or(rest.len());
+        let relative = rest[..end].trim_end_matches('/');
+        if relative.is_empty() {
+            continue;
+        }
+        let place = user_home.join(relative);
         if !places.contains(&place) {
             places.push(place);
         }
@@ -722,12 +749,68 @@ fn blocked_places(line: &str, user_home: &Path) -> Vec<PathBuf> {
     places
 }
 
-/// ホームの下なら `~/` の形にする。
-fn tilde(path: &Path, user_home: &Path) -> String {
-    match path.strip_prefix(user_home) {
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
+/// 止められた場所から、`[product.sandbox]` に足すとよい書き方を作る。
+/// - 使う人のビルドツールのキャッシュなら、agentcellsが持つキャッシュ（`caches`）を勧める
+/// - それ以外は、ホームのすぐ下の名前（`~/Library` などは、もう1つ下）を `read` で勧める
+///   （止められたのが読むことか書くことかは、出力からはわからない。書かせると手元のツールに効くので、まず読ませる）
+/// - 開けられない場所（秘密がよく置かれる場所、書かせない場所、agentcellsの置き場所）は勧めない
+fn suggestions(blocked: &[PathBuf], user_home: &Path, worktree: &Path) -> Vec<String> {
+    let worktree = worktree
+        .canonicalize()
+        .unwrap_or_else(|_| worktree.to_path_buf());
+    let guarded = |relative: &Path| {
+        crate::settings::SECRET_PLACES
+            .iter()
+            .chain(crate::settings::WRITE_PROTECTED_PLACES)
+            .chain(&[".config/gh"])
+            .any(|p| {
+                let p = p.to_lowercase();
+                let r = relative.to_string_lossy().to_lowercase();
+                r == p || r.starts_with(&format!("{p}/"))
+            })
+    };
+    let mut out = Vec::new();
+    for path in blocked {
+        let Ok(relative) = path.strip_prefix(user_home) else {
+            continue;
+        };
+        let mut parts = relative
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy());
+        let Some(first) = parts.next() else {
+            continue;
+        };
+        let mut place = PathBuf::from(first.as_ref());
+        if matches!(first.as_ref(), "Library" | ".config" | ".local")
+            && let Some(second) = parts.next()
+        {
+            place.push(second.as_ref());
+        }
+        let resolved = user_home
+            .join(&place)
+            .canonicalize()
+            .unwrap_or_else(|_| user_home.join(&place));
+        // 作業の場所を含む場所（~/.agentcells）は開けられない
+        if worktree.starts_with(&resolved) || guarded(relative) {
+            continue;
+        }
+        let suggestion = match crate::caches::for_place(relative) {
+            Some(cache) => format!(
+                "~/{} → caches = [\"{cache}\"]（agentcellsが持つキャッシュに向けます。手元のキャッシュには書かせません）",
+                relative.display()
+            ),
+            None => format!(
+                "~/{} → read = [\"~/{}\"]（読むだけ。ファイル1つだけでもよい）",
+                relative.display(),
+                place.display()
+            ),
+        };
+        let key = suggestion.split(" → ").nth(1).unwrap_or("").to_string();
+        if !out.iter().any(|s: &String| s.ends_with(&key)) {
+            out.push(suggestion);
+        }
     }
+    out
 }
 
 #[cfg(all(test, unix))]
@@ -777,6 +860,7 @@ mod tests {
             },
             scanner,
             tmp,
+            caches: BTreeMap::new(),
         };
         (dir, context)
     }
@@ -1007,14 +1091,25 @@ echo "[]"
                 "cat: /Users/me/.gradle/caches/x.lock: Operation not permitted",
                 home
             ),
-            vec![PathBuf::from("/Users/me/.gradle")]
+            vec![PathBuf::from("/Users/me/.gradle/caches/x.lock")]
         );
+        // Nodeは小文字で、パスを引用符で囲んで出す
         assert_eq!(
             blocked_places(
-                "java.nio.file.AccessDeniedException: /Users/me/Library/Android/sdk/licenses",
+                "Error: EPERM: operation not permitted, mkdir '/Users/me/.npm/_cacache'",
                 home
             ),
-            vec![PathBuf::from("/Users/me/Library/Android")]
+            vec![PathBuf::from("/Users/me/.npm/_cacache")]
+        );
+        // 引用符の中の空白を含むパス
+        assert_eq!(
+            blocked_places(
+                "EACCES: permission denied, open \"/Users/me/Library/Application Support/x.json\"",
+                home
+            ),
+            vec![PathBuf::from(
+                "/Users/me/Library/Application Support/x.json"
+            )]
         );
         // 止められたことを言っていない行や、ホームの外は拾わない
         assert!(blocked_places("reading /Users/me/.gradle/caches", home).is_empty());
@@ -1022,17 +1117,57 @@ echo "[]"
     }
 
     #[test]
-    fn run_collects_blocked_places_but_not_the_agentcells_home() {
-        let (dir, ctx) = setup();
+    fn suggestions_prefer_agentcells_caches_and_skip_guarded_places() {
+        let home = Path::new("/Users/me");
+        let worktree = Path::new("/Users/me/.agentcells/worktrees/octo/app/3");
+        let blocked: Vec<PathBuf> = [
+            ".gradle/caches/x.lock",
+            ".gradle/wrapper/dists",
+            "Library/Android/sdk/licenses",
+            ".ssh/id_ed25519",
+            ".zshrc",
+            ".agentcells/files/octo/app/key.jks",
+        ]
+        .iter()
+        .map(|p| home.join(p))
+        .collect();
+        let out = suggestions(&blocked, home, worktree);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].contains("caches = [\"gradle\"]"), "{out:?}");
+        assert!(out[1].contains("read = [\"~/Library/Android\"]"), "{out:?}");
+    }
+
+    #[test]
+    fn run_collects_blocked_places_and_points_caches_at_agentcells() {
+        let (dir, mut ctx) = setup();
         let home = dir.path();
+        ctx.caches
+            .insert("gradle".to_string(), dir.path().join("caches/app/gradle"));
         let command = format!(
-            "echo '{h}/.gradle/a: Operation not permitted' >&2; echo '{w}/x: Operation not permitted'; echo ok",
+            "echo '{h}/.gradle/a: Operation not permitted' >&2; echo \"$GRADLE_USER_HOME\" > gradle.txt",
             h = home.display(),
-            w = ctx.worktree.display()
         );
         let (code, blocked) = run_command(&ctx, &command, Some(home)).unwrap();
         assert_eq!(code, 0);
-        assert_eq!(blocked, vec![home.join(".gradle")]);
+        assert_eq!(blocked, vec![home.join(".gradle/a")]);
+        let gradle = std::fs::read_to_string(ctx.worktree.join("gradle.txt")).unwrap();
+        assert_eq!(
+            gradle.trim(),
+            dir.path().join("caches/app/gradle").display().to_string()
+        );
+    }
+
+    #[test]
+    fn run_does_not_wait_for_background_processes() {
+        let (_dir, ctx) = setup();
+        let started = std::time::Instant::now();
+        let (code, _) = run_command(&ctx, "sleep 8 & echo started", None).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

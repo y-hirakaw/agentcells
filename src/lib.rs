@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod caches;
 pub mod config;
 pub mod discussion;
 pub mod doctor;
