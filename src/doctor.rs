@@ -66,6 +66,13 @@ pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Chec
     checks.push(check_claude_auth(probe, claude_found));
     checks.push(check_betterleaks(probe));
     checks.push(check_home(home));
+    if let Some(note) = crate::run::stuck(home) {
+        checks.push(Check::fail(
+            "stuck",
+            note,
+            "残ったプロセスを止めてください（PIDは上のとおり。詳しくは ~/.agentcells/runs/ の error.txt）",
+        ));
+    }
     checks.push(check_path(home, path_env));
     let (config_check, config) = check_config(home);
     // 設定が正しくないと、書き間違えたcellのラベルが抜けて「そろっています」と出ることがあるので、確かめない

@@ -52,7 +52,57 @@ enum Failure {
     Error(Error),
     /// AIが動かしたプロセスを止めきれなかった。残ったプロセスにトークンを読まれうるので、
     /// トークンを作らず、GitHubには何も書かない（`ac:working` は付いたまま。人が片付ける）
-    Unstopped(Error),
+    Unstopped(Vec<Leftover>),
+}
+
+/// 止めきれなかったプロセス。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Leftover {
+    pub pid: u32,
+    /// 始まった時刻（`ps -o lstart`）。PIDの使い回しと見分ける
+    pub started: String,
+}
+
+/// 止めきれなかったプロセスの目印（`~/.agentcells/stuck.json`）。これがある間、tickは何も動かさない。
+/// 次の仕事の書き込みのトークンを、残ったプロセスに読ませないため。
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+struct Stuck {
+    /// どの仕事か（`<owner>/<repo>/<番号>`）
+    job: String,
+    processes: Vec<Leftover>,
+}
+
+fn stuck_path(home: &Home) -> PathBuf {
+    home.root().join("stuck.json")
+}
+
+/// 前の実行で止めきれなかったプロセスが、まだ残っていれば、その説明。
+/// どれも残っていなければ（同じPIDと始まった時刻のプロセスがなければ）、目印を消して `None`。
+pub fn stuck(home: &Home) -> Option<String> {
+    let path = stuck_path(home);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let Ok(stuck) = serde_json::from_str::<Stuck>(&text) else {
+        return Some(format!(
+            "前の実行の目印 {} を読めません。確かめてから消してください",
+            path.display()
+        ));
+    };
+    let rows = process_table();
+    let alive: Vec<&Leftover> = stuck
+        .processes
+        .iter()
+        .filter(|p| rows.iter().any(|r| r.0 == p.pid && r.3 == p.started))
+        .collect();
+    if alive.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let pids: Vec<String> = alive.iter().map(|p| p.pid.to_string()).collect();
+    Some(format!(
+        "前の実行（{}）でAIが動かしたプロセスが残っています（PID: {}）。止めてから、そのIssue/PRの ac:working を外し、ラベルを付け直してください。プロセスがなくなれば、次のtickから動きます",
+        stuck.job,
+        pids.join(", ")
+    ))
 }
 
 impl From<Error> for Failure {
@@ -127,18 +177,48 @@ impl Runner<'_> {
     /// 公開のIssueには、決まった短い文だけを書いて人間に回す。
     /// プロセスを止めきれなかったときは、トークンを作らず、GitHubには何も書かない。
     fn fail(&self, failure: Failure, cell: &Cell, issue: &Issue, place: &Place) -> Error {
-        let (e, write_to_github) = match failure {
-            Failure::Error(e) => (e, true),
-            Failure::Unstopped(e) => (e, false),
-        };
         let _ = std::fs::create_dir_all(&place.run);
+        let e = match failure {
+            Failure::Error(e) => e,
+            Failure::Unstopped(leftovers) => {
+                let e = Error::new(format!(
+                    "AIが動かしたプロセスを止めきれませんでした（PID: {}）。GitHubには何も書かずに止めます",
+                    leftovers
+                        .iter()
+                        .map(|p| p.pid.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .with_hint(
+                    "残ったプロセスを止めてから、Issue/PRの ac:working を外し、ラベルを付け直してください。それまで、tickはほかの仕事も動かしません",
+                );
+                let detail: Vec<String> = leftovers
+                    .iter()
+                    .map(|p| format!("{} {} {}", p.pid, p.started, command_of(p.pid)))
+                    .collect();
+                let _ = std::fs::write(
+                    place.run.join("error.txt"),
+                    format!(
+                        "{}\n{}\n\n{}\n",
+                        e.message,
+                        e.hint.clone().unwrap_or_default(),
+                        detail.join("\n")
+                    ),
+                );
+                let stuck = Stuck {
+                    job: place.relative.display().to_string(),
+                    processes: leftovers,
+                };
+                if let Ok(text) = serde_json::to_string_pretty(&stuck) {
+                    let _ = std::fs::write(stuck_path(self.home), text);
+                }
+                return e;
+            }
+        };
         let _ = std::fs::write(
             place.run.join("error.txt"),
             format!("{}\n{}\n", e.message, e.hint.clone().unwrap_or_default()),
         );
-        if !write_to_github {
-            return e;
-        }
         let text = format!(
             "実行できませんでした。agentcellsを動かしている人は、手元の記録（{}）を確かめてください。\n\n直したら、ラベル「{}」を付け直すと、もう一度動きます。",
             place.run_name(),
@@ -193,10 +273,7 @@ impl Runner<'_> {
             Prepared::Ready(ready) => ready,
         };
 
-        let finished = match ready.claude(self, cell, place).run()? {
-            ClaudeEnd::Unstopped(e) => return Err(Failure::Unstopped(e)),
-            other => other,
-        };
+        let finished = ready.claude(self, cell, place).run()?;
 
         // AIの動かしたものをすべて止めたあとで、書き込みのトークンを作る
         let write = self.write_credentials(&work.repo)?;
@@ -366,7 +443,6 @@ impl Runner<'_> {
                 Ok(value) => Outcome::from_result(&value),
                 Err(e) => Err(format!("AIの出力を読めません: {e}")),
             },
-            ClaudeEnd::Unstopped(e) => return Err(e),
         };
         let (requested, text) = match outcome {
             Ok(outcome) => (outcome.next, outcome.comment),
@@ -781,11 +857,11 @@ struct ClaudeRun<'a> {
     job_dirs: &'a [PathBuf],
 }
 
+/// claudeの終わり方。プロセスを止めきれなかったときは、ここには来ない（`Failure::Unstopped`）。
+/// 書き込みの道に入るのは、止めたことを確かめたときだけにするため。
 enum ClaudeEnd {
     Exited(String),
     TimedOut,
-    /// AIが動かしたプロセスを止めきれなかった
-    Unstopped(Error),
 }
 
 /// claudeに渡す環境変数。使う人の環境変数（`SSH_AUTH_SOCK`、`AWS_*`、ほかのツールのトークンなど）は、
@@ -871,7 +947,7 @@ impl ClaudeRun<'_> {
         format!("{:x}{:x}", std::process::id(), nanos)
     }
 
-    fn run(&self) -> Result<ClaudeEnd> {
+    fn run(&self) -> std::result::Result<ClaudeEnd, Failure> {
         let log = |name: &str| -> Result<std::fs::File> {
             let path = self.log_dir.join(name);
             std::fs::File::create(&path)
@@ -920,7 +996,7 @@ impl ClaudeRun<'_> {
                 Ok(None) if Instant::now() >= deadline => break true,
                 // Claude CodeのBashのシェルはすぐ終わるので、短い間隔で見る
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => return Err(Error::new(format!("claudeを待てません: {e}"))),
+                Err(e) => return Err(Error::new(format!("claudeを待てません: {e}")).into()),
             }
         };
         if timed_out {
@@ -932,8 +1008,8 @@ impl ClaudeRun<'_> {
         }
         let stopped = seen.stop_all(pid);
         let _ = child.wait();
-        if let Err(e) = stopped {
-            return Ok(ClaudeEnd::Unstopped(e));
+        if let Err(leftovers) = stopped {
+            return Err(Failure::Unstopped(leftovers));
         }
         if timed_out {
             return Ok(ClaudeEnd::TimedOut);
@@ -1105,7 +1181,9 @@ impl Processes {
     }
 
     /// 覚えたグループとプロセス、目印を持つプロセスをすべて止め、残っていないことを確かめる。
-    fn stop_all(&mut self, root: u32) -> Result<()> {
+    /// 止めきれなければ、残ったものを返す。
+    fn stop_all(&mut self, root: u32) -> std::result::Result<(), Vec<Leftover>> {
+        let mut last: Vec<Leftover> = Vec::new();
         let me = std::process::id();
         for _ in 0..10 {
             let rows = self.collect(root);
@@ -1123,6 +1201,17 @@ impl Processes {
             if alive.is_empty() {
                 return Ok(());
             }
+            last = alive
+                .iter()
+                .map(|pid| Leftover {
+                    pid: *pid,
+                    started: rows
+                        .iter()
+                        .find(|r| r.0 == *pid)
+                        .map(|r| r.3.clone())
+                        .unwrap_or_default(),
+                })
+                .collect();
             for group in self.groups.iter().filter(|g| self.valid_group(&rows, **g)) {
                 let _ = Command::new("kill")
                     .args(["-KILL", "--", &format!("-{group}")])
@@ -1137,13 +1226,20 @@ impl Processes {
             }
             std::thread::sleep(Duration::from_millis(300));
         }
-        Err(Error::new(
-            "AIが動かしたプロセスを止めきれませんでした。GitHubには何も書かずに止めます",
-        )
-        .with_hint(
-            "残ったプロセスを止めてから、Issue/PRの ac:working を外し、ラベルを付け直してください",
-        ))
+        // 最後に止めたあとも、まだ残っているかを確かめる
+        let rows = process_table();
+        last.retain(|p| rows.iter().any(|r| r.0 == p.pid && r.3 == p.started) && is_alive(p.pid));
+        if last.is_empty() { Ok(()) } else { Err(last) }
     }
+}
+
+/// プロセスのコマンド（止めきれなかったものを、人に伝えるため）。
+fn command_of(pid: u32) -> String {
+    Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 /// 生きているか。ゾンビ（終わったが、親がまだ回収していない）は、生きているとみなさない。
@@ -1208,7 +1304,7 @@ mod tests {
         let schema = serde_json::json!({"type": "object"});
         let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(30))
             .run()
-            .unwrap();
+            .unwrap_or_else(|_| panic!("failed"));
         let ClaudeEnd::Exited(stdout) = end else {
             panic!("timed out");
         };
@@ -1256,7 +1352,7 @@ mod tests {
         let schema = serde_json::json!({});
         let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(30))
             .run()
-            .unwrap();
+            .unwrap_or_else(|_| panic!("failed"));
         assert!(matches!(end, ClaudeEnd::Exited(_)));
         assert!(
             !alive_from_file(dir.path(), "child.pid"),
@@ -1275,7 +1371,7 @@ mod tests {
         let started = Instant::now();
         let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(2))
             .run()
-            .unwrap();
+            .unwrap_or_else(|_| panic!("failed"));
         assert!(matches!(end, ClaudeEnd::TimedOut));
         assert!(started.elapsed() < Duration::from_secs(20));
         assert!(
@@ -1331,7 +1427,7 @@ mod tests {
             log_dir: dir.path(),
             job_dirs: &job_dirs,
         };
-        let end = run.run().unwrap();
+        let end = run.run().unwrap_or_else(|_| panic!("failed"));
         assert!(matches!(end, ClaudeEnd::Exited(_)));
         std::thread::sleep(Duration::from_millis(500));
         let left = Command::new("pgrep")
@@ -1409,8 +1505,15 @@ mod tests {
             max_rounds: 3,
             timeout_minutes: 30,
         };
+        // 止めきれなかったものとして、今動いているこのテストのプロセスを渡す
+        let me = std::process::id();
+        let started = process_table()
+            .into_iter()
+            .find(|r| r.0 == me)
+            .map(|r| r.3)
+            .unwrap();
         let e = runner.fail(
-            Failure::Unstopped(Error::new("止めきれませんでした")),
+            Failure::Unstopped(vec![Leftover { pid: me, started }]),
             &cell,
             &issue,
             &place,
@@ -1423,6 +1526,18 @@ mod tests {
             probe.calls.borrow()
         );
         assert!(place.run.join("error.txt").exists());
+        // 残っている間は、tickが動かないよう目印を残す
+        let note = stuck(&home).unwrap();
+        assert!(note.contains(&me.to_string()), "{note}");
+        assert!(note.contains("octo/app/3"), "{note}");
+        // 残ったプロセスがもうなければ、目印は消える
+        std::fs::write(
+            stuck_path(&home),
+            r#"{"job":"octo/app/3","processes":[{"pid":1,"started":"never"}]}"#,
+        )
+        .unwrap();
+        assert!(stuck(&home).is_none());
+        assert!(!stuck_path(&home).exists());
 
         // ふつうの失敗なら、人間に回すコメントとラベルを書く
         runner.fail(Failure::Error(Error::new("失敗")), &cell, &issue, &place);

@@ -193,6 +193,13 @@ fn run(command: Commands) -> Result<ExitCode> {
                 println!("ほかのtickが動いているので、何もしません");
                 return Ok(ExitCode::SUCCESS);
             };
+            // 前の実行でAIのプロセスを止めきれなかったら、それが残っている間は何も動かさない
+            // （次の仕事の書き込みのトークンを、残ったプロセスに読ませないため）
+            if let Some(note) = run::stuck(&home) {
+                return Err(Error::new(note).with_hint(
+                    "`agentcells doctor` でも確かめられます。プロセスがなくなれば、次のtickから動きます",
+                ));
+            }
             let config = Config::load(&home.config_path())?;
             let credentials_for =
                 |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
