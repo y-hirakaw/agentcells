@@ -54,6 +54,9 @@ enum Commands {
         /// 動かさずに、見つかった仕事と、次に動かすものだけを表示する
         #[arg(long)]
         dry_run: bool,
+        /// 仕事が残っていれば、始めてからこの分数がたつまで、続けて動かす（0なら1件だけ）
+        #[arg(long, default_value_t = 30)]
+        max_minutes: u64,
     },
     /// 動いているcellと、agentcellsが扱っているIssueごとに、今どこまで進んでいるかを出す（読むだけ）
     Status {
@@ -327,7 +330,10 @@ fn run(command: Commands) -> Result<ExitCode> {
                 ExitCode::SUCCESS
             })
         }
-        Commands::Tick { dry_run } => {
+        Commands::Tick {
+            dry_run,
+            max_minutes,
+        } => {
             schedule::rotate_log(&home);
             let Some(_lock) = tick::lock(&home)? else {
                 println!("ほかのtickが動いているので、何もしません");
@@ -383,57 +389,97 @@ fn run(command: Commands) -> Result<ExitCode> {
             if !errors.is_empty() || !leftovers.is_empty() {
                 println!();
             }
-            let mut quiet = tick::Quiet::load(&home);
-            let found = tick::find(&config, &SystemProbe, &credentials_for, &actors, &mut quiet)?;
-            quiet.save(&home);
-            for (w, reason) in &found.skipped {
-                println!("見送り: {}（{reason}）", w.describe());
-            }
-            let work = found.work;
-            if work.is_empty() {
-                println!("仕事はありません");
-                return Ok(ExitCode::SUCCESS);
-            }
-            println!("仕事: {}件", work.len());
-            // 1回のtickでは1件だけ動かす
-            for w in &work {
-                println!("  {}", w.describe());
-            }
-            let next = &work[0];
-            println!("\n次に動かすもの: {}", next.describe());
-            if dry_run {
-                return Ok(ExitCode::SUCCESS);
-            }
             let agentcells = std::env::current_exe()
                 .map_err(|e| Error::new(format!("agentcellsの場所がわかりません: {e}")))?;
-            let scanner = find_program("betterleaks").ok_or_else(|| {
-                Error::new("betterleaksが見つかりません")
-                    .with_hint("`agentcells doctor` で確かめてください")
-            })?;
-            let claude = find_program("claude").ok_or_else(|| {
-                Error::new("claudeが見つかりません")
-                    .with_hint("`agentcells doctor` で確かめてください")
-            })?;
             // 試すときに、安いモデルで動かせるようにする
             let model = std::env::var("AGENTCELLS_MODEL").ok();
-            let runner = run::Runner {
-                home: &home,
-                config: &config,
-                probe: &SystemProbe,
-                actors: &actors,
-                claude: &claude,
-                agentcells: &agentcells,
-                scanner: &scanner,
-                model: model.as_deref(),
-            };
-            println!("動かしています...");
-            let report = runner.run(next)?;
-            match &report.reason {
-                Some(reason) if report.destination == "skipped" => {
-                    println!("見送りました: {reason}")
+            // 仕事が残っていれば、上限まで続けて探して動かす
+            let mut session = tick::Session::new(std::time::Duration::from_secs(
+                max_minutes.saturating_mul(60),
+            ));
+            // 見送りは、読み直すたびに同じものが出るので、1回のtickでは1度だけ出す
+            let mut told: std::collections::HashSet<String> = std::collections::HashSet::new();
+            loop {
+                if session.runs() > 0 {
+                    // 止めきれなかったプロセスが残ったら、ほかの仕事も動かさない
+                    if let Some(note) = run::stuck(&home) {
+                        return Err(Error::new(note).with_hint(
+                            "`agentcells doctor` でも確かめられます。プロセスがなくなれば、次のtickから動きます",
+                        ));
+                    }
+                    if session.halted() {
+                        println!("\nAIの実行が失敗したので、残りは次のtickで動かします");
+                        break;
+                    }
+                    if session.exhausted() {
+                        println!(
+                            "\nこのtickの上限（{max_minutes}分、{}件）に達したので、残りは次のtickで動かします",
+                            tick::MAX_RUNS
+                        );
+                        break;
+                    }
+                    println!(
+                        "\n--- 続けて、仕事を探します（このtickで{}件目のあと）",
+                        session.runs()
+                    );
                 }
-                Some(reason) => println!("{} に進めました（{reason}）", report.destination),
-                None => println!("{} に進めました", report.destination),
+                let mut quiet = tick::Quiet::load(&home);
+                let found =
+                    tick::find(&config, &SystemProbe, &credentials_for, &actors, &mut quiet)?;
+                quiet.save(&home);
+                for (w, reason) in &found.skipped {
+                    let line = format!("見送り: {}（{reason}）", w.describe());
+                    if told.insert(line.clone()) {
+                        println!("{line}");
+                    }
+                }
+                let work = found.work;
+                let Some(next) = session.next(&work) else {
+                    if session.runs() == 0 {
+                        println!("仕事はありません");
+                    } else {
+                        println!("ほかに仕事はありません");
+                    }
+                    break;
+                };
+                println!("仕事: {}件", work.len());
+                for w in &work {
+                    println!("  {}", w.describe());
+                }
+                println!("\n次に動かすもの: {}", next.describe());
+                if dry_run {
+                    break;
+                }
+                let scanner = find_program("betterleaks").ok_or_else(|| {
+                    Error::new("betterleaksが見つかりません")
+                        .with_hint("`agentcells doctor` で確かめてください")
+                })?;
+                let claude = find_program("claude").ok_or_else(|| {
+                    Error::new("claudeが見つかりません")
+                        .with_hint("`agentcells doctor` で確かめてください")
+                })?;
+                let runner = run::Runner {
+                    home: &home,
+                    config: &config,
+                    probe: &SystemProbe,
+                    actors: &actors,
+                    claude: &claude,
+                    agentcells: &agentcells,
+                    scanner: &scanner,
+                    model: model.as_deref(),
+                };
+                println!("動かしています...");
+                let report = runner.run(next)?;
+                let skipped = report.destination == "skipped";
+                match &report.reason {
+                    Some(reason) if skipped => println!("見送りました: {reason}"),
+                    Some(reason) => println!("{} に進めました（{reason}）", report.destination),
+                    None => println!("{} に進めました", report.destination),
+                }
+                session.ran(next, skipped);
+                if report.ai_failed {
+                    session.halt();
+                }
             }
             Ok(ExitCode::SUCCESS)
         }

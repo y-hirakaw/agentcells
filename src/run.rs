@@ -44,6 +44,9 @@ pub struct Report {
     pub destination: String,
     /// 人間に回したときや、見送ったときの理由
     pub reason: Option<String>,
+    /// AIの実行そのものが失敗した（結果が返らなかった、時間切れ）。使用量の上限やログインの切れでも
+    /// こうなり、ほかの仕事も同じように失敗しやすいので、tickはそこで続けるのをやめる
+    pub ai_failed: bool,
 }
 
 /// 動かしている途中の失敗。
@@ -318,6 +321,7 @@ impl Runner<'_> {
                 return Ok(Report {
                     destination: "skipped".to_string(),
                     reason: Some(note),
+                    ai_failed: false,
                 });
             }
             Prepared::Ready(ready) => ready,
@@ -593,6 +597,7 @@ impl Runner<'_> {
 
         // AIが決めた結果を読む。読めなければ、人間に回す
         let mut overridden: Option<String> = None;
+        let mut ai_failed = false;
         let outcome = match finished {
             ClaudeEnd::TimedOut => Err(format!(
                 "時間の上限（{}分）を超えたので、止めました",
@@ -607,6 +612,7 @@ impl Runner<'_> {
             Ok(outcome) => outcome,
             Err(reason) => {
                 overridden = Some(reason);
+                ai_failed = true;
                 Outcome {
                     next: transition::NEEDS_HUMAN.to_string(),
                     comment: String::new(),
@@ -746,6 +752,7 @@ impl Runner<'_> {
                 Destination::NeedsHuman => transition::NEEDS_HUMAN.to_string(),
             },
             reason,
+            ai_failed,
         })
     }
 

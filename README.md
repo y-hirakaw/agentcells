@@ -54,7 +54,7 @@ agentcells doctor
 | `agentcells setup` | 作業データの置き場所と、設定ファイルの雛形（`config.toml`）を用意する（何度実行してもよい） |
 | `agentcells labels sync [--dry-run]` | 設定ファイルのproductとcellに必要な `ac:` ラベルのうち、足りないものをGitHubに作る |
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
-| `agentcells tick [--dry-run]` | 仕事（あなたが選んだ、cellのラベルが付いたIssue/PRと、人間を待っていたところにあなたが返事をしたもの）を探して、1件をcellで動かす。閉じたIssue/PRに残った `ac:` ラベルも外す。`--dry-run` なら表示だけ。implementはコミットを確かめてpushし、PRを作る。reviewはPRにレビューを投稿する |
+| `agentcells tick [--dry-run]` | 仕事（あなたが選んだ、cellのラベルが付いたIssue/PRと、人間を待っていたところにあなたが返事をしたもの）を探して、1件ずつcellで動かす。仕事が残っていれば、上限（`--max-minutes`、既定は30分）まで続けて動かす。閉じたIssue/PRに残った `ac:` ラベルも外す。`--dry-run` なら表示だけ。implementはコミットを確かめてpushし、PRを作る。reviewはPRにレビューを投稿する |
 | `agentcells schedule install [--every <分>]` / `remove` | `tick` を決まった間隔（既定は10分）で動かすように、launchd（macOS）に登録する／外す。cellが動いている間は、次のtickは何もしない。ログは `~/.agentcells/logs/tick.log` |
 | `agentcells status [--watch]` | 動いているcell（経過時間、AIが使っているツール）と、扱っているIssueごとに、今どこまで進んでいるか（作業中、返事待ち、検品待ち、順番待ち）と、いつからかを出す。PRができたIssueは、PRの状態を出す（読むだけ）。`--watch` なら、動いているcellの様子だけを2秒ごとに出し直す |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |

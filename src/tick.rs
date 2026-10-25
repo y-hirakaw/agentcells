@@ -1,4 +1,5 @@
-//! 定期実行で呼ぶ `agentcells tick`。仕事を探し、1件ずつcellを動かす。
+//! 定期実行で呼ぶ `agentcells tick`。仕事を探し、1件ずつcellを動かす。仕事が残っていれば、
+//! 上限（時間と回数）まで、続けて探して動かす（[`Session`]）。
 //!
 //! 仕事は、開いているIssue/PRのうち、処理中（`ac:working`）でないもので、次のどちらか。
 //! Issueはproductの `issues` のリポジトリから、PRは `repos` のリポジトリから探す。
@@ -62,6 +63,76 @@ impl Work {
         match self.waiting {
             Some(waiting) => waiting.label(),
             None => &cell.label,
+        }
+    }
+}
+
+/// 1回のtickで動かす回数の上限。時間の上限より先に、思わぬくり返しを止めるため。
+pub const MAX_RUNS: usize = 20;
+
+/// 1回のtickの中で、続けて動かすかを決める。
+///
+/// - 1件は必ず動かす。そのあとは、始めてから `max` がたつか、[`MAX_RUNS`] 件動かしたら、新しく始めない
+///   （動いているcellは止めない）
+/// - 見送ったもの（動かす前の確かめで止めたもの）は、このtickではもう拾わない。ラベルが残るので、
+///   そのままだと同じものを拾い続けるため。進んだものは、また拾ってよい（triageからimplementへ、など。
+///   AIどうしの往復は、cellの `max_rounds` で止まる）
+#[derive(Debug)]
+pub struct Session {
+    started: std::time::Instant,
+    max: std::time::Duration,
+    runs: usize,
+    skipped: Vec<(Target, RepoName, u64)>,
+    /// これ以上続けない（AIの実行が失敗したなど）
+    halted: bool,
+}
+
+impl Session {
+    pub fn new(max: std::time::Duration) -> Self {
+        Session {
+            started: std::time::Instant::now(),
+            max,
+            runs: 0,
+            skipped: Vec::new(),
+            halted: false,
+        }
+    }
+
+    /// これ以上続けない。AIの実行そのものが失敗したら（使用量の上限、ログインの切れなど）、
+    /// ほかの仕事も同じように失敗して、たまっていた仕事がまとめて人間に回ってしまうため。
+    pub fn halt(&mut self) {
+        self.halted = true;
+    }
+
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn runs(&self) -> usize {
+        self.runs
+    }
+
+    /// もう新しく始めないか。
+    pub fn exhausted(&self) -> bool {
+        self.runs > 0
+            && (self.halted || self.runs >= MAX_RUNS || self.started.elapsed() >= self.max)
+    }
+
+    /// 次に動かすもの。このtickで見送ったものは飛ばす。
+    pub fn next<'a>(&self, work: &'a [Work]) -> Option<&'a Work> {
+        work.iter().find(|w| {
+            !self.skipped.iter().any(|(item, repo, number)| {
+                *item == w.item && repo == &w.repo && *number == w.number
+            })
+        })
+    }
+
+    /// 動かした。`skipped` なら、このtickではもう拾わない。
+    pub fn ran(&mut self, work: &Work, skipped: bool) {
+        self.runs += 1;
+        if skipped {
+            self.skipped
+                .push((work.item, work.repo.clone(), work.number));
         }
     }
 }
@@ -1052,6 +1123,52 @@ next = ["implement", "done"]
         let probe = FakeProbe::default().with_fallback(false);
         let err = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap_err();
         assert!(err.hint.unwrap().contains("agentcells doctor"));
+    }
+
+    fn work(cell: &str, number: u64) -> Work {
+        Work {
+            product: "app".to_string(),
+            cell: cell.to_string(),
+            item: Target::Issue,
+            repo: RepoName::parse("octo/issues").unwrap(),
+            number,
+            title: String::new(),
+            waiting: None,
+        }
+    }
+
+    #[test]
+    fn a_session_runs_until_time_or_runs_run_out_and_skips_what_was_skipped() {
+        let mut session = Session::new(std::time::Duration::from_secs(3600));
+        let found = [work("triage", 1), work("triage", 2)];
+        assert!(!session.exhausted());
+        assert_eq!(session.next(&found).map(|w| w.number), Some(1));
+        // 進んだものは、また拾ってよい
+        session.ran(&found[0], false);
+        assert_eq!(session.next(&found).map(|w| w.number), Some(1));
+        // 見送ったものは、このtickでは拾わない
+        session.ran(&found[0], true);
+        assert_eq!(session.next(&found).map(|w| w.number), Some(2));
+        session.ran(&found[1], true);
+        assert!(session.next(&found).is_none());
+        assert!(!session.exhausted());
+        for _ in session.runs()..MAX_RUNS {
+            session.ran(&found[1], false);
+        }
+        assert!(session.exhausted());
+
+        // AIの実行が失敗したら、続けない
+        let mut halted = Session::new(std::time::Duration::from_secs(3600));
+        halted.ran(&found[0], false);
+        assert!(!halted.exhausted());
+        halted.halt();
+        assert!(halted.exhausted());
+
+        // 時間の上限が0でも、1件は動かす
+        let mut once = Session::new(std::time::Duration::ZERO);
+        assert!(!once.exhausted());
+        once.ran(&found[0], false);
+        assert!(once.exhausted());
     }
 
     #[test]
