@@ -158,7 +158,7 @@ pub fn find(
                         let author = i
                             .author
                             .as_ref()
-                            .map(|a| rest_login(&a.login))
+                            .map(|a| crate::pr::app_login(&a.login))
                             .unwrap_or_else(|| "ghost".to_string());
                         let original = match item {
                             Target::PullRequest => crate::prompt::closes(&i.body, repo),
@@ -209,15 +209,6 @@ pub fn find(
         }
     }
     Ok(found)
-}
-
-/// `gh pr list --json author` は、GitHub Appの作者を `app/<slug>` と返す。REST APIやeventsと同じ
-/// `<slug>[bot]` に読み替える（`[bot]` を外して比べると、同じ名前の人のアカウントと見分けられない）。
-fn rest_login(login: &str) -> String {
-    match login.strip_prefix("app/") {
-        Some(slug) => format!("{slug}[bot]"),
-        None => login.to_string(),
-    }
 }
 
 fn list(

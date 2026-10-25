@@ -128,11 +128,14 @@ pub fn push_staged(
 pub const AUTORUN_PATHS: &[&str] = &[
     ".claude",
     ".mcp.json",
-    ".vscode/tasks.json",
-    ".vscode/settings.json",
+    ".vscode",
+    ".idea",
+    ".zed",
+    ".cursor",
     ".devcontainer",
     ".envrc",
     ".husky",
+    ".gitattributes",
     ".github/workflows",
 ];
 
@@ -167,6 +170,45 @@ pub fn verify(
             return Ok(Some(format!(
                 "置いた秘密のファイルと同じ中身のファイル（{}）がコミットに入っています",
                 path.unwrap_or("?")
+            )));
+        }
+    }
+    // マージコミットの差分は、既定の `git log` に出ないので、その分の確かめをすり抜けられる。
+    // AIがマージを作る必要はないので、断る
+    let merges = git_out(
+        probe,
+        &["-C", staging_path, "rev-list", "--merges", &range],
+        ISOLATED_GIT_ENV,
+    )?;
+    if !merges.trim().is_empty() {
+        return Ok(Some(
+            "マージコミットがあります（中身を確かめきれないので、pushしません）".to_string(),
+        ));
+    }
+    // シンボリックリンクで、守るパスを別の場所に向けられる（`.vscode` → `tools/v` など）ので、足させない
+    let raw = git_out(
+        probe,
+        &[
+            "-C",
+            staging_path,
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "--raw",
+            "--no-renames",
+            "--format=",
+            &range,
+        ],
+        ISOLATED_GIT_ENV,
+    )?;
+    for line in raw.lines() {
+        // ":<古いmode> <新しいmode> <古いhash> <新しいhash> <状態>\t<パス>"
+        let mut fields = line.split_whitespace();
+        let new_mode = fields.nth(1);
+        if new_mode == Some("120000") {
+            let path = line.split('\t').nth(1).unwrap_or("?");
+            return Ok(Some(format!(
+                "シンボリックリンクを足すコミットがあります: {path}"
             )));
         }
     }
@@ -235,12 +277,15 @@ pub fn verify(
     Ok(None)
 }
 
-/// ブランチから開いているPRの番号。なければ `None`。
+/// ブランチから開いている、agentcellsが作ったPRの番号。なければ `None`。
+/// `--head` はブランチの名前だけで探すので、同じ名前のブランチからフォークで開いた他人のPRも返る。
+/// 作者が書き込みのアカウント（`writer`）で、フォークからでないものだけを使う。
 pub fn find_open(
     probe: &dyn Probe,
     credentials: &Credentials,
     repo: &RepoName,
     branch: &str,
+    writer: &str,
 ) -> Result<Option<u64>> {
     let repo_arg = repo.to_string();
     let out = gh(
@@ -256,19 +301,40 @@ pub fn find_open(
             "--state",
             "open",
             "--json",
-            "number",
-            "--jq",
-            ".[0].number",
+            "number,isCrossRepository,author",
         ],
     )?;
-    let number = out.trim();
-    if number.is_empty() || number == "null" {
-        return Ok(None);
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Listed {
+        number: u64,
+        is_cross_repository: bool,
+        author: Option<Author>,
     }
-    number
-        .parse()
-        .map(Some)
-        .map_err(|e| Error::new(format!("PRの番号を読めません（{number}）: {e}")))
+    #[derive(serde::Deserialize)]
+    struct Author {
+        login: String,
+    }
+    let listed: Vec<Listed> =
+        serde_json::from_str(&out).map_err(|e| Error::new(format!("PRの一覧を読めません: {e}")))?;
+    Ok(listed
+        .into_iter()
+        .find(|p| {
+            !p.is_cross_repository
+                && p.author
+                    .as_ref()
+                    .is_some_and(|a| app_login(&a.login).eq_ignore_ascii_case(writer))
+        })
+        .map(|p| p.number))
+}
+
+/// `gh pr list --json author` は、GitHub Appの作者を `app/<slug>` と返す。REST APIやeventsと同じ
+/// `<slug>[bot]` に読み替える（`[bot]` を外して比べると、同じ名前の人のアカウントと見分けられない）。
+pub fn app_login(login: &str) -> String {
+    match login.strip_prefix("app/") {
+        Some(slug) => format!("{slug}[bot]"),
+        None => login.to_string(),
+    }
 }
 
 /// PRを作り、その番号を返す（`gh pr create` はPRのURLを出す）。
@@ -449,6 +515,50 @@ mod tests {
         }
 
         #[test]
+        fn verify_refuses_merges_and_symlinks() {
+            // マージのときに足したものは、既定の git log に出ない
+            let dir = tempfile::tempdir().unwrap();
+            let scanner = fake_scanner(dir.path());
+            let work = dir.path().join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            git_in(&work, &["init", "-q", "-b", "main"]);
+            std::fs::write(work.join("a.txt"), "a").unwrap();
+            git_in(&work, &["add", "-A"]);
+            git_in(&work, &["commit", "-q", "-m", "base"]);
+            let base = git_in(&work, &["rev-parse", "HEAD"]);
+            git_in(&work, &["checkout", "-q", "-b", "side"]);
+            std::fs::write(work.join("b.txt"), "b").unwrap();
+            git_in(&work, &["add", "-A"]);
+            git_in(&work, &["commit", "-q", "-m", "side"]);
+            git_in(&work, &["checkout", "-q", "-b", "ac/x", "main"]);
+            git_in(&work, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
+            std::fs::create_dir_all(work.join(".claude")).unwrap();
+            std::fs::write(work.join(".claude/settings.json"), "{}").unwrap();
+            git_in(&work, &["add", "-A"]);
+            git_in(&work, &["commit", "-q", "-m", "merge"]);
+            let staging = stage(&SystemProbe, &work, "ac/x").unwrap();
+            let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
+                .unwrap()
+                .unwrap();
+            assert!(reason.contains("マージコミット"), "{reason}");
+
+            // シンボリックリンクで、守るパスを別の場所に向ける
+            let dir = tempfile::tempdir().unwrap();
+            let scanner = fake_scanner(dir.path());
+            let (staging, base) = staged(dir.path(), &[("tools/v/tasks.json", "{}")]);
+            let work = dir.path().join("work");
+            std::os::unix::fs::symlink("tools/v", work.join(".vsc")).unwrap();
+            git_in(&work, &["add", "-A"]);
+            git_in(&work, &["commit", "-q", "-m", "link"]);
+            drop(staging);
+            let staging = stage(&SystemProbe, &work, "ac/x").unwrap();
+            let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
+                .unwrap()
+                .unwrap();
+            assert!(reason.contains("シンボリックリンク"), "{reason}");
+        }
+
+        #[test]
         fn verify_passes_ordinary_commits() {
             let dir = tempfile::tempdir().unwrap();
             let scanner = fake_scanner(dir.path());
@@ -491,6 +601,7 @@ mod tests {
 
             for (path, content, expect) in [
                 (".claude/settings.json", "{}", ".claude"),
+                (".vscode/tasks.json", "{}", ".vscode"),
                 (".github/workflows/ci.yml", "on: push", ".github/workflows"),
                 ("src/config.rs", "token = FAKE-SECRET", "fake"),
             ] {

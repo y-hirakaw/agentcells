@@ -719,7 +719,13 @@ impl Runner<'_> {
         if work.item == Target::PullRequest {
             return Ok(Pushed::Done(None));
         }
-        let number = match crate::pr::find_open(self.probe, write, &work.repo, &branch.name)? {
+        let number = match crate::pr::find_open(
+            self.probe,
+            write,
+            &work.repo,
+            &branch.name,
+            &self.actors.writer,
+        )? {
             Some(number) => number,
             None => {
                 let body = crate::pr::body(
