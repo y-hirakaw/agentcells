@@ -47,6 +47,37 @@ pub struct Report {
     /// AIの実行そのものが失敗した（結果が返らなかった、時間切れ）。使用量の上限やログインの切れでも
     /// こうなり、ほかの仕事も同じように失敗しやすいので、tickはそこで続けるのをやめる
     pub ai_failed: bool,
+    /// 何回目か（見送ったときは0）
+    pub round: u32,
+    /// AIが選んだ先（結果が返らなかったときは `None`）
+    pub requested: Option<String>,
+    /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
+    pub pr: Option<u64>,
+    /// 使ったモデル（指定しなかったら `None`）
+    pub model: Option<String>,
+    pub usage: Usage,
+}
+
+/// claudeが結果と一緒に返す、やり取りの回数と費用の目安。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Usage {
+    pub turns: Option<u64>,
+    pub cost_usd: Option<f64>,
+    /// 実際に使ったモデル（`modelUsage` のキー）
+    pub models: Vec<String>,
+}
+
+impl Usage {
+    fn from_result(result: &serde_json::Value) -> Self {
+        Usage {
+            turns: result["num_turns"].as_u64(),
+            cost_usd: result["total_cost_usd"].as_f64(),
+            models: result["modelUsage"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// 動かしている途中の失敗。
@@ -323,6 +354,11 @@ impl Runner<'_> {
                     destination: "skipped".to_string(),
                     reason: Some(note),
                     ai_failed: false,
+                    round: 0,
+                    requested: None,
+                    pr: None,
+                    model: None,
+                    usage: Usage::default(),
                 });
             }
             Prepared::Ready(ready) => ready,
@@ -601,13 +637,17 @@ impl Runner<'_> {
         // AIが決めた結果を読む。読めなければ、人間に回す
         let mut overridden: Option<String> = None;
         let mut ai_failed = false;
+        let mut usage = Usage::default();
         let outcome = match finished {
             ClaudeEnd::TimedOut => Err(format!(
                 "時間の上限（{}分）を超えたので、止めました",
                 cell.timeout_minutes
             )),
             ClaudeEnd::Exited(stdout) => match serde_json::from_str::<serde_json::Value>(&stdout) {
-                Ok(value) => Outcome::from_result(&value),
+                Ok(value) => {
+                    usage = Usage::from_result(&value);
+                    Outcome::from_result(&value)
+                }
                 Err(e) => Err(format!("AIの出力を読めません: {e}")),
             },
         };
@@ -767,6 +807,11 @@ impl Runner<'_> {
             },
             reason,
             ai_failed,
+            round,
+            requested: (!ai_failed).then(|| outcome.next.clone()),
+            pr: pr_number,
+            model: self.model.or(cell.model.as_deref()).map(str::to_string),
+            usage,
         })
     }
 

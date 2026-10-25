@@ -14,6 +14,7 @@ pub mod marker;
 pub mod pr;
 pub mod probe;
 pub mod prompt;
+pub mod record;
 pub mod review;
 pub mod run;
 pub mod running;

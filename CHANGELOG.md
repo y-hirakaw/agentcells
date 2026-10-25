@@ -6,6 +6,12 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.16.0] - 2026-10-25
+
+### 足したこと
+
+- tickが動いたことを `~/.agentcells/logs/events.jsonl` に1行1件のJSONで残す（tickの始めと終わり、動かしたcell、見送ったもの、片付けたもの、エラー）。動かしたcellには、round、進めた先、かかった時間、モデル、claudeが返したやり取りの回数と費用の目安も書く。inspector（ラインの不具合を見つけるcell）の材料にするため。`tick.log` は人が読むためのもので、同じcellが続けて動いた、といったことを機械で数えにくい
+
 ## [0.15.0] - 2026-10-25
 
 ### 足したこと

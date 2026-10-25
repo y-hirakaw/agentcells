@@ -14,6 +14,7 @@ use agentcells::home::{Home, RepoName};
 use agentcells::labels;
 use agentcells::probe::SystemProbe;
 use agentcells::prompt;
+use agentcells::record;
 use agentcells::run;
 use agentcells::schedule;
 use agentcells::setup;
@@ -341,146 +342,205 @@ fn run(command: Commands) -> Result<ExitCode> {
             };
             // ロックを取れたので、動いているcellはない。殺されたtickが残した印を片付ける
             agentcells::running::finish(&home);
-            // 前の実行でAIのプロセスを止めきれなかったら、それが残っている間は何も動かさない
-            // （次の仕事の書き込みのトークンを、残ったプロセスに読ませないため）
-            if let Some(note) = run::stuck(&home) {
-                return Err(Error::new(note).with_hint(
-                    "`agentcells doctor` でも確かめられます。プロセスがなくなれば、次のtickから動きます",
-                ));
-            }
-            let config = Config::load(&home.config_path())?;
-            let credentials_for =
-                |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
-            let actors = guard::Actors {
-                // 設定を読むときに、productがあれば operator は必ずある
-                operator: config.operator.clone().unwrap_or_default(),
-                writer: prompt::writer_login(&config, &SystemProbe)?,
+            // 動いたことを記録する（inspectorの材料）。試すだけ（--dry-run）なら記録しない
+            record::rotate(&home);
+            let recorder = (!dry_run).then(|| record::Recorder::new(&home, unix_now()));
+            let note = |event: record::Event| {
+                if let Some(recorder) = &recorder {
+                    recorder.write(unix_now(), event);
+                }
             };
-            // ラベルが足りないと、仕事が見つからなかったり、ラベルを付け替えられなかったりする
-            match labels::missing(&config, &SystemProbe) {
-                Ok(missing) if !missing.is_empty() => println!(
-                    "注意: 足りないラベルがあります（`agentcells labels sync` で作れます）:\n{}\n",
-                    labels::describe_missing(&missing)
-                ),
-                Ok(_) => {}
-                Err(e) => println!("注意: ラベルを確かめられません: {}\n", e.message),
-            }
-            // 閉じたものに残ったラベルを片付ける。できなくても、仕事は進める
-            let (leftovers, errors) = tidy::find(&config, &SystemProbe, &credentials_for);
-            for error in &errors {
-                println!("注意: 片付けるものを探せません: {error}");
-            }
-            if dry_run {
-                for l in &leftovers {
-                    println!("片付ける予定: {} を外す", l.describe());
+            note(record::Event::Started {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                max_minutes,
+            });
+            // 終わった理由を記録する。ここから先でエラーになったら error とその中身
+            let mut why = "error";
+            let mut runs = 0;
+            let result = (|| -> Result<()> {
+                // 前の実行でAIのプロセスを止めきれなかったら、それが残っている間は何も動かさない
+                // （次の仕事の書き込みのトークンを、残ったプロセスに読ませないため）
+                if let Some(note_text) = run::stuck(&home) {
+                    why = "stuck";
+                    return Err(Error::new(note_text).with_hint(
+                        "`agentcells doctor` でも確かめられます。プロセスがなくなれば、次のtickから動きます",
+                    ));
                 }
-            } else if !leftovers.is_empty() {
-                let write_for = |repo: &RepoName| {
-                    github::credentials(&config, &SystemProbe, repo, Purpose::Work)
+                let config = Config::load(&home.config_path())?;
+                let credentials_for = |repo: &RepoName| {
+                    github::credentials(&config, &SystemProbe, repo, Purpose::Read)
                 };
-                let results = tidy::remove(&SystemProbe, &leftovers, &write_for);
-                for (l, result) in leftovers.iter().zip(results) {
-                    match result {
-                        Ok(()) => println!("片付け: {} を外しました", l.describe()),
-                        Err(e) => println!("注意: {} を外せません: {}", l.describe(), e.message),
-                    }
-                }
-            }
-            if !errors.is_empty() || !leftovers.is_empty() {
-                println!();
-            }
-            let agentcells = std::env::current_exe()
-                .map_err(|e| Error::new(format!("agentcellsの場所がわかりません: {e}")))?;
-            // 試すときに、安いモデルで動かせるようにする
-            let model = std::env::var("AGENTCELLS_MODEL").ok();
-            // 仕事が残っていれば、上限まで続けて探して動かす
-            let mut session = tick::Session::new(std::time::Duration::from_secs(
-                max_minutes.saturating_mul(60),
-            ));
-            // 見送りは、読み直すたびに同じものが出るので、1回のtickでは1度だけ出す
-            let mut told: std::collections::HashSet<String> = std::collections::HashSet::new();
-            loop {
-                if session.runs() > 0 {
-                    // 止めきれなかったプロセスが残ったら、ほかの仕事も動かさない
-                    if let Some(note) = run::stuck(&home) {
-                        return Err(Error::new(note).with_hint(
-                            "`agentcells doctor` でも確かめられます。プロセスがなくなれば、次のtickから動きます",
-                        ));
-                    }
-                    if session.halted() {
-                        println!("\nAIの実行が失敗したので、残りは次のtickで動かします");
-                        break;
-                    }
-                    if session.exhausted() {
-                        println!(
-                            "\nこのtickの上限（{max_minutes}分、{}件）に達したので、残りは次のtickで動かします",
-                            tick::MAX_RUNS
-                        );
-                        break;
-                    }
-                    println!(
-                        "\n--- 続けて、仕事を探します（このtickで{}件目のあと）",
-                        session.runs()
-                    );
-                }
-                let mut quiet = tick::Quiet::load(&home);
-                let found =
-                    tick::find(&config, &SystemProbe, &credentials_for, &actors, &mut quiet)?;
-                quiet.save(&home);
-                for (w, reason) in &found.skipped {
-                    let line = format!("見送り: {}（{reason}）", w.describe());
-                    if told.insert(line.clone()) {
-                        println!("{line}");
-                    }
-                }
-                let work = found.work;
-                let Some(next) = session.next(&work) else {
-                    if session.runs() == 0 {
-                        println!("仕事はありません");
-                    } else {
-                        println!("ほかに仕事はありません");
-                    }
-                    break;
+                let actors = guard::Actors {
+                    // 設定を読むときに、productがあれば operator は必ずある
+                    operator: config.operator.clone().unwrap_or_default(),
+                    writer: prompt::writer_login(&config, &SystemProbe)?,
                 };
-                println!("仕事: {}件", work.len());
-                for w in &work {
-                    println!("  {}", w.describe());
+                // ラベルが足りないと、仕事が見つからなかったり、ラベルを付け替えられなかったりする
+                match labels::missing(&config, &SystemProbe) {
+                    Ok(missing) if !missing.is_empty() => println!(
+                        "注意: 足りないラベルがあります（`agentcells labels sync` で作れます）:\n{}\n",
+                        labels::describe_missing(&missing)
+                    ),
+                    Ok(_) => {}
+                    Err(e) => println!("注意: ラベルを確かめられません: {}\n", e.message),
                 }
-                println!("\n次に動かすもの: {}", next.describe());
+                // 閉じたものに残ったラベルを片付ける。できなくても、仕事は進める
+                let (leftovers, errors) = tidy::find(&config, &SystemProbe, &credentials_for);
+                for error in &errors {
+                    println!("注意: 片付けるものを探せません: {error}");
+                }
                 if dry_run {
-                    break;
+                    for l in &leftovers {
+                        println!("片付ける予定: {} を外す", l.describe());
+                    }
+                } else if !leftovers.is_empty() {
+                    let write_for = |repo: &RepoName| {
+                        github::credentials(&config, &SystemProbe, repo, Purpose::Work)
+                    };
+                    let results = tidy::remove(&SystemProbe, &leftovers, &write_for);
+                    for (l, result) in leftovers.iter().zip(results) {
+                        note(record::Event::tidied(
+                            l.kind,
+                            &l.repo.to_string(),
+                            l.number,
+                            &l.labels,
+                            result.as_ref().err().map(|e| e.message.clone()),
+                        ));
+                        match result {
+                            Ok(()) => println!("片付け: {} を外しました", l.describe()),
+                            Err(e) => {
+                                println!("注意: {} を外せません: {}", l.describe(), e.message)
+                            }
+                        }
+                    }
                 }
-                let scanner = find_program("betterleaks").ok_or_else(|| {
-                    Error::new("betterleaksが見つかりません")
-                        .with_hint("`agentcells doctor` で確かめてください")
-                })?;
-                let claude = find_program("claude").ok_or_else(|| {
-                    Error::new("claudeが見つかりません")
-                        .with_hint("`agentcells doctor` で確かめてください")
-                })?;
-                let runner = run::Runner {
-                    home: &home,
-                    config: &config,
-                    probe: &SystemProbe,
-                    actors: &actors,
-                    claude: &claude,
-                    agentcells: &agentcells,
-                    scanner: &scanner,
-                    model: model.as_deref(),
-                };
-                println!("動かしています...");
-                let report = runner.run(next)?;
-                let skipped = report.destination == "skipped";
-                match &report.reason {
-                    Some(reason) if skipped => println!("見送りました: {reason}"),
-                    Some(reason) => println!("{} に進めました（{reason}）", report.destination),
-                    None => println!("{} に進めました", report.destination),
+                if !errors.is_empty() || !leftovers.is_empty() {
+                    println!();
                 }
-                session.ran(next, skipped);
-                if report.ai_failed {
-                    session.halt();
+                let agentcells = std::env::current_exe()
+                    .map_err(|e| Error::new(format!("agentcellsの場所がわかりません: {e}")))?;
+                // 試すときに、安いモデルで動かせるようにする
+                let model = std::env::var("AGENTCELLS_MODEL").ok();
+                // 仕事が残っていれば、上限まで続けて探して動かす
+                let mut session = tick::Session::new(std::time::Duration::from_secs(
+                    max_minutes.saturating_mul(60),
+                ));
+                // 見送りは、読み直すたびに同じものが出るので、1回のtickでは1度だけ出す
+                let mut told: std::collections::HashSet<String> = std::collections::HashSet::new();
+                loop {
+                    if session.runs() > 0 {
+                        // 止めきれなかったプロセスが残ったら、ほかの仕事も動かさない
+                        if let Some(note_text) = run::stuck(&home) {
+                            why = "stuck";
+                            return Err(Error::new(note_text).with_hint(
+                                "`agentcells doctor` でも確かめられます。プロセスがなくなれば、次のtickから動きます",
+                            ));
+                        }
+                        if session.halted() {
+                            println!("\nAIの実行が失敗したので、残りは次のtickで動かします");
+                            why = "ai_failed";
+                            break;
+                        }
+                        if session.exhausted() {
+                            println!(
+                                "\nこのtickの上限（{max_minutes}分、{}件）に達したので、残りは次のtickで動かします",
+                                tick::MAX_RUNS
+                            );
+                            why = "limit";
+                            break;
+                        }
+                        println!(
+                            "\n--- 続けて、仕事を探します（このtickで{}件目のあと）",
+                            session.runs()
+                        );
+                    }
+                    let mut quiet = tick::Quiet::load(&home);
+                    let found =
+                        tick::find(&config, &SystemProbe, &credentials_for, &actors, &mut quiet)?;
+                    quiet.save(&home);
+                    for (w, reason) in &found.skipped {
+                        let line = format!("見送り: {}（{reason}）", w.describe());
+                        if told.insert(line.clone()) {
+                            println!("{line}");
+                            note(record::Event::Skipped {
+                                subject: record::Subject::of(w),
+                                reason: reason.clone(),
+                            });
+                        }
+                    }
+                    let work = found.work;
+                    let Some(next) = session.next(&work) else {
+                        if session.runs() == 0 {
+                            println!("仕事はありません");
+                        } else {
+                            println!("ほかに仕事はありません");
+                        }
+                        why = "no_work";
+                        break;
+                    };
+                    println!("仕事: {}件", work.len());
+                    for w in &work {
+                        println!("  {}", w.describe());
+                    }
+                    println!("\n次に動かすもの: {}", next.describe());
+                    if dry_run {
+                        why = "dry_run";
+                        break;
+                    }
+                    let scanner = find_program("betterleaks").ok_or_else(|| {
+                        Error::new("betterleaksが見つかりません")
+                            .with_hint("`agentcells doctor` で確かめてください")
+                    })?;
+                    let claude = find_program("claude").ok_or_else(|| {
+                        Error::new("claudeが見つかりません")
+                            .with_hint("`agentcells doctor` で確かめてください")
+                    })?;
+                    let runner = run::Runner {
+                        home: &home,
+                        config: &config,
+                        probe: &SystemProbe,
+                        actors: &actors,
+                        claude: &claude,
+                        agentcells: &agentcells,
+                        scanner: &scanner,
+                        model: model.as_deref(),
+                    };
+                    println!("動かしています...");
+                    let started = unix_now();
+                    let report = match runner.run(next) {
+                        Ok(report) => report,
+                        Err(e) => {
+                            let now = unix_now();
+                            note(record::Event::Failed {
+                                subject: record::Subject::of(next),
+                                started,
+                                seconds: now.saturating_sub(started),
+                                error: e.message.clone(),
+                            });
+                            return Err(e);
+                        }
+                    };
+                    note(record::Event::ran(next, started, unix_now(), &report));
+                    let skipped = report.destination == "skipped";
+                    match &report.reason {
+                        Some(reason) if skipped => println!("見送りました: {reason}"),
+                        Some(reason) => println!("{} に進めました（{reason}）", report.destination),
+                        None => println!("{} に進めました", report.destination),
+                    }
+                    session.ran(next, skipped);
+                    runs = session.runs();
+                    if report.ai_failed {
+                        session.halt();
+                    }
                 }
-            }
+                Ok(())
+            })();
+            note(record::Event::Ended {
+                runs,
+                why: why.to_string(),
+                error: result.as_ref().err().map(|e| e.message.clone()),
+            });
+            result?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Prompt {

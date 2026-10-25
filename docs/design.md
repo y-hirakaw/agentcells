@@ -182,6 +182,25 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
 - `doctor` は、登録していなければ注意を、plistにあるagentcellsがなければ失敗を出す。macOS以外では確かめない（cronなどで `agentcells tick` を動かす）
 - 試すときは、環境変数 `AGENTCELLS_MODEL`（`haiku` など）で `claude -p` のモデルを変えられる
 
+### 動いたことの記録
+
+tickは、動いたことを `~/.agentcells/logs/events.jsonl` に、1行に1件のJSONで足していく。inspector（concept.md）が、同じcellが続けて動いた、止まった、差し戻しが多い、といったことを数えるための材料にする。`tick.log` は人が読むためのもので、機械で数えにくいため、別に残す。
+
+| event | 書くとき | 中身 |
+| --- | --- | --- |
+| `started` | ロックを取れたとき | agentcellsの版、`--max-minutes` |
+| `tidied` | 閉じたものに残ったラベルを外したとき | リポジトリ、番号、外したラベル、外せなかったときはエラー |
+| `skipped` | 動かす前の確かめで見送ったとき（1回のtickで、同じものは1度だけ） | 仕事、理由 |
+| `ran` | cellを1回動かしたとき | 仕事、始めた時刻、かかった秒、round、AIが選んだ先と実際に進めた先（CLIが人間に回したら違う）、人間に回した理由、IssueからPRに進んだならPRの番号（IssueとPRの記録をつなぐため）、AIの実行が失敗したか、指定したモデルと実際に使ったモデル（claudeの結果の `modelUsage`）、claudeが返したやり取りの回数と費用の目安 |
+| `failed` | cellを動かしている途中で、エラーで止まったとき | 仕事、始めた時刻、かかった秒、エラー |
+| `ended` | tickが終わったとき | 動かした件数（`ran` の件数。`failed` は含まない）、終わった理由（`no_work`、`limit`、`ai_failed`、`stuck`、`error`）、`error` と `stuck` ならその中身 |
+
+- どの行にも、書いた時刻（UNIXの秒）と、どのtickか（始めた時刻とpid）を書く。仕事は、product、cell、Issueか PRか、リポジトリ、番号と、返事で動いたなら待っていたラベル
+- `started` のあとは、エラーで終わっても `ended` を書く。`ended` がなければ、tickが殺された（ログアウト、Ctrl-Cなど）か、panicした
+- 手元だけに置く（権限は600）。リポジトリの名前と番号は書くが、Issue/PRのタイトルや本文、AIの出力は書かない。ただし、理由とエラー（`reason`、`error`）は自由な文で、リポジトリの中のパス、ほかの人のログイン、ghやgitのエラーが入りうる。公開の場所に出すときは、inspectorが伏せ字にし、自由な文はそのまま出さない（予定）
+- 5MBを超えたら、tickの最初に `events.jsonl.1` に回す（前の `.1` は消える）。書けなくても、tickは止めない
+- `--dry-run` のときは書かない
+
 ### 1件を動かす流れ
 
 `src/run.rs`。
