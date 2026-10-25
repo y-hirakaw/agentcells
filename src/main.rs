@@ -16,6 +16,7 @@ use agentcells::probe::SystemProbe;
 use agentcells::prompt;
 use agentcells::run;
 use agentcells::setup;
+use agentcells::status;
 use agentcells::tick;
 
 #[derive(Parser)]
@@ -52,6 +53,8 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// agentcellsが扱っているIssueごとに、今どこまで進んでいるかを出す（読むだけ）
+    Status,
     /// cellとして動くAIが使うコマンド（agentcellsがAIを起動したときだけ使える）
     Cell {
         #[command(subcommand)]
@@ -188,6 +191,50 @@ fn run(command: Commands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Cell { command } => run_cell(command),
+        Commands::Status => {
+            let config = Config::load(&home.config_path())?;
+            let credentials_for =
+                |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let actors = guard::Actors {
+                operator: config.operator.clone().unwrap_or_default(),
+                writer: prompt::writer_login(&config, &SystemProbe)?,
+            };
+            if config.products.is_empty() {
+                println!("productがないので、扱っているIssueはありません");
+            }
+            let mut failed = false;
+            for (i, product) in config.products.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                println!("{}", product.name);
+                let report =
+                    status::product(&config, product, &SystemProbe, &credentials_for, &actors);
+                for error in &report.errors {
+                    println!("  エラー: {error}");
+                }
+                failed |= !report.errors.is_empty();
+                for note in &report.notes {
+                    println!("  注意: {note}");
+                }
+                if report.lines.is_empty() {
+                    println!("  扱っているIssue/PRはありません");
+                }
+                for line in &report.lines {
+                    println!("  {}", line.describe(now));
+                }
+            }
+            // スクリプトから呼んだときに、読めなかったことに気づけるように
+            Ok(if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
         Commands::Tick { dry_run } => {
             let Some(_lock) = tick::lock(&home)? else {
                 println!("ほかのtickが動いているので、何もしません");

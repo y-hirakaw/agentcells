@@ -673,7 +673,7 @@ next = ["done"]
         // リポジトリごとのトークンで、空のghの設定を使って読む
         for (call, env) in probe.calls.borrow().iter().zip(probe.envs.borrow().iter()) {
             // 一覧は --repo、履歴は /repos/ のパス、編集の履歴はGraphQLの name でリポジトリを渡す
-            let rest = ["--repo octo/", "/repos/octo/", "-F name="]
+            let rest = ["--repo octo/", "/repos/octo/", "-f name="]
                 .iter()
                 .find_map(|key| call.split(key).nth(1))
                 .unwrap();

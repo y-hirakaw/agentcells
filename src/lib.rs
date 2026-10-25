@@ -17,5 +17,6 @@ pub mod review;
 pub mod run;
 pub mod settings;
 pub mod setup;
+pub mod status;
 pub mod tick;
 pub mod transition;

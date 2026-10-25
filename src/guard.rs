@@ -61,16 +61,26 @@ impl Actors {
         let Some(user) = user else {
             return false;
         };
-        self.is_writer(&user.login)
-            || user.typename.as_deref() == Some("Bot")
+        self.is_writer_graphql(&user.login, user.typename.as_deref())
+    }
+
+    /// GraphQLのログインと `__typename` から、書き込みのアカウントかを見る（[`Self::is_writer_user`]）。
+    pub(crate) fn is_writer_graphql(&self, login: &str, typename: Option<&str>) -> bool {
+        self.is_writer(login)
+            || typename == Some("Bot")
                 && self
                     .writer
                     .strip_suffix("[bot]")
-                    .is_some_and(|slug| user.login.eq_ignore_ascii_case(slug))
+                    .is_some_and(|slug| login.eq_ignore_ascii_case(slug))
     }
 
     fn is_trusted(&self, login: &str) -> bool {
         self.is_operator(login) || self.is_writer(login)
+    }
+
+    /// GraphQLのログインと `__typename` から、信頼できるか（[`Self::is_trusted`]）を見る。
+    pub(crate) fn is_trusted_graphql(&self, login: &str, typename: Option<&str>) -> bool {
+        self.is_operator(login) || self.is_writer_graphql(login, typename)
     }
 }
 
@@ -494,9 +504,10 @@ fn fetch_edits(
         "graphql",
         "-f",
         query.as_str(),
-        "-F",
+        // -F は数字だけの名前を数に変えるので、名前は -f で渡す
+        "-f",
         owner.as_str(),
-        "-F",
+        "-f",
         name.as_str(),
         "-F",
         number_arg.as_str(),
@@ -543,7 +554,7 @@ pub(crate) mod fake {
         );
         probe.with(
             &format!(
-                "gh api graphql -f query={EDITS_QUERY} -F owner={owner} -F name={name} -F number={number}"
+                "gh api graphql -f query={EDITS_QUERY} -f owner={owner} -f name={name} -F number={number}"
             ),
             true,
             &format!(r#"{{"data":{{"repository":{{"issueOrPullRequest":{edits}}}}}}}"#),

@@ -55,6 +55,7 @@ agentcells doctor
 | `agentcells labels sync [--dry-run]` | 設定ファイルのproductとcellに必要な `ac:` ラベルのうち、足りないものをGitHubに作る |
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
 | `agentcells tick [--dry-run]` | 仕事（あなたが選んだ、cellのラベルが付いたIssue/PRと、人間を待っていたところにあなたが返事をしたもの）を探して、1件をcellで動かす。`--dry-run` なら表示だけ。implementはコミットを確かめてpushし、PRを作る。reviewはPRにレビューを投稿する |
+| `agentcells status` | 扱っているIssueごとに、今どこまで進んでいるか（作業中、返事待ち、検品待ち、順番待ち）と、いつからかを出す。PRができたIssueは、PRの状態を出す（読むだけ） |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |
 
 設定ファイル `~/.agentcells/config.toml` には、cellを使うあなたのGitHubのログイン（`operator`）と、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [docs/design.md](docs/design.md) と、雛形のコメントを見てください。動くのは、あなたがAssigneesに自分を入れ、cellのラベルを付けたIssue/PRだけです（ほかの人がラベルやAssigneesを変えても、勝手に始まりません）。AIが質問して止まったもの（`ac:needs-human`）や、検品を待つPR（`ac:in-review`）には、人に返事をするのと同じようにコメントすれば、続きが動きます（ほかの人のコメントでは動きません。あなたのコメントは、どれも返事として扱います）。標準のcell（triage、implement、review）は、プロンプトを書かなくても [prompts/](prompts/) の標準のプロンプトで動きます。`prompt` にファイルを書くと、追加の指示として足されます。
