@@ -95,7 +95,6 @@ pub fn sync(
     Ok(result)
 }
 
-/// GitHubのラベル名は大文字と小文字を区別しないので、小文字にそろえて返す。
 /// 足りないラベルがあるリポジトリと、そのラベル。`doctor` と `tick` が知らせるのに使う（作りはしない）。
 pub fn missing(config: &Config, probe: &dyn Probe) -> Result<Vec<(RepoName, Vec<Label>)>> {
     Ok(sync(config, probe, true)?
@@ -116,6 +115,7 @@ pub fn describe_missing(missing: &[(RepoName, Vec<Label>)]) -> String {
         .join("\n")
 }
 
+/// GitHubのラベル名は大文字と小文字を区別しないので、小文字にそろえて返す。
 fn existing_labels(repo: &RepoName, probe: &dyn Probe) -> Result<HashSet<String>> {
     let repo_arg = repo.to_string();
     let args = [

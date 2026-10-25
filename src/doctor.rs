@@ -68,9 +68,12 @@ pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Chec
     checks.push(check_home(home));
     checks.push(check_path(home, path_env));
     let (config_check, config) = check_config(home);
+    // 設定が正しくないと、書き間違えたcellのラベルが抜けて「そろっています」と出ることがあるので、確かめない
+    let config_ok = config_check.status != Status::Fail;
     checks.push(config_check);
     checks.push(check_github(config.as_ref(), probe));
     if let Some(config) = &config
+        && config_ok
         && !config.products.is_empty()
     {
         checks.push(check_labels(config, probe));

@@ -43,7 +43,10 @@ cd agentcells
 ```sh
 git pull
 ./install.sh
+agentcells doctor
 ```
+
+新しく要る設定やラベルがあれば、`agentcells doctor` が直し方を出します。
 
 | コマンド | 何をするか |
 | --- | --- |
