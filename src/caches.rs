@@ -5,8 +5,9 @@
 //! agentcellsが持つキャッシュは、sandboxの中のビルドしか使わない。
 //!
 //! キャッシュは同じproductの仕事で共有するので、ある仕事のビルドが置いたものが、あとの仕事のビルドで動きうる。
-//! コードを動かせる設定（Gradleの `init.d` など）は、コマンドを動かす前に毎回消す。キャッシュの中身
-//! （Gradle本体やjar）の差し替えは残るので、ビルドの側で検証する（`distributionSha256Sum` など）。
+//! コードを動かせる設定（Gradleの `init.d` など）と、検証されずに使われる展開済みのもの（cargoの `registry/src`、
+//! Goのビルドのキャッシュなど）は、コマンドを動かす前に毎回消す。ダウンロードしたもののハッシュは、
+//! ダウンロードのときにしか確かめられないので、残るもの（Gradle本体、jar、wheelなど）の差し替えは防げない。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,8 +20,10 @@ pub struct Cache {
     pub name: &'static str,
     /// 使う人のキャッシュの場所（ホームからの相対パス）。止められた場所がここなら、このキャッシュを勧める
     places: &'static [&'static str],
-    /// キャッシュの中の、コードを動かせる設定。コマンドを動かす前に消す
+    /// キャッシュの中の、コードを動かせる設定や、検証されずに使われるもの。コマンドを動かす前に消す
     code: &'static [&'static str],
+    /// 消したあとに置き直すファイル（キャッシュからの相対パスと中身）
+    files: &'static [(&'static str, &'static str)],
 }
 
 pub const CACHES: &[Cache] = &[
@@ -32,22 +35,29 @@ pub const CACHES: &[Cache] = &[
             "init.gradle",
             "init.gradle.kts",
             "gradle.properties",
+            // 前の仕事のデーモンは、消したあとの設定でも動き続け、次のビルドを引き受ける
+            "daemon",
         ],
+        files: &[],
     },
     Cache {
         name: "npm",
         places: &[".npm"],
-        code: &[],
+        // _cacache は読むたびにintegrityで確かめられるが、npxで入れたものはそのまま動く
+        code: &["_npx"],
+        files: &[],
     },
     Cache {
         name: "yarn",
         places: &["Library/Caches/Yarn", ".yarn", ".cache/yarn"],
         code: &[],
+        files: &[],
     },
     Cache {
         name: "pnpm",
         places: &["Library/pnpm", ".pnpm-store", ".local/share/pnpm"],
         code: &[],
+        files: &[],
     },
     Cache {
         name: "cargo",
@@ -58,22 +68,30 @@ pub const CACHES: &[Cache] = &[
             "credentials",
             "credentials.toml",
             "bin",
+            // 展開済みのソース。cargoは展開したあとは確かめないので、毎回 registry/cache の .crate から展開し直させる
+            "registry/src",
         ],
+        files: &[],
     },
     Cache {
         name: "maven",
         places: &[".m2"],
-        code: &[],
+        code: &["settings.xml"],
+        // 使う人の ~/.m2/settings.xml は読ませないので（ファイルがあって読めないとmavenが止まりうる）、空の設定を使わせる
+        files: &[("settings.xml", "<settings/>\n")],
     },
     Cache {
         name: "pip",
         places: &["Library/Caches/pip", ".cache/pip"],
         code: &[],
+        files: &[],
     },
     Cache {
         name: "go",
         places: &["go/pkg/mod", "Library/Caches/go-build", ".cache/go-build"],
-        code: &[],
+        // コンパイル済みのものは、そのままリンクされる
+        code: &["build"],
+        files: &[],
     },
 ];
 
@@ -85,11 +103,30 @@ pub fn names() -> Vec<&'static str> {
     CACHES.iter().map(|c| c.name).collect()
 }
 
-/// キャッシュ `name` を `dir` に向ける環境変数。`maven_opts` は、もとの `MAVEN_OPTS`。
-pub fn env(name: &str, dir: &Path, maven_opts: Option<&str>) -> Vec<(String, String)> {
+/// キャッシュ `name` を `dir` に向ける環境変数。`current` は、もとの環境変数を返す（足すものに使う）。
+pub fn env(
+    name: &str,
+    dir: &Path,
+    current: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
     let dir_s = dir.display().to_string();
+    let append = |key: &str, value: String| match current(key) {
+        Some(old) if !old.trim().is_empty() => format!("{old} {value}"),
+        _ => value,
+    };
     let pairs: Vec<(&str, String)> = match name {
-        "gradle" => vec![("GRADLE_USER_HOME", dir_s)],
+        // デーモンを残さない。残ると、次の仕事のビルドを、前の仕事の設定のまま引き受ける
+        "gradle" => vec![
+            ("GRADLE_USER_HOME", dir_s),
+            (
+                "GRADLE_OPTS",
+                append(
+                    "GRADLE_OPTS",
+                    "-Dorg.gradle.daemon=false -Dkotlin.compiler.execution.strategy=in-process"
+                        .to_string(),
+                ),
+            ),
+        ],
         "npm" => vec![("npm_config_cache", dir_s)],
         "yarn" => vec![("YARN_CACHE_FOLDER", dir_s)],
         "pnpm" => vec![
@@ -98,14 +135,19 @@ pub fn env(name: &str, dir: &Path, maven_opts: Option<&str>) -> Vec<(String, Str
         ],
         // 使う人の ~/.cargo/config.toml も読まなくなる
         "cargo" => vec![("CARGO_HOME", dir_s)],
-        "maven" => {
-            let local = format!("-Dmaven.repo.local={dir_s}");
-            let opts = match maven_opts {
-                Some(opts) if !opts.trim().is_empty() => format!("{opts} {local}"),
-                _ => local,
-            };
-            vec![("MAVEN_OPTS", opts)]
-        }
+        "maven" => vec![
+            (
+                "MAVEN_OPTS",
+                append("MAVEN_OPTS", format!("-Dmaven.repo.local={dir_s}")),
+            ),
+            (
+                "MAVEN_ARGS",
+                append(
+                    "MAVEN_ARGS",
+                    format!("-s {}", dir.join("settings.xml").display()),
+                ),
+            ),
+        ],
         "pip" => vec![("PIP_CACHE_DIR", dir_s)],
         "go" => vec![
             ("GOMODCACHE", dir.join("mod").display().to_string()),
@@ -160,6 +202,15 @@ pub fn clean(name: &str, dir: &Path) -> Result<()> {
                 .with_hint("人間に回してください（needs-human）")
         })?;
     }
+    for (file, content) in cache.files {
+        let path = dir.join(file);
+        std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&path, content))
+            .map_err(|e| {
+                Error::new(format!("キャッシュの {} を置けません: {e}", path.display()))
+                    .with_hint("人間に回してください（needs-human）")
+            })?;
+    }
     Ok(())
 }
 
@@ -170,20 +221,32 @@ mod tests {
     #[test]
     fn points_tools_at_the_given_dir() {
         let dir = Path::new("/c/app/gradle");
+        let none = |_: &str| None;
+        let gradle = env("gradle", dir, none);
         assert_eq!(
-            env("gradle", dir, None),
-            vec![("GRADLE_USER_HOME".to_string(), "/c/app/gradle".to_string())]
+            gradle[0],
+            ("GRADLE_USER_HOME".to_string(), "/c/app/gradle".to_string())
         );
+        assert!(gradle[1].1.contains("-Dorg.gradle.daemon=false"));
+        let maven = env("maven", Path::new("/c/m2"), |key| {
+            (key == "MAVEN_OPTS").then(|| "-Xmx1g".to_string())
+        });
         assert_eq!(
-            env("maven", Path::new("/c/m2"), Some("-Xmx1g")),
-            vec![(
-                "MAVEN_OPTS".to_string(),
-                "-Xmx1g -Dmaven.repo.local=/c/m2".to_string()
-            )]
+            maven,
+            vec![
+                (
+                    "MAVEN_OPTS".to_string(),
+                    "-Xmx1g -Dmaven.repo.local=/c/m2".to_string()
+                ),
+                (
+                    "MAVEN_ARGS".to_string(),
+                    "-s /c/m2/settings.xml".to_string()
+                ),
+            ]
         );
-        assert_eq!(env("go", Path::new("/c/go"), None).len(), 2);
+        assert_eq!(env("go", Path::new("/c/go"), none).len(), 2);
         for name in names() {
-            assert!(!env(name, dir, None).is_empty(), "{name}");
+            assert!(!env(name, dir, none).is_empty(), "{name}");
         }
     }
 
@@ -210,11 +273,30 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(dir.path().join("gradle"), cargo.join("bin")).unwrap();
         std::fs::write(cargo.join("config.toml"), "[build]\nrustc-wrapper = \"x\"").unwrap();
+        std::fs::create_dir_all(cargo.join("registry/src/index/serde-1.0.0")).unwrap();
+        std::fs::create_dir_all(cargo.join("registry/cache")).unwrap();
         clean("cargo", &cargo).unwrap();
         assert!(!cargo.join("config.toml").exists());
+        // 展開済みのソースは消し、ダウンロードした .crate は残す
+        assert!(!cargo.join("registry/src").exists());
+        assert!(cargo.join("registry/cache").exists());
         assert!(std::fs::symlink_metadata(cargo.join("bin")).is_err());
         // リンク先は消さない
         assert!(gradle.join("caches").exists());
+
+        // 使う人の設定の代わりに、空の設定を置き直す
+        let maven = dir.path().join("maven");
+        std::fs::create_dir_all(&maven).unwrap();
+        std::fs::write(
+            maven.join("settings.xml"),
+            "<settings><mirrors>evil</mirrors></settings>",
+        )
+        .unwrap();
+        clean("maven", &maven).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(maven.join("settings.xml")).unwrap(),
+            "<settings/>\n"
+        );
     }
 
     #[test]

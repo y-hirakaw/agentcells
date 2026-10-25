@@ -263,8 +263,14 @@ write = []                                            # ホームの下で書か
 - ビルドツールのキャッシュは、使う人のもの（`~/.gradle` など）を書かせず、agentcellsが持つ `caches/<product>/<ツール>` を使わせる。`agentcells cell run` が環境変数でツールをそこへ向ける（gradle: `GRADLE_USER_HOME`、npm: `npm_config_cache`、yarn: `YARN_CACHE_FOLDER`、pnpm: `npm_config_store_dir`、cargo: `CARGO_HOME`、maven: `MAVEN_OPTS` の `-Dmaven.repo.local`、pip: `PIP_CACHE_DIR`、go: `GOMODCACHE` と `GOCACHE`）
   - 使う人のキャッシュを書かせると、AIが書き換えたビルドがそこにコードを置け（`~/.gradle/init.d`、`~/.gradle/gradle.properties` の `-javaagent`、`~/.cargo/config.toml` の `rustc-wrapper`、`~/.m2` のjarなど）、あとで使う人がsandboxの外で動かすツールがそれを実行する。そのコードは `~/.agentcells` のAppの秘密鍵も読める。読まれる危険より重いので、勧める形からは外す
   - agentcellsのキャッシュは、sandboxの中のビルドしか使わない。ただし同じproductの仕事で共有するので、ある仕事（メンバーでない人が立てたIssueに仕込まれた指示に従ったビルドなど）が置いたものは、あとのほかの仕事のビルドで動きうる。そこから、その仕事の作業場所（PRに紛れ込ませる）と、読ませたファイル（`read_placed`）に手が届く（残る危険）
-  - そのため、`agentcells cell run` は、コマンドを動かす前に毎回、キャッシュの中のコードを動かせる設定を消す（gradle: `init.d/`、`init.gradle`、`init.gradle.kts`、`gradle.properties`。cargo: `config`、`config.toml`、`credentials`、`credentials.toml`、`bin/`）
-  - キャッシュの中身（Gradle本体、jar、Goのビルドのキャッシュなど）の差し替えは残る。ビルドの側で検証する（Gradleの `distributionSha256Sum` と依存の検証の `verification-metadata.xml`。`Cargo.lock`、`go.sum`、npmの `integrity` は、すでに検証される）。キャッシュを、Issueを書いた人を信頼できるかで分けるか、仕事ごとの写しにするかは、まだ決めていない
+  - そのため、`agentcells cell run` は、コマンドを動かす前に毎回、キャッシュの中のコードを動かせる設定と、検証されずに使われる展開済みのものを消す。CLIはsandboxの外ではこのキャッシュを使わないので、ほかの経路はない
+    - gradle: `init.d/`、`init.gradle`、`init.gradle.kts`、`gradle.properties`、`daemon/`。デーモンは使わせない（`GRADLE_OPTS` で `org.gradle.daemon=false` と、Kotlinのコンパイラをデーモンにしない設定を渡す）。前の仕事のデーモンが残ると、消したあとの設定のまま、次の仕事のビルドを引き受けるため
+    - cargo: `config`、`config.toml`、`credentials`、`credentials.toml`、`bin/`、`registry/src/`（展開済みのソース。cargoは展開したあとは確かめないので、毎回 `registry/cache` の `.crate` から、確かめたうえで展開し直させる）
+    - npm: `_npx/`（npxで入れたものは、そのまま動く。`_cacache` は読むたびにintegrityで確かめられる）
+    - go: `build/`（`GOCACHE`。コンパイル済みのものは、そのままリンクされる）。`GOMODCACHE` は、ビルドの前に `go mod verify` を動かすことを勧める
+    - maven: `settings.xml` を空の設定（`<settings/>`）に置き直し、`MAVEN_ARGS` の `-s` で使わせる（使う人の `~/.m2/settings.xml` は読ませないので、ファイルがあって読めないとmavenが止まりうる。未確認）
+  - ダウンロードしたもののハッシュ（`Cargo.lock`、`go.sum`、Gradleの `verification-metadata.xml` など）は、ダウンロードのときに確かめられるだけで、キャッシュに置かれたあとは確かめられない。そのため、残るもの（Gradleの `caches/` と `wrapper/dists`、mavenのjar、pipのwheel、`GOMODCACHE`）の差し替えは防げない（残る危険）。キャッシュを、Issueを書いた人を信頼できるかで分けるか、仕事ごとの写しにするかは、まだ決めていない（concept.md）
+  - 前の仕事が残したプロセスが、消したあとに書き戻すこともできる。仕事が終わったら、`claude -p` のプロセスグループを終わらせる（予定。「GitHubへの書き込み」を参照）。ただし、自分を切り離すデーモンは、プロセスグループからは外れる
   - `tick` は、今の仕事のファイルとsandboxで書ける場所の両方を、同じ関数（`caches::dirs`）から作る
   - 初めは空なので、取得元のホストを `network` に書く必要がある
 - `write` は、ほかに道がないときのための上級の設定。`doctor` は、書いたものすべてに警告を出す。ホーム、`~/.config`、`~/Library`、`~/.local`、`~/Documents` のような広い場所は書けない。シェルの設定（`~/.zshrc`、`~/.zlogin` など）、`~/.claude`、`~/.gitconfig`、`~/.local/bin`、`~/bin`、`~/Library/LaunchAgents` は、書かせない（`denyWrite`）。これらの中や、agentcellsの置き場所を含む場所は、`write` に書くと断る

@@ -645,10 +645,9 @@ fn run_command(
         .env("TMPDIR", &context.tmp)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let maven_opts = std::env::var("MAVEN_OPTS").ok();
     for (name, dir) in &context.caches {
         crate::caches::clean(name, dir)?;
-        cmd.envs(crate::caches::env(name, dir, maven_opts.as_deref()));
+        cmd.envs(crate::caches::env(name, dir, |key| std::env::var(key).ok()));
     }
     let mut child = cmd
         .spawn()
