@@ -42,7 +42,12 @@ impl Purpose {
     /// Appに付けた権限のうち、この使い道に要るもの（Workflowsなどは付けない）。
     pub fn permissions(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Purpose::Read => &[("issues", "read"), ("pull_requests", "read")],
+            // 作業の場所を作るために、リポジトリの中身も読む（cloneとfetch）
+            Purpose::Read => &[
+                ("contents", "read"),
+                ("issues", "read"),
+                ("pull_requests", "read"),
+            ],
             Purpose::Labels => &[("issues", "write")],
             Purpose::Work => &[
                 ("contents", "write"),

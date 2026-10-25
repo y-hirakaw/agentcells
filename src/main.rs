@@ -14,6 +14,7 @@ use agentcells::home::{Home, RepoName};
 use agentcells::labels;
 use agentcells::probe::SystemProbe;
 use agentcells::prompt;
+use agentcells::run;
 use agentcells::setup;
 use agentcells::tick;
 
@@ -219,16 +220,58 @@ fn run(command: Commands) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             println!("仕事: {}件", work.len());
+            // 1回のtickでは1件だけ動かす。今は動かせない種類の仕事は飛ばす
+            let mut next = None;
             for w in &work {
-                println!("  {}", w.describe());
+                let note = config
+                    .cell(&w.cell)
+                    .and_then(|cell| run::unsupported(w, cell));
+                match note {
+                    Some(note) => println!("  {}（{note}）", w.describe()),
+                    None => {
+                        println!("  {}", w.describe());
+                        next = next.or(Some(w));
+                    }
+                }
             }
-            println!("\n次に動かすもの: {}", work[0].describe());
-            if !dry_run {
-                return Err(
-                    Error::new("cellを動かす部分は、まだ作っていません").with_hint(
-                        "今は `agentcells tick --dry-run` で、見つかる仕事を確かめられます",
-                    ),
-                );
+            let Some(next) = next else {
+                println!("\n今動かせる仕事はありません");
+                return Ok(ExitCode::SUCCESS);
+            };
+            println!("\n次に動かすもの: {}", next.describe());
+            if dry_run {
+                return Ok(ExitCode::SUCCESS);
+            }
+            let agentcells = std::env::current_exe()
+                .map_err(|e| Error::new(format!("agentcellsの場所がわかりません: {e}")))?;
+            let scanner = find_program("betterleaks").ok_or_else(|| {
+                Error::new("betterleaksが見つかりません")
+                    .with_hint("`agentcells doctor` で確かめてください")
+            })?;
+            let claude = find_program("claude").ok_or_else(|| {
+                Error::new("claudeが見つかりません")
+                    .with_hint("`agentcells doctor` で確かめてください")
+            })?;
+            // 試すときに、安いモデルで動かせるようにする
+            let model = std::env::var("AGENTCELLS_MODEL").ok();
+            let runner = run::Runner {
+                home: &home,
+                config: &config,
+                probe: &SystemProbe,
+                actors: &actors,
+                claude: &claude,
+                agentcells: &agentcells,
+                scanner: &scanner,
+                model: model.as_deref(),
+            };
+            println!("動かしています...");
+            let report = runner.run(next)?;
+            match &report.reason {
+                Some(reason) if report.destination == "skipped" => {
+                    println!("見送りました: {reason}")
+                }
+                Some(reason) => println!("{} に進めました（{reason}）", report.destination),
+                None => println!("{} に進めました", report.destination),
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -298,4 +341,13 @@ fn print_doctor(home: &Home) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// PATHから、プログラムの絶対パスを探す。AIに別のものを動かされないよう、sandboxの外で決めておく。
+fn find_program(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+        .and_then(|p| p.canonicalize().ok())
 }

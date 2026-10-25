@@ -14,6 +14,7 @@ pub mod pr;
 pub mod probe;
 pub mod prompt;
 pub mod review;
+pub mod run;
 pub mod settings;
 pub mod setup;
 pub mod tick;

@@ -442,8 +442,35 @@ fn scan_secrets(context: &Context) -> Result<()> {
         return Ok(());
     }
     let input: String = lines.iter().map(|l| format!("{}\n", l.text)).collect();
+    let hint = "コミットできません。人間に回してください（needs-human）";
+    let found = scan_text(&context.scanner, &input).map_err(|e| e.with_hint(hint))?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = found
+        .iter()
+        .map(|(line, rule)| match lines.get(line.wrapping_sub(1)) {
+            Some(l) => format!("  - {}:{}（{rule}）", l.path, l.line),
+            None => format!("  - 場所不明（{rule}）"),
+        })
+        .collect();
+    Err(Error::new(format!(
+        "コミットに秘密らしいものが入っているので、コミットしませんでした:\n{}",
+        list.join("\n")
+    ))
+    .with_hint(
+        "秘密を消してから、もう一度コミットしてください。秘密でないなら、人間に回してください（needs-human）",
+    ))
+}
 
-    let mut command = Command::new(&context.scanner);
+/// 文章を、betterleaksの既定の決まりだけで調べる。見つかったものの行（1から）と種類を返す。
+/// コミットに足す行のほか、AIが書いてGitHubに投稿する文章にも使う。
+///
+/// betterleaksは、調べる場所の設定や無視のファイル、行の `betterleaks:allow` で見逃すものを決められる。
+/// どれもAIが書けるので、AIが書けない `/` で動かし、設定を選ぶ環境変数を消し、allowのコメントを無視させる。
+/// 動かないときや、結果が読めないときはエラーにする（調べられなかったものを通さない）。
+pub fn scan_text(scanner: &Path, text: &str) -> Result<Vec<(usize, String)>> {
+    let mut command = Command::new(scanner);
     command
         .args([
             "stdin",
@@ -473,12 +500,12 @@ fn scan_secrets(context: &Context) -> Result<()> {
     let unavailable = |e: std::io::Error| {
         Error::new(format!(
             "秘密を探すbetterleaks（{}）を動かせません: {e}",
-            context.scanner.display()
+            scanner.display()
         ))
-        .with_hint("コミットできません。人間に回してください（needs-human）")
     };
     let mut child = command.spawn().map_err(unavailable)?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
+    let input = text.to_string();
     // 書き終わる前に読み始めないと、出力が多いときに互いを待って止まる
     let writer = std::thread::spawn(move || {
         use std::io::Write;
@@ -488,32 +515,16 @@ fn scan_secrets(context: &Context) -> Result<()> {
     // betterleaksが入力を読み切らずに終わることがあるので、書けなかったことは問わない
     let _ = writer.join();
     match out.status.code() {
-        Some(0) => Ok(()),
+        Some(0) => Ok(Vec::new()),
         Some(1) => {
-            let findings: Vec<Finding> = serde_json::from_slice(&out.stdout).map_err(|e| {
-                Error::new(format!("betterleaksの結果を読めません: {e}"))
-                    .with_hint("コミットできません。人間に回してください（needs-human）")
-            })?;
-            let list: Vec<String> = findings
-                .iter()
-                .map(|f| match lines.get(f.line.wrapping_sub(1)) {
-                    Some(l) => format!("  - {}:{}（{}）", l.path, l.line, f.rule),
-                    None => format!("  - 場所不明（{}）", f.rule),
-                })
-                .collect();
-            Err(Error::new(format!(
-                "コミットに秘密らしいものが入っているので、コミットしませんでした:\n{}",
-                list.join("\n")
-            ))
-            .with_hint(
-                "秘密を消してから、もう一度コミットしてください。秘密でないなら、人間に回してください（needs-human）",
-            ))
+            let findings: Vec<Finding> = serde_json::from_slice(&out.stdout)
+                .map_err(|e| Error::new(format!("betterleaksの結果を読めません: {e}")))?;
+            Ok(findings.into_iter().map(|f| (f.line, f.rule)).collect())
         }
         _ => Err(Error::new(format!(
             "betterleaksが失敗しました: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        ))
-        .with_hint("コミットできません。人間に回してください（needs-human）")),
+        ))),
     }
 }
 
