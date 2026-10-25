@@ -743,6 +743,18 @@ impl Runner<'_> {
 
         // コミットを確かめてpushし、IssueからならPRを作る（レビューのcellと、着手を確かめるcellはpushしない）
         let mut pr_number: Option<u64> = None;
+        let mut kept_branch: Option<(String, Option<u64>)> = None;
+        // CLIが人間に回すとき（時間切れ、ラベルの変化など）は、pushしない。それでも、AIの作業が作業場所ごと
+        // 消えないように、コミットがあれば手元に残す
+        if overridden.is_some()
+            && !cell.review
+            && !cell.confirms()
+            && let Some(branch) = &ready.branch
+            && let Some(note) = self.keep_unpushed(place, branch)
+            && let Some(reason) = &mut overridden
+        {
+            reason.push_str(&format!("\n\n{note}"));
+        }
         if overridden.is_none()
             && !cell.review
             && !cell.confirms()
@@ -758,13 +770,14 @@ impl Runner<'_> {
                         && outcome.next != transition::STOP
                     {
                         overridden = Some(format!(
-                            "新しいコミットがないので「{}」には進めません",
+                            "新しいコミットがないので「{}」には進めません（同じものを何度もレビューしないため）。直すことがなかったのなら、ここにそう書くか、ラベルを付け替えてください。直してほしいことがあれば、コメントで頼むと、また動きます",
                             outcome.next
                         ));
                     }
                 }
                 Pushed::Refused(reason) => overridden = Some(reason),
                 Pushed::Done(number) => pr_number = number,
+                Pushed::Branch(name, open) => kept_branch = Some((name, open)),
             }
         }
 
@@ -795,6 +808,15 @@ impl Runner<'_> {
             && work.item == Target::Issue
         {
             text.push_str(&format!("\n\nPR: #{number}"));
+        }
+        match &kept_branch {
+            Some((name, Some(number))) => text.push_str(&format!(
+                "\n\nここまでの作業は、ブランチ `{name}`（PR #{number}）にpushしました。次に動くときは、そこから続けます"
+            )),
+            Some((name, None)) => text.push_str(&format!(
+                "\n\nここまでの作業は、ブランチ `{name}` にpushしました（PRはまだ作っていません）。次に動くときは、そこから続けます"
+            )),
+            None => {}
         }
         if let Some(reason) = &reason {
             if !text.is_empty() {
@@ -891,6 +913,41 @@ impl Runner<'_> {
         })
     }
 
+    /// pushしなかったAIの作業（コミット）を、手元に残し、取り出し方を返す。実行の記録の場所は、同じIssue/PRの
+    /// 次の実行で空になるので、別の場所（`kept/`）に、時刻を付けて残す。
+    fn keep_work(&self, place: &Place, staging: &Path, branch: &Branch) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let kept = self.home.root().join("kept");
+        prune_kept(&kept, now);
+        let name = format!("{}/{now}.bundle", place.relative.display());
+        match keep_bundle(self.probe, staging, branch, &kept, &kept.join(&name)) {
+            Ok(()) => format!(
+                "AIの作業（コミット）は、agentcellsを動かしている人の手元の ~/.agentcells/kept/{name} に残しました（{KEPT_DAYS}日で消します）。作業するリポジトリで `git fetch ~/.agentcells/kept/{name} {}:ai-work` を実行すると、ブランチ ai-work として取り出せます",
+                branch.name
+            ),
+            Err(e) => format!(
+                "AIの作業（コミット）を手元に残せませんでした: {}",
+                e.message
+            ),
+        }
+    }
+
+    /// pushしないで終わるとき、AIが足したコミットがあれば手元に残し、取り出し方を返す。なければ `None`。
+    fn keep_unpushed(&self, place: &Place, branch: &Branch) -> Option<String> {
+        let staging = crate::pr::stage(self.probe, &place.worktree, &branch.name).ok()?;
+        let staging_path = path_str(staging.path()).ok()?;
+        let range = format!("{}..refs/heads/{}", branch.start, branch.name);
+        let count = git_out(
+            self.probe,
+            &["-C", &staging_path, "rev-list", "--count", &range],
+        )
+        .ok()?;
+        (count.trim() != "0").then(|| self.keep_work(place, staging.path(), branch))
+    }
+
     /// AIが足したコミットを確かめてpushする。IssueからでPRに進むなら、PRを作る（あれば、それを使う）。
     /// 確かめもpushも、CLIがその場で作ったbareリポジトリから行う（AIが書き換えられる .git/config を読まない）。
     #[allow(clippy::too_many_arguments)]
@@ -938,10 +995,19 @@ impl Runner<'_> {
                 .config
                 .cell(&outcome.next)
                 .is_some_and(|next| !next.on.contains(&Target::Issue));
-        if work.item == Target::Issue && !wants_pr {
+        // PRを作るcell（implementなど。PRを扱うcellに進めるもの）が、途中で人間に回すときは、PRは作らずに
+        // ブランチだけをpushする。pushしないと、作業場所ごと消えて、次の実行が最初からやり直しになるため
+        let keeps_branch = work.item == Target::Issue
+            && outcome.next == transition::NEEDS_HUMAN
+            && cell.next.iter().any(|n| {
+                self.config
+                    .cell(n)
+                    .is_some_and(|next| !next.on.contains(&Target::Issue))
+            });
+        if work.item == Target::Issue && !wants_pr && !keeps_branch {
             return Ok(Pushed::Nothing);
         }
-        if let Some(reason) = crate::pr::verify(
+        if let Some(refusal) = crate::pr::verify(
             self.probe,
             staging.path(),
             &branch.start,
@@ -949,11 +1015,29 @@ impl Runner<'_> {
             &ready.placed_blobs,
             self.scanner,
         )? {
-            return Ok(Pushed::Refused(format!("pushしませんでした: {reason}")));
+            // pushしない作業も、人が読んだり取り出したりできるように、手元に残す（作業場所は消えるため）
+            let text = format!(
+                "pushしませんでした: {}\n\n次にすること: {}\n\n{}",
+                refusal.reason,
+                refusal.next,
+                self.keep_work(place, staging.path(), branch)
+            );
+            return Ok(Pushed::Refused(text));
         }
         crate::pr::push_staged(self.probe, write, staging.path(), &work.repo, &branch.name)?;
         if work.item == Target::PullRequest {
             return Ok(Pushed::Done(None));
+        }
+        if keeps_branch {
+            // 同じブランチのPRが開いていれば（人がPRのあるIssueに付け直したときなど）、そのPRに足したことになる
+            let open = crate::pr::find_open(
+                self.probe,
+                write,
+                &work.repo,
+                &branch.name,
+                &self.actors.writer,
+            )?;
+            return Ok(Pushed::Branch(branch.name.clone(), open));
         }
         let number = match crate::pr::find_open(
             self.probe,
@@ -1099,6 +1183,9 @@ enum Pushed {
     Refused(String),
     /// pushした。IssueからならPRの番号
     Done(Option<u64>),
+    /// 人間に回すので、PRは作らずに、ブランチだけをpushした（次の実行は、そこから続ける）。
+    /// そのブランチのPRが開いていれば、その番号
+    Branch(String, Option<u64>),
 }
 
 impl Ready {
@@ -1717,6 +1804,80 @@ impl Reader<'_> {
 /// claudeの出力（`stream-json`）を書くファイル。
 const CLAUDE_LOG: &str = "claude.jsonl";
 
+/// 残したAIの作業のうち、古いもの（`KEPT_DAYS` より前に作ったもの）を消す。
+fn prune_kept(kept: &Path, now: u64) {
+    let limit = KEPT_DAYS * 24 * 3600;
+    let Ok(owners) = std::fs::read_dir(kept) else {
+        return;
+    };
+    // kept/<owner>/<repo>/<番号>/<時刻>.bundle
+    let dirs = |dir: std::path::PathBuf| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|e| e.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    for owner in owners.flatten().map(|e| e.path()) {
+        for repo in dirs(owner.clone()) {
+            for number in dirs(repo.clone()) {
+                for bundle in dirs(number.clone()) {
+                    let at = bundle
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    if at.is_some_and(|at| at + limit < now) {
+                        let _ = std::fs::remove_file(bundle);
+                    }
+                }
+                // 空になった場所も消す（空でなければ消えない）
+                let _ = std::fs::remove_dir(&number);
+            }
+            let _ = std::fs::remove_dir(&repo);
+        }
+        let _ = std::fs::remove_dir(&owner);
+    }
+}
+
+/// 残したAIの作業を消すまでの日数。
+const KEPT_DAYS: u64 = 30;
+
+/// AIが足したコミット（動かす前のブランチの先から）を、gitのbundleとして `path`（`kept` の下）に残す。
+/// 秘密らしいもので断った作業も入るので、`kept` から下はほかのユーザーに読ませない。
+fn keep_bundle(
+    probe: &dyn Probe,
+    staging: &Path,
+    branch: &Branch,
+    kept: &Path,
+    path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let private = |dir: &Path| {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+            .map_err(|e| Error::new(format!("{} を作れません: {e}", dir.display())))
+    };
+    private(kept)?;
+    if let Some(dir) = path.parent() {
+        private(dir)?;
+    }
+    let staging = path_str(staging)?;
+    let out = path_str(path)?;
+    let head = format!("refs/heads/{}", branch.name);
+    let start = format!("^{}", branch.start);
+    git(
+        probe,
+        &[
+            "-C", &staging, "bundle", "create", "-q", &out, &head, &start,
+        ],
+        ISOLATED_GIT_ENV,
+    )?;
+    // AIが読んだファイルの中身も入りうるので、ほかのユーザーに読ませない
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::new(format!("{} の権限を変えられません: {e}", path.display())))
+}
+
 /// Issue/PRごとの、実行の記録の場所（`runs/<owner>/<repo>/<番号>`）。
 fn run_dir(home: &Home, repo: &RepoName, number: u64) -> PathBuf {
     home.root()
@@ -2314,6 +2475,70 @@ mod tests {
                 .any(|c| c.contains("--add-label ac:needs-human")),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn refused_work_can_be_fetched_from_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        let start = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-q", "-b", "ac/x"]);
+        std::fs::write(repo.join("b.txt"), "b").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "ai work"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        let branch = Branch {
+            name: "ac/x".into(),
+            base: "main".into(),
+            start: start.clone(),
+        };
+        let kept = dir.path().join("kept");
+        let bundle = kept.join("octo/app/3/100.bundle");
+        keep_bundle(&crate::probe::SystemProbe, &repo, &branch, &kept, &bundle).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&bundle), 0o600);
+        assert_eq!(mode(&kept), 0o700);
+        assert_eq!(mode(&kept.join("octo/app/3")), 0o700);
+        // 人の手元のclone（AIの作業はない）に、書いたとおりのコマンドで取り出せる
+        let human = dir.path().join("human");
+        let repo_arg = repo.to_str().unwrap();
+        git(
+            dir.path(),
+            &["clone", "-q", "-b", "main", repo_arg, "human"],
+        );
+        git(
+            &human,
+            &["fetch", "-q", bundle.to_str().unwrap(), "ac/x:ai-work"],
+        );
+        assert_eq!(git(&human, &["rev-parse", "ai-work"]), head);
+
+        // 古いものは消す
+        prune_kept(&kept, 100 + KEPT_DAYS * 24 * 3600 - 1);
+        assert!(bundle.exists());
+        prune_kept(&kept, 100 + KEPT_DAYS * 24 * 3600 + 1);
+        assert!(!bundle.exists());
+        assert!(!kept.join("octo").exists());
+        assert!(kept.exists());
     }
 
     #[test]

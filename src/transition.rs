@@ -212,7 +212,7 @@ fn plan_labels(
     let choices = choices(cell, finished.waiting, finished.asked);
     if !choices.iter().any(|c| c == requested) {
         return to_human(Some(format!(
-            "cell「{}」から「{requested}」には進めません（選べる先: {}）",
+            "cell「{}」から「{requested}」には進めません（選べる先: {}）。続けるなら、進める先のcellのラベルを付けるか、ここにコメントで指示してください",
             cell.name,
             choices.join(", ")
         )));
@@ -252,7 +252,7 @@ fn plan_labels(
                 Some(next) if product.cells.iter().any(|c| c == name) => next,
                 _ => {
                     return to_human(Some(format!(
-                        "「{name}」はproduct「{}」で動いていません",
+                        "「{name}」はproduct「{}」で動いていません。agentcellsを動かしている人が、config.toml の cells を確かめてください",
                         product.name
                     )));
                 }
@@ -260,7 +260,7 @@ fn plan_labels(
             let done_runs = runs(name);
             if done_runs >= next.max_rounds {
                 return to_human(Some(format!(
-                    "「{name}」はすでに{done_runs}回動いていて、上限（{}回）に達しました",
+                    "「{name}」はすでに{done_runs}回動いていて、上限（{}回）に達しました。AIどうしの往復が続いているので、内容を確かめてください。方針をコメントすると、また上限まで動きます",
                     next.max_rounds
                 )));
             }
@@ -277,13 +277,13 @@ fn plan_labels(
             } else if finished.item == Target::Issue && next.on.contains(&Target::PullRequest) {
                 if !finished.created_pr {
                     return to_human(Some(format!(
-                        "PRが作られていないので「{name}」に進めません"
+                        "PRが作られていないので「{name}」に進めません。AIがコミットを作らなかったか、作れなかったようです。ここにコメントで続きを頼むと、また動きます"
                     )));
                 }
                 plan.add_to_created_pr.push(next.label.clone());
             } else {
                 return to_human(Some(format!(
-                    "「{name}」は{}を扱えません",
+                    "「{name}」は{}を扱えません。agentcellsを動かしている人が、config.toml の cell の on と next を確かめてください",
                     finished.item.as_str()
                 )));
             }
@@ -317,7 +317,7 @@ pub fn tampered(before: &[String], after: &[String]) -> Option<String> {
         parts.push(format!("外れた: {}", removed.join(", ")));
     }
     Some(format!(
-        "実行中に ac: のラベルが変わりました（{}）",
+        "実行中に ac: のラベルが変わりました（{}）。人が付け替えたのでなければ、AIが変えた可能性があります。確かめてから、動かしたいcellのラベルを付け直してください",
         parts.join("、")
     ))
 }

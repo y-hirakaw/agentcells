@@ -144,6 +144,24 @@ pub const AUTORUN_PATHS: &[&str] = &[
 /// 下のディレクトリにあっても効くもの。パスのどこかの部分がこの名前なら断る。
 const AUTORUN_NAMES: &[&str] = &[".envrc", ".gitattributes", ".claude", ".mcp.json"];
 
+/// pushしない理由と、人が次にすること。人間に回すコメントに書く（何が起きて、どこを見て、何をすれば
+/// 続きが動くかが分からないと、人が止まってしまうため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub reason: String,
+    pub next: &'static str,
+}
+
+impl Refusal {
+    fn new(reason: String, next: &'static str) -> Self {
+        Refusal { reason, next }
+    }
+}
+
+const NEXT_MERGE: &str = "ベースのブランチとぶつかっていると、AIはmainなどを取り込むマージで解消しようとします。agentcellsはマージコミットをpushしないので、ぶつかりを手で解消してPRのブランチ（PRがまだなければ ac/ で始まるブランチ）にpushしてから、ここにコメントしてください。AIの解消のしかたは、下の作業から読めます";
+const NEXT_GUARDED: &str = "この変更が本当に要るなら、人が中身を確かめて、手で入れてください。要らないなら、それを入れずに進めるよう、ここにコメントで頼んでください";
+const NEXT_SECRET: &str = "秘密が入らないように直すよう、ここにコメントで頼んでください。秘密ではない（見誤り）なら、agentcellsを動かしている人が中身を確かめてから、手で入れてください";
+
 /// pushする前に、ブランチに足したコミット（`base` から `branch` まで）をすべて確かめる。
 /// AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る。
 /// 問題があれば、その理由（秘密そのものは書かない）。
@@ -158,7 +176,7 @@ pub fn verify(
     branch: &str,
     placed_blobs: &[String],
     scanner: &Path,
-) -> Result<Option<String>> {
+) -> Result<Option<Refusal>> {
     let staging_path = path_str(staging)?;
     let range = format!("{base}..refs/heads/{branch}");
     let objects = git_out(
@@ -172,9 +190,12 @@ pub fn verify(
             continue;
         };
         if placed_blobs.iter().any(|b| b == sha) {
-            return Ok(Some(format!(
-                "置いた秘密のファイルと同じ中身のファイル（{}）がコミットに入っています",
-                path.unwrap_or("?")
+            return Ok(Some(Refusal::new(
+                format!(
+                    "置いた秘密のファイルと同じ中身のファイル（{}）がコミットに入っています",
+                    path.unwrap_or("?")
+                ),
+                NEXT_SECRET,
             )));
         }
     }
@@ -186,9 +207,10 @@ pub fn verify(
         ISOLATED_GIT_ENV,
     )?;
     if !merges.trim().is_empty() {
-        return Ok(Some(
+        return Ok(Some(Refusal::new(
             "マージコミットがあります（中身を確かめきれないので、pushしません）".to_string(),
-        ));
+            NEXT_MERGE,
+        )));
     }
     // シンボリックリンクで、守るパスを別の場所に向けられる（`.vscode` → `tools/v` など）ので、足させない
     let raw = git_out(
@@ -212,13 +234,17 @@ pub fn verify(
         let new_mode = fields.nth(1);
         let path = line.split('\t').nth(1).unwrap_or("?");
         if new_mode == Some("120000") {
-            return Ok(Some(format!(
-                "シンボリックリンクを足すコミットがあります: {path}"
+            return Ok(Some(Refusal::new(
+                format!("シンボリックリンクを足すコミットがあります: {path}"),
+                NEXT_GUARDED,
             )));
         }
         // submoduleの中身はこのリポジトリにないので、確かめられない（人が --recursive でcloneすると入る）
         if new_mode == Some("160000") {
-            return Ok(Some(format!("submoduleを足すコミットがあります: {path}")));
+            return Ok(Some(Refusal::new(
+                format!("submoduleを足すコミットがあります: {path}"),
+                NEXT_GUARDED,
+            )));
         }
     }
     let changed = git_out(
@@ -247,8 +273,11 @@ pub fn verify(
                     .find(|n| lower.split('/').any(|part| part == **n))
             });
         if let Some(guarded) = guarded {
-            return Ok(Some(format!(
-                "人が開いたときに自動で動くファイル（{guarded}）を変えるコミットがあります: {path}"
+            return Ok(Some(Refusal::new(
+                format!(
+                    "人が開いたときに自動で動くファイル（{guarded}）を変えるコミットがあります: {path}"
+                ),
+                NEXT_GUARDED,
             )));
         }
     }
@@ -283,8 +312,9 @@ pub fn verify(
                 .get(line.wrapping_sub(1))
                 .map(|l| format!("{}:{}", l.path, l.line))
                 .unwrap_or_else(|| "場所不明".to_string());
-            return Ok(Some(format!(
-                "コミットに秘密らしいもの（{rule}、{place}）が入っています"
+            return Ok(Some(Refusal::new(
+                format!("コミットに秘密らしいもの（{rule}、{place}）が入っています"),
+                NEXT_SECRET,
             )));
         }
     }
@@ -554,7 +584,7 @@ mod tests {
             let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
                 .unwrap()
                 .unwrap();
-            assert!(reason.contains("マージコミット"), "{reason}");
+            assert!(reason.reason.contains("マージコミット"), "{reason:?}");
 
             // シンボリックリンクで、守るパスを別の場所に向ける
             let dir = tempfile::tempdir().unwrap();
@@ -570,7 +600,7 @@ mod tests {
             let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
                 .unwrap()
                 .unwrap();
-            assert!(reason.contains("シンボリックリンク"), "{reason}");
+            assert!(reason.reason.contains("シンボリックリンク"), "{reason:?}");
         }
 
         #[test]
@@ -612,7 +642,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            assert!(reason.contains("copy.txt"), "{reason}");
+            assert!(reason.reason.contains("copy.txt"), "{reason:?}");
 
             for (path, content, expect) in [
                 (".claude/settings.json", "{}", ".claude"),
@@ -627,7 +657,7 @@ mod tests {
                 let reason = verify(&SystemProbe, staging.path(), &base, "ac/x", &[], &scanner)
                     .unwrap()
                     .unwrap();
-                assert!(reason.contains(expect), "{path}: {reason}");
+                assert!(reason.reason.contains(expect), "{path}: {reason:?}");
             }
         }
 
