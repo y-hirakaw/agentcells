@@ -823,6 +823,10 @@ private_key = "github-app.pem"
         std::fs::write(home.config_path(), format!("{text}{GITHUB_APP}")).unwrap();
         let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
         assert_eq!(check.status, Status::Fail);
-        assert!(check.detail.contains("読ませない場所"), "{}", check.detail);
+        assert!(
+            check.detail.contains("開けられない場所"),
+            "{}",
+            check.detail
+        );
     }
 }

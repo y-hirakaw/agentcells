@@ -153,8 +153,22 @@ pub fn runtime_settings(
     for program in run.programs {
         allow_read.extend(forms(program)?);
     }
-    for path in &product.sandbox.read {
+    let mut allow_write = [forms(run.git_dir)?, forms(run.tmp)?].concat();
+    for (key, path) in product.sandbox.opened() {
         allow_read.extend(forms(path)?);
+        if key == "write" {
+            allow_write.extend(forms(path)?);
+        }
+    }
+    // 書き込みは、denyWriteがallowWriteより細かくなくても勝つ（2.1.310で確かめた）。`~/.agentcells` を入れると、
+    // その中のこの仕事の .git と一時ディレクトリにも書けなくなるので入れない。`write` には、それを含む場所を書かせない
+    let mut deny_write = Vec::new();
+    for place in protected_places(home, config)?
+        .into_iter()
+        .filter(|p| p != home.root())
+        .chain(write_protected_places()?)
+    {
+        deny_write.extend(forms(&place)?);
     }
 
     // sandboxの中では ~/.gitconfig が読めず、gitが止まる。使う人とシステムのgitの設定は読ませない
@@ -163,8 +177,6 @@ pub fn runtime_settings(
         .map(|(k, v)| (k.to_string(), json!(v)))
         .collect();
 
-    let allow_write = [forms(run.git_dir)?, forms(run.tmp)?].concat();
-
     Ok(json!({
         "env": env,
         "permissions": { "allow": allow, "deny": deny },
@@ -172,7 +184,8 @@ pub fn runtime_settings(
             "enabled": true,
             "allowUnsandboxedCommands": false,
             "filesystem": {
-                "allowWrite": allow_write,
+                "allowWrite": dedup(allow_write),
+                "denyWrite": dedup(deny_write),
                 "denyRead": dedup(deny_read),
                 "allowRead": dedup(allow_read),
             },
@@ -185,19 +198,25 @@ pub fn runtime_settings(
     }))
 }
 
-/// productの `sandbox.read` の問題。読ませない場所の中を開けると、sandboxはそちらを優先して読ませてしまうので断る。
+/// productの `sandbox.read` と `sandbox.write` の問題。読ませない場所や書かせない場所の中を開けると、
+/// sandboxはそちらを優先して開けてしまうので断る。
 pub fn sandbox_problems(home: &Home, config: &Config) -> Vec<String> {
-    let places = match protected_places(home, config) {
-        Ok(places) => places,
-        Err(e) => return vec![e.message],
+    let (places, write_places) = match (protected_places(home, config), write_protected_places()) {
+        (Ok(places), Ok(write_places)) => (places, write_places),
+        (Err(e), _) | (_, Err(e)) => return vec![e.message],
     };
     let mut problems = Vec::new();
     for product in &config.products {
-        for path in &product.sandbox.read {
+        for (key, path) in product.sandbox.opened() {
             let Ok(written) = path_forms(path) else {
                 continue;
             };
-            let place = places.iter().find(|place| {
+            let guarded: Vec<&PathBuf> = if key == "write" {
+                places.iter().chain(&write_places).collect()
+            } else {
+                places.iter().collect()
+            };
+            let place = guarded.into_iter().find(|place| {
                 let Ok(place_forms) = path_forms(place) else {
                     return false;
                 };
@@ -207,10 +226,17 @@ pub fn sandbox_problems(home: &Home, config: &Config) -> Vec<String> {
             });
             if let Some(place) = place {
                 problems.push(format!(
-                    "product「{}」の sandbox.read の {} は、読ませない場所（{}）の中なので書けません",
+                    "product「{}」の sandbox.{key} の {} は、開けられない場所（{}）の中なので書けません",
                     product.name,
                     path.display(),
                     place.display()
+                ));
+            } else if key == "write" && contains(&written, home.root()) {
+                problems.push(format!(
+                    "product「{}」の sandbox.write の {} は、agentcellsの置き場所（{}）を含むので書けません",
+                    product.name,
+                    path.display(),
+                    home.root().display()
                 ));
             }
         }
@@ -237,10 +263,10 @@ pub fn sandbox_warnings(config: &Config) -> Vec<String> {
     .collect();
     let mut warnings = Vec::new();
     for product in &config.products {
-        for path in &product.sandbox.read {
+        for (key, path) in product.sandbox.opened() {
             if wide.iter().any(|w| same_path(w, path)) {
                 warnings.push(format!(
-                    "product「{}」の sandbox.read の {} は広すぎます。並べ忘れた場所の秘密も読めるようになります。要る場所だけを書いてください",
+                    "product「{}」の sandbox.{key} の {} は広すぎます。並べ忘れた場所の秘密も読めるようになります。要る場所だけを書いてください",
                     product.name,
                     path.display()
                 ));
@@ -263,6 +289,28 @@ fn same_path(a: &Path, b: &Path) -> bool {
     let a = a.to_string_lossy().to_lowercase();
     let b = b.to_string_lossy().to_lowercase();
     a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// `write` で広い場所を開けても、書かせない場所。書かれると、使う人が手元で動かすClaude Codeや、
+/// ログインのたびに動くものに、AIが書いたものが効いてしまう。
+fn write_protected_places() -> Result<Vec<PathBuf>> {
+    let user_home = user_home()?;
+    Ok([
+        ".claude",
+        ".claude.json",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
+        ".gitconfig",
+        ".config/git",
+        "Library/LaunchAgents",
+    ]
+    .iter()
+    .map(|p| user_home.join(p))
+    .collect())
 }
 
 /// 開けた場所の中にあっても読ませない場所。
@@ -312,6 +360,16 @@ fn reads_placed(product: &Product, worktree: &Path, placed: &Path) -> bool {
         .read_placed
         .iter()
         .any(|p| fold(p) == relative)
+}
+
+/// `paths` のどれかが、`inner` を含むか（`inner` がその中か、同じか）。
+fn contains(paths: &[PathBuf], inner: &Path) -> bool {
+    let Ok(inner_forms) = path_forms(inner) else {
+        return false;
+    };
+    paths
+        .iter()
+        .any(|p| inner_forms.iter().any(|i| starts_with_ignore_case(i, p)))
 }
 
 /// `path` が `base` か、その中か。大文字・小文字は問わない（macOSの標準のファイルシステムでは同じ場所を指す）。
@@ -648,7 +706,7 @@ mod tests {
             read: vec![PathBuf::from("/opt/sdk"), user_home().join(".cargo")],
             read_placed: vec![],
             network: vec!["registry.npmjs.org".to_string()],
-            bind_localhost: false,
+            ..Sandbox::default()
         });
         let settings = settings_with(&Config::default(), &product, &[]);
         let fs = &settings["sandbox"]["filesystem"];
@@ -732,7 +790,7 @@ mod tests {
         ] {
             let problems = sandbox_problems(&home(), &config(vec![bad.clone()]));
             assert_eq!(problems.len(), 1, "{bad:?}: {problems:?}");
-            assert!(problems[0].contains("読ませない場所"), "{problems:?}");
+            assert!(problems[0].contains("開けられない場所"), "{problems:?}");
         }
         // 読ませない場所を含む、広い場所は書ける（中の読ませない場所は、より細かい決まりで止まる）
         let wide = config(vec![user_home().join(".config"), user_home()]);
@@ -749,6 +807,49 @@ mod tests {
             tmp: Path::new("/t"),
         };
         assert!(runtime_settings(&home(), &bad, &bad.products[0], &run).is_err());
+    }
+
+    #[test]
+    fn write_opens_places_for_writing_but_never_shell_or_claude_settings() {
+        let product = product(Sandbox {
+            write: vec![user_home().join(".gradle")],
+            ..Sandbox::default()
+        });
+        let settings = settings_with(&Config::default(), &product, &[]);
+        let fs = &settings["sandbox"]["filesystem"];
+        let gradle = user_home().join(".gradle").display().to_string();
+        assert!(strings(&fs["allowWrite"]).contains(&gradle));
+        assert!(strings(&fs["allowRead"]).contains(&gradle));
+        let deny_write = strings(&fs["denyWrite"]);
+        for place in [".claude", ".zshrc", "Library/LaunchAgents"] {
+            let place = user_home().join(place).display().to_string();
+            assert!(deny_write.contains(&place), "{place}: {deny_write:?}");
+        }
+        // ~/.agentcells を入れると、この仕事の .git と一時ディレクトリにも書けなくなる
+        assert!(!deny_write.contains(&"/home/me/.agentcells".to_string()));
+
+        // 書かせない場所の中は、write に書けない（read なら書ける）
+        let config = |sandbox: Sandbox| Config {
+            products: vec![self::product(sandbox)],
+            ..Config::default()
+        };
+        let bad = config(Sandbox {
+            write: vec![user_home().join(".claude/hooks")],
+            ..Sandbox::default()
+        });
+        assert_eq!(sandbox_problems(&home(), &bad).len(), 1);
+        // agentcellsの置き場所を含む場所も、write に書けない
+        let wide = config(Sandbox {
+            write: vec![PathBuf::from("/home/me")],
+            ..Sandbox::default()
+        });
+        let problems = sandbox_problems(&home(), &wide);
+        assert!(problems[0].contains("含むので"), "{problems:?}");
+        let fine = config(Sandbox {
+            read: vec![user_home().join(".claude/hooks")],
+            ..Sandbox::default()
+        });
+        assert!(sandbox_problems(&home(), &fine).is_empty());
     }
 
     #[test]

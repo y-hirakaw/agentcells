@@ -218,6 +218,8 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
 - sandboxの中では `TMPDIR` が `/tmp/claude-<uid>` になり、そこには書ける。`/tmp` そのものには書けない。worktreeを一時ディレクトリに置かない
 - `/tmp/claude-<uid>` は、同じ人のほかのセッションと共有で、sandboxの中から、ほかのセッションのscratchpadを読み書きできた。`denyWrite` に入れると、Claude Code自身がコマンドを動かせなくなる（`/tmp/claude-<uid>/cwd-...` に書けない）。設定の `env` の `TMPDIR` は効かない。`denyRead` に `/tmp` を入れても、Claude Codeがコマンドの出力やcwdを `/tmp/claude-<uid>` に書けず、すべてのコマンドが終了コード1になる（`cat` は標準出力に書けない）。起動するときの `CLAUDE_CODE_TMPDIR` は、Claude Code自身の一部のファイルを動かすが、シェルの `/tmp/claude-<uid>/cwd-...` は動かない
 - テストが `127.0.0.1` でサーバーを開くには、`network.allowLocalBinding` が要る
+- 書き込みは、`denyWrite` が `allowWrite` より細かくなくても勝つ。`denyWrite` に `~/.agentcells` を入れると、その中の `allowWrite`（この仕事の `.git` の実体と一時ディレクトリ）にも書けず、コミットできない。読み込み（`denyRead` と `allowRead`）とは違う
+- `write` に書いた場所には、sandboxの中から書ける。`agentcells cell run` は、止められた場所を出力から拾って、足すとよい場所を出す
 - `permissions.blockReadsOutsideWorkingDirectories` は、`agentcells cell` が今の仕事のファイルを読めなくなり、ホームの下のツールチェーンも読めなくなるので使わない
 - sandboxは `GIT_CONFIG_*` の環境変数で `safe.directory` などを足す。作者の名前は足さない
 
@@ -248,7 +250,8 @@ productごとに、AIが動かすコマンド（ビルドやテストを含む�
 
 ```toml
 [product.sandbox]
-read = ["~/.gradle", "~/Library/Android/sdk"]          # ホームの下で読ませる場所（`~/` で始めるか絶対パス）
+read = ["~/Library/Android/sdk", "~/.android/debug.keystore"]  # ホームの下で読ませる場所（`~/` で始めるか絶対パス）
+write = ["~/.gradle"]                                 # ホームの下で書かせる（読ませもする）場所
 network = ["services.gradle.org", "dl.google.com"]    # 通信してよい先。取得元のホストを具体的に書く
 read_placed = ["app/google-services.json"]            # files/ から置いたファイルのうち、ビルドに読ませるもの
 bind_localhost = false                                # テストが localhost でサーバーを開けるようにする
@@ -256,7 +259,13 @@ bind_localhost = false                                # テストが localhost �
 
 - 通信先は、取得元のホスト（`repo.maven.apache.org`、`dl.google.com` など）を具体的に書く。`*.amazonaws.com`、`*.googleapis.com`、`*.blob.core.windows.net`、`*.cloudfront.net` のようなワイルドカードは、攻撃者が用意した誰でも書ける置き場所を含み、外へ送れてしまう。`doctor` は、ワイルドカードと、広すぎる `read`（`~`、`~/.config`、`~/Library`、`~/Documents` など）を知らせる
 
+- 使う人がsandboxの仕組みを知らなくても、動かしてみれば何を足せばよいかがわかるようにする。足りないときは、こう伝わる
+  - 読み書きできない場所: `agentcells cell run` が、コマンドの出力から、止められたホームの下の場所（`Operation not permitted` などの行にあるパス）を拾い、`~/.gradle` のようにまとめて、足すとよい場所として最後に出す
+  - 通信できない先: Claude Codeが、止めた先をコマンドの結果に書き足す
+  - AIは、それを書いて人間に回す。足すかどうかは人間が決める
 - 開けた場所の秘密は、AIが書き換えたビルドを通して読まれうる。何を開けるかは使う人が決める
+- `write` で開けた場所にAIのビルドが書いたものは、使う人が手元で動かすツールにも効く（`~/.gradle/init.gradle` を置かれると、手元のGradleでも動く）。シェルの設定（`~/.zshrc` など）、`~/.claude`、`~/.gitconfig`、`~/Library/LaunchAgents` は、広く開けても書かせない（`denyWrite`）。これらの中や、agentcellsの置き場所を含む場所は、`write` に書くと断る
+- ファイルを1つだけ開けられる。`~/.android` を開けると adb の秘密鍵（`adbkey`）も読めるので、`~/.android/debug.keystore` のように書く
 - `read` に、読ませない場所（`~/.agentcells`、ghの設定、`~/.ssh` など）の中を書くと、`doctor` と実行の前に断る
 - 設定にコマンドを書いても、置いた秘密のファイルは守れない。コマンドが固定でも、そのコマンドが動かすビルドの設定（`build.gradle` など）はAIが書き換えられるため。リリース用のkeystoreのような強い秘密は、cellに渡さない（デバッグ用の鍵でビルドし、署名はCIでする）
 

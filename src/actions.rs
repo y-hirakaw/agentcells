@@ -592,6 +592,9 @@ pub fn blob_hash(worktree: &Path, file: &Path) -> Result<String> {
 }
 
 /// 設定に書いたコマンドを、worktreeで実行する。標準出力と標準エラーはそのまま流し、終了コードを返す。
+///
+/// sandboxに止められた、ホームの下の場所が出力にあれば、最後に `[product.sandbox]` に足すとよい場所を出す。
+/// 使う人がsandboxの仕組みを知らなくても、動かしてみれば、何を足せばよいかがわかるようにするため。
 pub fn run(context: &Context, name: &str) -> Result<i32> {
     let command = context.commands.get(name).ok_or_else(|| {
         let names: Vec<&str> = context.commands.keys().map(String::as_str).collect();
@@ -602,14 +605,129 @@ pub fn run(context: &Context, name: &str) -> Result<i32> {
             format!("使えるのは {} です", names.join(", "))
         })
     })?;
-    let status = Command::new("sh")
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let (code, blocked) = run_command(context, command, user_home.as_deref())?;
+    if let Some(user_home) = &user_home
+        && !blocked.is_empty()
+    {
+        let list: Vec<String> = blocked
+            .iter()
+            .map(|p| format!("  - {}", tilde(p, user_home)))
+            .collect();
+        eprintln!(
+            "\nagentcells: sandboxで、ホームの下の次の場所が使えませんでした:\n{}\n\
+             ビルドやテストに要る場所なら、needs-human にして、config.toml の [product.sandbox] に足すよう人間に頼んでください。\n\
+             読むだけなら read、書きもするなら write に書きます（例: write = [\"{}\"]）。足すかどうかは人間が決めます",
+            list.join("\n"),
+            tilde(&blocked[0], user_home)
+        );
+    }
+    Ok(code)
+}
+
+/// コマンドを動かし、出力をそのまま流しながら、sandboxに止められたホームの下の場所を集める。
+fn run_command(
+    context: &Context,
+    command: &str,
+    user_home: Option<&Path>,
+) -> Result<(i32, Vec<PathBuf>)> {
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(&context.worktree)
         .env("TMPDIR", &context.tmp)
-        .status()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| Error::new(format!("「{command}」を実行できません: {e}")))?;
-    Ok(status.code().unwrap_or(1))
+    let relay = |from: Box<dyn std::io::Read + Send>, to: fn() -> Box<dyn std::io::Write>| {
+        let user_home = user_home.map(Path::to_path_buf);
+        let worktree = context
+            .worktree
+            .canonicalize()
+            .unwrap_or_else(|_| context.worktree.clone());
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(from);
+            let mut found = Vec::new();
+            let mut line = Vec::new();
+            while reader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                let mut out = to();
+                let _ = out.write_all(&line);
+                let _ = out.flush();
+                if let Some(user_home) = &user_home {
+                    for place in blocked_places(&String::from_utf8_lossy(&line), user_home) {
+                        // 作業の場所を含む場所（~/.agentcells）は開けられないので、勧めない
+                        let resolved = place.canonicalize().unwrap_or_else(|_| place.clone());
+                        if !worktree.starts_with(&resolved) && !found.contains(&place) {
+                            found.push(place);
+                        }
+                    }
+                }
+                line.clear();
+            }
+            found
+        })
+    };
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let out = relay(Box::new(stdout), || Box::new(std::io::stdout()));
+    let err = relay(Box::new(stderr), || Box::new(std::io::stderr()));
+    let status = child
+        .wait()
+        .map_err(|e| Error::new(format!("「{command}」を待てません: {e}")))?;
+    let mut blocked = out.join().unwrap_or_default();
+    for place in err.join().unwrap_or_default() {
+        if !blocked.contains(&place) {
+            blocked.push(place);
+        }
+    }
+    Ok((status.code().unwrap_or(1), blocked))
+}
+
+/// sandboxに止められたときの言い方。
+const BLOCKED_MARKERS: &[&str] = &[
+    "Operation not permitted",
+    "AccessDeniedException",
+    "Permission denied",
+];
+
+/// 1行の出力から、sandboxに止められた、ホームの下の場所を取り出す。ホームのすぐ下の名前（`~/.gradle`）にまとめる。
+/// `~/Library` と `~/.config` と `~/.local` は広すぎるので、もう1つ下（`~/Library/Android`）にする。
+fn blocked_places(line: &str, user_home: &Path) -> Vec<PathBuf> {
+    if !BLOCKED_MARKERS.iter().any(|m| line.contains(m)) {
+        return Vec::new();
+    }
+    let prefix = format!("{}/", user_home.display());
+    let mut places = Vec::new();
+    for (start, _) in line.match_indices(&prefix) {
+        let rest = &line[start + prefix.len()..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || "'\":),;`".contains(c))
+            .unwrap_or(rest.len());
+        let mut parts = rest[..end].split('/').filter(|p| !p.is_empty());
+        let Some(first) = parts.next() else {
+            continue;
+        };
+        let mut place = user_home.join(first);
+        if matches!(first, "Library" | ".config" | ".local")
+            && let Some(second) = parts.next()
+        {
+            place = place.join(second);
+        }
+        if !places.contains(&place) {
+            places.push(place);
+        }
+    }
+    places
+}
+
+/// ホームの下なら `~/` の形にする。
+fn tilde(path: &Path, user_home: &Path) -> String {
+    match path.strip_prefix(user_home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -879,6 +997,42 @@ echo "[]"
         assert_eq!(made.trim(), ctx.tmp.display().to_string());
         let err = run(&ctx, "rm-everything").unwrap_err();
         assert!(err.hint.unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn blocked_places_are_found_in_command_output() {
+        let home = Path::new("/Users/me");
+        assert_eq!(
+            blocked_places(
+                "cat: /Users/me/.gradle/caches/x.lock: Operation not permitted",
+                home
+            ),
+            vec![PathBuf::from("/Users/me/.gradle")]
+        );
+        assert_eq!(
+            blocked_places(
+                "java.nio.file.AccessDeniedException: /Users/me/Library/Android/sdk/licenses",
+                home
+            ),
+            vec![PathBuf::from("/Users/me/Library/Android")]
+        );
+        // 止められたことを言っていない行や、ホームの外は拾わない
+        assert!(blocked_places("reading /Users/me/.gradle/caches", home).is_empty());
+        assert!(blocked_places("/opt/x: Operation not permitted", home).is_empty());
+    }
+
+    #[test]
+    fn run_collects_blocked_places_but_not_the_agentcells_home() {
+        let (dir, ctx) = setup();
+        let home = dir.path();
+        let command = format!(
+            "echo '{h}/.gradle/a: Operation not permitted' >&2; echo '{w}/x: Operation not permitted'; echo ok",
+            h = home.display(),
+            w = ctx.worktree.display()
+        );
+        let (code, blocked) = run_command(&ctx, &command, Some(home)).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(blocked, vec![home.join(".gradle")]);
     }
 
     #[test]

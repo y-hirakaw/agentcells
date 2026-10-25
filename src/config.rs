@@ -30,7 +30,8 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # build = "npm run build"
 #
 # [product.sandbox]                  # AIが動かすコマンドに開ける場所。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない
-# read = ["~/.npm", "~/.nvm"]        # ホームの下で読ませる場所（ツールチェーンやキャッシュ）。開けた場所の秘密は読まれうる
+# read = ["~/.nvm"]                  # ホームの下で読ませる場所（ツールチェーンなど）。開けた場所の秘密は読まれうる
+# write = ["~/.npm"]                 # ホームの下で書かせる場所（キャッシュなど）。書かれたものは、手元で動かすツールにも効く
 # network = ["registry.npmjs.org"]   # 通信してよい先。取得元のホストを具体的に書く（*.amazonaws.com のような広いワイルドカードは、外へ送る道になる）
 # read_placed = []                   # files/ から置いたファイルのうち、ビルドに読ませるもの（リポジトリからの相対パス）
 # bind_localhost = false             # テストが localhost でサーバーを開けるようにする
@@ -110,6 +111,10 @@ pub struct Sandbox {
     /// 読み込んだあとは絶対パスになっている
     #[serde(default)]
     pub read: Vec<PathBuf>,
+    /// ホームの下で書かせる（読ませもする）場所（`~/.gradle` のようなキャッシュ）。書き方は `read` と同じ。
+    /// AIが書き換えたビルドがここに書いたものは、使う人が手元で動かすツールにも効く
+    #[serde(default)]
+    pub write: Vec<PathBuf>,
     /// worktreeに置いたファイルのうち、ビルドやテストに読ませるもの（リポジトリからの相対パス）。
     /// 読ませると、AIが書き換えたビルドを通して中身を取り出せるので、要るものだけにする
     #[serde(default)]
@@ -121,6 +126,16 @@ pub struct Sandbox {
     /// テストが手元（localhost）でサーバーを開けるようにする
     #[serde(default)]
     pub bind_localhost: bool,
+}
+
+impl Sandbox {
+    /// 開ける場所と、その項目の名前（`read` か `write`）。
+    pub fn opened(&self) -> impl Iterator<Item = (&'static str, &PathBuf)> {
+        self.read
+            .iter()
+            .map(|p| ("read", p))
+            .chain(self.write.iter().map(|p| ("write", p)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,7 +257,8 @@ impl Config {
         }
         let user_home = std::env::var_os("HOME").map(PathBuf::from);
         for product in &mut config.products {
-            for path in &mut product.sandbox.read {
+            let sandbox = &mut product.sandbox;
+            for path in sandbox.read.iter_mut().chain(sandbox.write.iter_mut()) {
                 if let (Ok(rest), Some(user_home)) = (path.strip_prefix("~"), &user_home) {
                     *path = user_home.join(rest);
                 }
@@ -317,10 +333,10 @@ impl Config {
                     problems.push(format!("product「{}」のコマンド「{name}」が空です", p.name));
                 }
             }
-            for path in &p.sandbox.read {
+            for (key, path) in p.sandbox.opened() {
                 if !path.is_absolute() || has_parent_dir(path) {
                     problems.push(format!(
-                        "product「{}」の sandbox.read の {} は、`~/` で始めるか絶対パスで書いてください（`..` は使えません）",
+                        "product「{}」の sandbox.{key} の {} は、`~/` で始めるか絶対パスで書いてください（`..` は使えません）",
                         p.name,
                         path.display()
                     ));
@@ -780,7 +796,7 @@ timeout_minutes = 10
     fn products_can_open_the_sandbox() {
         let text = VALID.replace(
             "cells = [\"triage\", \"review\"]",
-            "cells = [\"triage\", \"review\"]\n\n[product.sandbox]\nread = [\"~/.cargo\", \"/opt/sdk\"]\nread_placed = [\"app/google-services.json\"]\nnetwork = [\"registry.npmjs.org\", \"*.gradle.org\"]",
+            "cells = [\"triage\", \"review\"]\n\n[product.sandbox]\nread = [\"~/.cargo\", \"/opt/sdk\"]\nwrite = [\"~/.gradle\"]\nread_placed = [\"app/google-services.json\"]\nnetwork = [\"registry.npmjs.org\", \"*.gradle.org\"]",
         );
         let dir = base_with_prompts(&["triage.md", "review.md"]);
         let config = Config::parse(&text, dir.path()).unwrap();
@@ -790,6 +806,7 @@ timeout_minutes = 10
             sandbox.read,
             vec![user_home.join(".cargo"), PathBuf::from("/opt/sdk")]
         );
+        assert_eq!(sandbox.write, vec![user_home.join(".gradle")]);
         assert_eq!(
             sandbox.read_placed,
             vec![PathBuf::from("app/google-services.json")]

@@ -19,6 +19,8 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
   - 使う人のホームの下は読ませず、productの `[product.sandbox]` の `read` に書いた場所だけを開ける。読ませない場所を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまうため。`~/.agentcells`、ghの設定、`~/.ssh` などは、広く開けても読ませない
   - 外への通信は、`[product.sandbox]` の `network` に書いた先だけにし、ほかは聞かずに止める。WebFetchも使わせない。読めた秘密を、コミットを通さずに外へ送らせないため。止めた先はAIに見えるので、AIは足すとよい設定を書いて人間に回す
   - 一時ディレクトリ: Claude Codeがsandboxで使わせる `/tmp/claude-<uid>` は、使う人のほかのセッションと共有なので、ビルドとテストには、`agentcells cell run` が仕事ごとの一時ディレクトリを渡す（`/tmp/claude-<uid>` そのものは、Claude Codeの都合で塞げない。残る危険）
+  - `write` に書いた場所（`~/.gradle` のようなキャッシュ）には書ける。シェルの設定や `~/.claude` などは、広く開けても書かせない
+  - 読み書きを止められたとき、`agentcells cell run` が、出力から止められた場所を拾い、`[product.sandbox]` に足すとよい場所を出す。使う人がsandboxの仕組みを先に知らなくても、動かしてみれば何を足せばよいかがわかるようにするため
   - `bind_localhost` を書くと、テストがlocalhostでサーバーを開ける
   - 置いた秘密のファイル（keystoreなど）は、ビルドにも読ませない。`read_placed` に書いたものだけ読ませる。読ませると、AIが書き換えたビルドを通して取り出せるため、要るものだけを明示する
 - **コミットの前に秘密を探す**（[betterleaks](https://github.com/betterleaks/betterleaks)）
