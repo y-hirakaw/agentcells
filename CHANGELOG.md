@@ -6,6 +6,12 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.17.1] - 2026-10-25
+
+### 直したこと
+
+- `doctor` が、GitHub Appの作り方の案内で、日本語の手順（`docs/README.ja.md`）を指すようにした。READMEを英語にし、日本語版を `docs/README.ja.md` に移したため。GitHub Appの手順から、使わない Workflows の権限も外した（agentcellsは `.github/workflows` を変えるコミットをpushしない）
+
 ## [0.17.0] - 2026-10-25
 
 ### 足したこと

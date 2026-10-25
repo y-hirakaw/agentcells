@@ -383,7 +383,7 @@ fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
         return Check::warn(
             NAME,
             "ghにログインしているあなたのアカウントで書き込みます。AIのコメントやPRがあなたの名前になり、人間の発言と見分けにくくなります",
-            "GitHub Appを作り、config.toml の [github_app] に書くのがおすすめです（手順は README の「GitHub App」）",
+            "GitHub Appを作り、config.toml の [github_app] に書くのがおすすめです（手順は https://github.com/y-hirakaw/agentcells/blob/main/docs/README.ja.md の「GitHub App」）",
         );
     };
     // 鍵の権限はネットワークに出ずに確かめられるので先に見て、ほかの結果と一緒に知らせる。
