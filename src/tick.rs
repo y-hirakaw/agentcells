@@ -232,8 +232,9 @@ struct ListedUser {
     login: String,
 }
 
-/// 仕事を探す。人間を待っていたもので、cellを使う人が返事をしたものを先に、そのあとに、productとcellを
-/// 設定の順に見て、同じcellの中では番号の小さい順に並べる。
+/// 仕事を探す。人間を待っていたもので、cellを使う人が返事をしたものを先に、そのあとに、流れの後ろの工程
+/// （[`depths`] の深いcell）から、同じ工程ならPRをIssueより先に並べる（仕掛かっているものを先に片付ける）。
+/// それも同じなら、productとcellの設定の順、番号の小さい順。
 ///
 /// `credentials_for` は、リポジトリを読むための認証を返す（ghの設定はAIが書き換えられるので、
 /// 読むときもトークンと空の設定のghを使う）。
@@ -348,10 +349,75 @@ pub fn find(
             }
         }
     }
+    // 流れの後ろの工程から動かす。新しいIssueの triage が、前からあるPRの review を待たせないように
+    order(config, &mut found.work);
     // 返事を待っていた人を、先に相手にする
     replied.work.append(&mut found.work);
     replied.skipped.append(&mut found.skipped);
     Ok(replied)
+}
+
+/// 流れの後ろの工程（[`depths`] の深いcell）から並べ、同じ深さならPRをIssueより先にする。
+/// それ以外は、今の順（productとcellの設定の順、番号の小さい順）のまま。
+fn order(config: &Config, work: &mut [Work]) {
+    let depths: HashMap<String, HashMap<String, usize>> = config
+        .products
+        .iter()
+        .map(|p| (p.name.clone(), depths(config, p)))
+        .collect();
+    work.sort_by_key(|w| {
+        let depth = depths
+            .get(&w.product)
+            .and_then(|d| d.get(&w.cell))
+            .copied()
+            .unwrap_or(0);
+        (std::cmp::Reverse(depth), w.item == Target::Issue)
+    });
+}
+
+/// productの中での、cellの深さ（流れの入口から、いくつ進んだところか）。入口は、ほかのcellの `next` に
+/// ないcell（triage など）で、深さ0。そこから `next` をたどった、いちばん短い数（差し戻しの輪があっても止まる）。
+/// 入口がなかったり、入口からたどれないcell（別の輪）があれば、そのうち設定で先のcellを入口にして、またたどる。
+pub fn depths(config: &Config, product: &Product) -> HashMap<String, usize> {
+    let cells: Vec<_> = product
+        .cells
+        .iter()
+        .filter_map(|name| config.cell_in(product, name))
+        .collect();
+    let in_product = |name: &String| product.cells.contains(name);
+    let pointed: Vec<&String> = cells
+        .iter()
+        .flat_map(|c| c.next.iter().filter(|n| *n != &c.name && in_product(n)))
+        .collect();
+    let mut queue: std::collections::VecDeque<String> = cells
+        .iter()
+        .filter(|c| !pointed.contains(&&c.name))
+        .map(|c| c.name.clone())
+        .collect();
+    let mut depths: HashMap<String, usize> = queue.iter().map(|n| (n.clone(), 0)).collect();
+    loop {
+        while let Some(name) = queue.pop_front() {
+            let depth = depths[&name];
+            let Some(cell) = cells.iter().find(|c| c.name == name) else {
+                continue;
+            };
+            for next in cell.next.iter().filter(|n| in_product(n)) {
+                if !depths.contains_key(next) {
+                    depths.insert(next.clone(), depth + 1);
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+        // まだ深さのないcell（入口からたどれない輪）があれば、設定で先のものを入口にする
+        match cells.iter().find(|c| !depths.contains_key(&c.name)) {
+            Some(cell) => {
+                depths.insert(cell.name.clone(), 0);
+                queue.push_back(cell.name.clone());
+            }
+            None => break,
+        }
+    }
+    depths
 }
 
 /// 仕事を探すリポジトリ。Issueはproductの `issues`、PRは `repos`。
@@ -837,13 +903,14 @@ next = ["done"]
         );
         let work = found.work;
         let described: Vec<String> = work.iter().map(Work::describe).collect();
+        // どちらも入口のcell（深さ0）なので、PRを先に、同じcellの中では番号の小さい順
         assert_eq!(
             described,
             vec![
+                "review PR octo/app#12「PR」",
                 "triage Issue octo/issues#3「先」",
                 "triage Issue octo/issues#5「人間待ち」",
                 "triage Issue octo/issues#9「後」",
-                "review PR octo/app#12「PR」",
             ]
         );
         // リポジトリごとのトークンで、空のghの設定を使って読む
@@ -1184,6 +1251,93 @@ next = ["implement", "done"]
         let probe = probe_with("2026-10-25T03:10:00Z");
         tick(&probe);
         assert_eq!(reads(&probe), 1);
+    }
+
+    #[test]
+    fn later_steps_in_the_flow_are_deeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"
+operator = "me"
+
+[[product]]
+name = "app"
+issues = "octo/app"
+repos = ["octo/app"]
+cells = ["triage", "implement", "review", "assess"]
+
+[[product]]
+name = "loop"
+issues = "octo/loop"
+repos = ["octo/loop"]
+cells = ["implement", "review"]
+
+[[cell]]
+name = "triage"
+on = "issue"
+label = "ac:triage"
+next = ["implement", "done"]
+
+[[cell]]
+name = "implement"
+on = ["issue", "pull_request"]
+label = "ac:implement"
+next = ["review"]
+
+[[cell]]
+name = "review"
+on = "pull_request"
+label = "ac:review"
+next = ["implement", "done"]
+
+[[cell]]
+name = "assess"
+on = "issue"
+label = "ac:assess"
+next = ["implement", "done"]
+"#;
+        let config = Config::parse(text, dir.path()).unwrap();
+        let app = depths(&config, &config.products[0]);
+        assert_eq!(app["triage"], 0);
+        assert_eq!(app["assess"], 0);
+        assert_eq!(app["implement"], 1);
+        // 差し戻しの輪（review → implement）があっても、いちばん短い数
+        assert_eq!(app["review"], 2);
+        // 入口がない（すべてが輪）なら、最初のcellを入口にする
+        let looped = depths(&config, &config.products[1]);
+        assert_eq!(looped["implement"], 0);
+        assert_eq!(looped["review"], 1);
+        // 入口からたどれない輪があっても、どのcellにも深さが付く
+        let mut apart = config.clone();
+        apart.products[0]
+            .next
+            .insert("triage".into(), vec!["done".into()]);
+        apart.products[0]
+            .next
+            .insert("assess".into(), vec!["done".into()]);
+        let d = depths(&apart, &apart.products[0]);
+        assert_eq!((d["triage"], d["implement"], d["review"]), (0, 0, 1));
+
+        // 後ろの工程から、同じ工程ならPRを先に、それ以外は今の順のまま並べる
+        let w = |cell: &str, item: Target, number: u64| Work {
+            product: "app".into(),
+            cell: cell.into(),
+            item,
+            repo: RepoName::parse("octo/app").unwrap(),
+            number,
+            title: String::new(),
+            waiting: None,
+        };
+        let mut work = vec![
+            w("triage", Target::Issue, 1),
+            w("assess", Target::Issue, 2),
+            w("implement", Target::Issue, 3),
+            w("implement", Target::PullRequest, 4),
+            w("review", Target::PullRequest, 5),
+            w("triage", Target::Issue, 6),
+        ];
+        order(&config, &mut work);
+        let numbers: Vec<u64> = work.iter().map(|w| w.number).collect();
+        assert_eq!(numbers, [5, 4, 3, 1, 2, 6]);
     }
 
     #[test]
