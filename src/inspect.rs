@@ -401,6 +401,8 @@ pub struct Context<'a> {
 #[derive(Debug, Default)]
 pub struct Summary {
     pub findings: usize,
+    /// 見つけたことの目印（2段目に、同じことを書かせないため）
+    pub fingerprints: Vec<String>,
     pub created: Vec<u64>,
     pub commented: Vec<u64>,
     pub kept: usize,
@@ -408,6 +410,11 @@ pub struct Summary {
     pub report: Option<PathBuf>,
     /// 人に伝えること
     pub notes: Vec<String>,
+    /// 2段目が手元に残したメモの数と、その場所
+    pub observations: usize,
+    pub notes_path: Option<PathBuf>,
+    /// 2段目が動けなかったときの理由
+    pub notes_error: Option<String>,
 }
 
 /// 規則で調べるところまで（AIは動かさない）。`agentcells inspect --dry-run` で、AIに渡すものを見せる。
@@ -439,6 +446,7 @@ pub fn run(ctx: &Context) -> Result<Summary> {
     let (findings, totals) = find(&lines);
     let mut summary = Summary {
         findings: findings.len(),
+        fingerprints: findings.iter().map(|f| f.fingerprint.to_string()).collect(),
         ..Summary::default()
     };
     if findings.is_empty() {

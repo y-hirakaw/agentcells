@@ -1281,7 +1281,7 @@ impl Place {
             worktree: home.worktrees_dir().join(&relative),
             git_dir: home.root().join("gitdirs").join(&relative),
             tmp: home.root().join("tmp").join(&relative),
-            run: home.root().join("runs").join(&relative),
+            run: run_dir(home, repo, number),
             relative,
         }
     }
@@ -1716,6 +1716,20 @@ impl Reader<'_> {
 
 /// claudeの出力（`stream-json`）を書くファイル。
 const CLAUDE_LOG: &str = "claude.jsonl";
+
+/// Issue/PRごとの、実行の記録の場所（`runs/<owner>/<repo>/<番号>`）。
+fn run_dir(home: &Home, repo: &RepoName, number: u64) -> PathBuf {
+    home.root()
+        .join("runs")
+        .join(&repo.owner)
+        .join(&repo.name)
+        .join(number.to_string())
+}
+
+/// Issue/PRの、最後の実行のclaudeの出力。同じIssue/PRの次の実行で上書きされる。
+pub fn claude_log(home: &Home, repo: &RepoName, number: u64) -> PathBuf {
+    run_dir(home, repo, number).join(CLAUDE_LOG)
+}
 
 /// `stream-json` の出力から、結果の行（`"type":"result"`）を読む。なければ空。
 fn result_line(stdout: &str) -> &str {

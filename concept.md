@@ -52,7 +52,6 @@ cellの外にいて、次の行き先を判断する。単に運ぶのではな�
 
 inspectorの1段目（構造化した記録から規則で見つけ、agentcellsのIssueにする）は作った（docs/design.md の「inspector」）。残り:
 
-- 2段目: ログの中身（`claude.jsonl`）まで読む。1段目にない発見は、手元に残し、聞かれたら出す
 - 見つけたものの出す先を、直す場所ごとに分ける
   - productの問題（テストが遅い、Issueの書き方で差し戻しが多い）: そのproductのIssueのリポジトリ。productの中身は、そのproductにしか出さない
   - 使う人の設定やプロンプト（`[product.commands]` のテストのコマンドが作業場所に合っていない、など）: 手元に残す

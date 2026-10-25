@@ -13,6 +13,7 @@ pub mod inspect;
 pub mod labels;
 pub mod limit;
 pub mod marker;
+pub mod notes;
 pub mod pr;
 pub mod probe;
 pub mod prompt;

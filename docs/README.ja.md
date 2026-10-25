@@ -58,7 +58,7 @@ agentcells doctor
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
 | `agentcells tick [--dry-run]` | 仕事（あなたが選んだ、cellのラベルが付いたIssue/PRと、人間を待っていたところにあなたが返事をしたもの）を探して、1件ずつcellで動かす。仕事が残っていれば、上限（`--max-minutes`、既定は30分）まで続けて動かす。閉じたIssue/PRに残った `ac:` ラベルも外す。`--dry-run` なら表示だけ。AIが使用量の上限に当たったら、その仕事は人間に回さずに元に戻し、上限が戻るまで新しく始めない（`--ignore-pause` で動かせる）。implementはコミットを確かめてpushし、PRを作る。reviewはPRにレビューを投稿する |
 | `agentcells schedule install [--every <分>]` / `remove` | `tick` を決まった間隔（既定は10分）で動かすように、launchd（macOS）に登録する／外す。cellが動いている間は、次のtickは何もしない。ログは `~/.agentcells/logs/tick.log` |
-| `agentcells inspect [--dry-run]` | tickの記録（`~/.agentcells/logs/events.jsonl`）を決まった規則で調べ、ラインの不具合（同じcellが続けて動いた、AIの実行が失敗した、など）を見つけて、AIがagentcellsのソースから原因と直し方の案を書く。`[inspector] issues` に書いたリポジトリにIssueにする（書かなければ手元に残すだけ）。`[inspector]` を書けば、tickも1日に1回、最後にこれを動かす。`--dry-run` は、AIに渡す伏せ字の記録だけを出す |
+| `agentcells inspect [--dry-run]` | tickの記録（`~/.agentcells/logs/events.jsonl`）を決まった規則で調べ、ラインの不具合（同じcellが続けて動いた、AIの実行が失敗した、など）を見つけて、AIがagentcellsのソースから原因と直し方の案を書く。`[inspector] issues` に書いたリポジトリにIssueにする（書かなければ手元に残すだけ）。`[inspector]` を書けば、tickも1日に1回、最後にこれを動かす。`--dry-run` は、AIに渡す伏せ字の記録だけを出す。cellの実行ごとの要約（使ったツール、エラー、許されなかった操作）も読み、設定やテスト、プロンプトなど、ラインを遅くしていることを手元にメモする。`--notes` で見られる |
 | `agentcells status [--watch]` | 動いているcell（経過時間、AIが使っているツール）と、扱っているIssueごとに、今どこまで進んでいるか（作業中、返事待ち、検品待ち、順番待ち）と、いつからかを出す。PRができたIssueは、PRの状態を出す（読むだけ）。`--watch` なら、動いているcellの様子だけを2秒ごとに出し直す |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |
 

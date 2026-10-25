@@ -141,6 +141,12 @@ pub enum Event {
         commented: Vec<u64>,
         /// 出さずに手元に残した案の数
         kept: usize,
+        /// 2段目で手元に残したメモの数
+        #[serde(default)]
+        observations: usize,
+        /// 2段目が動けなかったときの理由
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes_error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

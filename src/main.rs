@@ -69,6 +69,9 @@ enum Commands {
         /// AIは動かさずに、規則で見つけたもの（AIに渡す、伏せ字にした記録）だけを表示する
         #[arg(long)]
         dry_run: bool,
+        /// 動かさずに、2段目が手元に残した最近のメモを表示する
+        #[arg(long)]
+        notes: bool,
     },
     /// 動いているcellと、agentcellsが扱っているIssueごとに、今どこまで進んでいるかを出す（読むだけ）
     Status {
@@ -549,10 +552,27 @@ fn run(command: Commands) -> Result<ExitCode> {
                                 seconds: now.saturating_sub(started),
                                 error: e.message.clone(),
                             });
+                            // claudeを動かしたあとの失敗なら、その中身も読めるように残す
+                            if config.inspector.is_some() {
+                                agentcells::notes::keep_digest(
+                                    &home, next, "failed", 0, started, now,
+                                );
+                            }
                             return Err(e);
                         }
                     };
                     note(record::Event::ran(next, started, unix_now(), &report));
+                    // inspectorの2段目のために、実行の中身の要約を残す（claudeの出力は、次の実行で上書きされる）
+                    if config.inspector.is_some() && report.destination != "skipped" {
+                        agentcells::notes::keep_digest(
+                            &home,
+                            next,
+                            &report.destination,
+                            report.round,
+                            started,
+                            unix_now(),
+                        );
+                    }
                     let skipped = report.destination == "skipped";
                     match &report.reason {
                         Some(reason) if skipped => println!("見送りました: {reason}"),
@@ -610,7 +630,17 @@ fn run(command: Commands) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Inspect { dry_run } => {
+        Commands::Inspect { dry_run, notes } => {
+            if notes {
+                let recent = agentcells::notes::recent(&home, 3);
+                if recent.is_empty() {
+                    println!("まだメモはありません（inspectorの2段目が動くと、ここに残ります）");
+                }
+                for (path, text) in recent.iter().rev() {
+                    println!("--- {}\n{text}", path.display());
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
             if dry_run {
                 println!(
                     "{}",
@@ -733,7 +763,7 @@ fn inspect_now(
     inspector: &agentcells::config::Inspector,
     note: &dyn Fn(record::Event),
 ) -> Result<inspect::Summary> {
-    let result = (|| {
+    let result = (|| -> Result<inspect::Summary> {
         let claude = find_program("claude").ok_or_else(|| {
             Error::new("claudeが見つかりません").with_hint("`agentcells doctor` で確かめてください")
         })?;
@@ -742,7 +772,8 @@ fn inspect_now(
                 .with_hint("`agentcells doctor` で確かめてください")
         })?;
         let writer = prompt::writer_login(config, &SystemProbe)?;
-        inspect::run(&inspect::Context {
+        let now = unix_now();
+        let mut summary = inspect::run(&inspect::Context {
             home,
             config,
             inspector,
@@ -750,8 +781,34 @@ fn inspect_now(
             claude: &claude,
             scanner: &scanner,
             writer: &writer,
-            now: unix_now(),
-        })
+            now,
+        })?;
+        // 2段目: 実行の中身まで読み、1段目で見つけたこと以外を、手元に残す
+        let reported = summary.fingerprints.clone();
+        let reported: Vec<&str> = reported.iter().map(String::as_str).collect();
+        let context = agentcells::notes::Context {
+            home,
+            config,
+            inspector,
+            probe: &SystemProbe,
+            claude: &claude,
+            scanner: &scanner,
+            now,
+        };
+        match agentcells::notes::run(&context, &reported) {
+            Ok(Some((count, path))) => {
+                summary.observations = count;
+                summary.notes_path = Some(path);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                summary
+                    .notes
+                    .push(format!("2段目が動けませんでした: {}", e.message));
+                summary.notes_error = Some(e.message);
+            }
+        }
+        Ok(summary)
     })();
     note(match &result {
         Ok(s) => record::Event::Inspected {
@@ -759,6 +816,8 @@ fn inspect_now(
             created: s.created.clone(),
             commented: s.commented.clone(),
             kept: s.kept,
+            observations: s.observations,
+            notes_error: s.notes_error.clone(),
             error: None,
         },
         Err(e) => record::Event::Inspected {
@@ -766,6 +825,8 @@ fn inspect_now(
             created: Vec::new(),
             commented: Vec::new(),
             kept: 0,
+            observations: 0,
+            notes_error: None,
             error: Some(e.message.clone()),
         },
     });
@@ -774,10 +835,10 @@ fn inspect_now(
 
 fn print_inspection(summary: &inspect::Summary) {
     if summary.findings == 0 {
-        println!("気になることはありませんでした");
-        return;
+        println!("1段目（記録の規則）: 気になることはありませんでした");
+    } else {
+        println!("1段目（記録の規則）: 気になること {}件", summary.findings);
     }
-    println!("気になること: {}件", summary.findings);
     for number in &summary.created {
         println!("  Issueを作りました: #{number}");
     }
@@ -787,11 +848,18 @@ fn print_inspection(summary: &inspect::Summary) {
     if summary.kept > 0 {
         println!("  出さずに手元に残した案: {}件", summary.kept);
     }
-    for note in &summary.notes {
-        println!("  注意: {note}");
-    }
     if let Some(report) = &summary.report {
         println!("  記録: {}", report.display());
+    }
+    if let Some(path) = &summary.notes_path {
+        println!(
+            "2段目（実行の中身）: 手元に残したメモ {}件（`agentcells inspect --notes` で見られます）",
+            summary.observations
+        );
+        println!("  メモ: {}", path.display());
+    }
+    for note in &summary.notes {
+        println!("注意: {note}");
     }
 }
 
