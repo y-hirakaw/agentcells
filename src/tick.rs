@@ -167,14 +167,13 @@ struct Listed {
     number: u64,
     title: String,
     #[serde(default)]
-    labels: Vec<ListedLabel>,
+    labels: Nodes<ListedLabel>,
     #[serde(default)]
-    assignees: Vec<ListedUser>,
+    assignees: Nodes<ListedUser>,
     #[serde(default)]
-    author: Option<ListedUser>,
+    author: Option<ListedAuthor>,
     #[serde(default)]
     body: String,
-    /// 人間を待っているものだけ読む
     #[serde(default, rename = "updatedAt")]
     updated_at: String,
 }
@@ -183,15 +182,44 @@ impl Listed {
     /// GitHubのラベル名は大文字・小文字を区別しない。
     fn has_label(&self, label: &str) -> bool {
         self.labels
+            .nodes
             .iter()
             .any(|l| l.name.eq_ignore_ascii_case(label))
     }
 
     fn is_assigned(&self, actors: &Actors) -> bool {
         self.assignees
+            .nodes
             .iter()
             .any(|a| a.login.eq_ignore_ascii_case(&actors.operator))
     }
+
+    /// 作った人。GraphQLはAppを `[bot]` なしのloginで返すので、RESTと同じ形にする。
+    fn author_login(&self) -> String {
+        match &self.author {
+            Some(a) if a.typename == "Bot" => format!("{}[bot]", a.login),
+            Some(a) => a.login.clone(),
+            None => "ghost".to_string(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Nodes<T> {
+    nodes: Vec<T>,
+}
+
+impl<T> Default for Nodes<T> {
+    fn default() -> Self {
+        Nodes { nodes: Vec::new() }
+    }
+}
+
+#[derive(Deserialize)]
+struct ListedAuthor {
+    #[serde(rename = "__typename")]
+    typename: String,
+    login: String,
 }
 
 #[derive(Deserialize)]
@@ -248,7 +276,7 @@ pub fn find(
             for &item in &cell.on {
                 for repo in repos_for(product, item) {
                     let env = cache[repo].gh_env()?;
-                    let mut items = list(probe, &env, item, repo, &cell.label, FIELDS)?;
+                    let mut items = list(probe, &env, item, repo, &cell.label)?;
                     items.sort_by_key(|i| i.number);
                     for i in items {
                         // GitHubのラベル名は大文字・小文字を区別しない。人間を待っているものでも、
@@ -279,8 +307,7 @@ pub fn find(
                 }
                 for repo in repos_for(product, item) {
                     let env = cache[repo].gh_env()?;
-                    let fields = format!("{FIELDS},updatedAt");
-                    let mut items = list(probe, &env, item, repo, waiting.label(), &fields)?;
+                    let mut items = list(probe, &env, item, repo, waiting.label())?;
                     items.sort_by_key(|i| i.number);
                     for i in items {
                         // cellのラベルが付いていれば、上でそのcellの仕事として見ている
@@ -416,11 +443,7 @@ impl Checker<'_> {
             found.skipped.push((work, reason));
             return Ok(());
         }
-        let author = i
-            .author
-            .as_ref()
-            .map(|a| crate::pr::app_login(&a.login))
-            .unwrap_or_else(|| "ghost".to_string());
+        let author = i.author_login();
         let original = match work.item {
             Target::PullRequest => crate::prompt::closes(&i.body, &work.repo),
             Target::Issue => None,
@@ -470,7 +493,42 @@ impl Checker<'_> {
 }
 
 /// 一覧で読む項目。
-const FIELDS: &str = "number,title,labels,assignees,author,body";
+const FIELDS: &str = "number title body updatedAt author { __typename login } labels(first: 100) { nodes { name } } assignees(first: 100) { nodes { login } }";
+
+/// 1回に読む件数。ラベルで絞った、開いているものだけなので、足りなくなることはまずない。
+const LIST_LIMIT: u32 = 100;
+
+/// ラベルの付いた、開いているIssue/PRを読む問い合わせ。
+///
+/// `gh issue list --label` などは、GitHubの検索を使う。検索は、ラベルを変えたり閉じたりしてから
+/// しばらくは、前のままで見つかる（cellが進めた直後に、同じtickで前のcellの仕事として拾い直し、
+/// 同じcellが2回動いた）。そのため、検索を使わずに、リポジトリのIssue/PRをラベルで絞って読む。
+fn list_query(item: Target) -> String {
+    let connection = match item {
+        Target::Issue => "issues",
+        Target::PullRequest => "pullRequests",
+    };
+    format!(
+        "query($owner: String!, $name: String!, $label: String!) {{ repository(owner: $owner, name: $name) {{ {connection}(states: OPEN, labels: [$label], first: {LIST_LIMIT}) {{ nodes {{ {FIELDS} }} }} }} }}"
+    )
+}
+
+#[derive(Deserialize)]
+struct ListResponse {
+    data: ListData,
+}
+
+#[derive(Deserialize)]
+struct ListData {
+    repository: Option<ListRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListRepository {
+    issues: Option<Nodes<Listed>>,
+    pull_requests: Option<Nodes<Listed>>,
+}
 
 /// 人間を待っているもので、返事がなかったときの、Issue/PRの更新時刻（`~/.agentcells/waiting.json`）。
 /// 更新時刻が変わっていなければ（コメントもレビューも増えていなければ）、やり取りを読み直さない。
@@ -564,26 +622,23 @@ fn list(
     item: Target,
     repo: &RepoName,
     label: &str,
-    fields: &str,
 ) -> Result<Vec<Listed>> {
-    let kind = match item {
-        Target::Issue => "issue",
-        Target::PullRequest => "pr",
-    };
-    let repo_arg = repo.to_string();
+    let query = format!("query={}", list_query(item));
+    // -F は数字だけの名前を数に変えるので、-f で渡す
+    let owner = format!("owner={}", repo.owner);
+    let name = format!("name={}", repo.name);
+    let label_arg = format!("label={label}");
     let args = [
-        kind,
-        "list",
-        "--repo",
-        repo_arg.as_str(),
-        "--label",
-        label,
-        "--state",
-        "open",
-        "--json",
-        fields,
-        "--limit",
-        "100",
+        "api",
+        "graphql",
+        "-f",
+        query.as_str(),
+        "-f",
+        owner.as_str(),
+        "-f",
+        name.as_str(),
+        "-f",
+        label_arg.as_str(),
     ];
     let out = probe.run_with_env("gh", &args, env).ok_or_else(|| {
         Error::new("ghが見つかりません").with_hint("`agentcells doctor` で確かめてください")
@@ -595,8 +650,23 @@ fn list(
         ))
         .with_hint("`agentcells doctor` で、リポジトリと書き込みのアカウントを確かめてください"));
     }
-    serde_json::from_str(&out.stdout)
-        .map_err(|e| Error::new(format!("{repo} の一覧を読めません: {e}")))
+    let response: ListResponse = serde_json::from_str(&out.stdout)
+        .map_err(|e| Error::new(format!("{repo} の一覧を読めません: {e}")))?;
+    let repository = response
+        .data
+        .repository
+        .ok_or_else(|| Error::new(format!("{repo} が見つかりません")))?;
+    let items = match item {
+        Target::Issue => repository.issues,
+        Target::PullRequest => repository.pull_requests,
+    };
+    // 絞り込みはGitHubに任せているが、探したラベルが付いていないものを仕事にしないよう、念のため確かめる
+    Ok(items
+        .map(|n| n.nodes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| i.has_label(label))
+        .collect())
 }
 
 #[cfg(test)]
@@ -652,28 +722,65 @@ next = ["done"]
     }
 
     fn list_command(kind: &str, repo: &str, label: &str) -> String {
+        let item = match kind {
+            "issue" => Target::Issue,
+            _ => Target::PullRequest,
+        };
+        let (owner, name) = repo.split_once('/').unwrap();
         format!(
-            "gh {kind} list --repo {repo} --label {label} --state open --json number,title,labels,assignees,author,body --limit 100"
+            "gh api graphql -f query={} -f owner={owner} -f name={name} -f label={label}",
+            list_query(item)
         )
     }
 
-    /// 人間を待っているものの一覧は、更新時刻も読む。
-    fn waiting_command(kind: &str, repo: &str, label: &str) -> String {
-        list_command(kind, repo, label).replace(",body ", ",body,updatedAt ")
+    /// ghの `--json` の形で書いた一覧（`labels` と `assignees` は配列、Appの `author` は `app/<名前>`）を、
+    /// GraphQLの答えの形にする。
+    fn response(kind: &str, items: &str) -> String {
+        let mut items: Vec<serde_json::Value> = serde_json::from_str(items).unwrap();
+        for item in &mut items {
+            for key in ["labels", "assignees"] {
+                if let Some(list) = item.get(key).cloned() {
+                    item[key] = serde_json::json!({ "nodes": list });
+                }
+            }
+            if let Some(login) = item["author"]["login"].as_str().map(str::to_string) {
+                item["author"] = match login.strip_prefix("app/") {
+                    Some(bot) => serde_json::json!({"__typename": "Bot", "login": bot}),
+                    None => serde_json::json!({"__typename": "User", "login": login}),
+                };
+            }
+        }
+        let connection = if kind == "issue" {
+            "issues"
+        } else {
+            "pullRequests"
+        };
+        serde_json::json!({"data": {"repository": {connection: {"nodes": items}}}}).to_string()
+    }
+
+    trait WithList {
+        /// ラベルの付いた一覧を読んだら、`items`（ghの `--json` の形）を返す。
+        fn with_list(self, kind: &str, repo: &str, label: &str, items: &str) -> Self;
+    }
+
+    impl WithList for FakeProbe {
+        fn with_list(self, kind: &str, repo: &str, label: &str, items: &str) -> Self {
+            self.with(
+                &list_command(kind, repo, label),
+                true,
+                &response(kind, items),
+            )
+        }
     }
 
     /// 人間を待っているものはない。
     fn nothing_waiting(mut probe: FakeProbe, issues: &[&str], prs: &[&str]) -> FakeProbe {
         for repo in issues {
-            probe = probe.with(
-                &waiting_command("issue", repo, "ac:needs-human"),
-                true,
-                "[]",
-            );
+            probe = probe.with_list("issue", repo, "ac:needs-human", "[]");
         }
         for repo in prs {
             for label in ["ac:needs-human", "ac:in-review"] {
-                probe = probe.with(&waiting_command("pr", repo, label), true, "[]");
+                probe = probe.with_list("pr", repo, label, "[]");
             }
         }
         probe
@@ -687,25 +794,17 @@ next = ["done"]
     fn finds_open_items_with_cell_labels_skipping_working() {
         let (_dir, config) = config();
         let probe = FakeProbe::default()
-            .with(
-                "gh issue list --repo octo/issues --label ac:triage --state open --json number,title,labels,assignees,author,body --limit 100",
-                true,
-                &format!(r#"[{{"number":9,"title":"後","labels":[{{"name":"ac:triage"}}],{ME}}},
+            .with_list("issue", "octo/issues", "ac:triage", &format!(r#"[{{"number":9,"title":"後","labels":[{{"name":"ac:triage"}}],{ME}}},
                     {{"number":3,"title":"先","labels":[{{"name":"ac:triage"}}],{ME}}},
                     {{"number":4,"title":"処理中","labels":[{{"name":"ac:triage"}},{{"name":"ac:working"}}],{ME}}},
                     {{"number":5,"title":"人間待ち","labels":[{{"name":"ac:triage"}},{{"name":"AC:Needs-Human"}}],{ME}}},
                     {{"number":6,"title":"他人の","labels":[{{"name":"ac:triage"}}],"assignees":[{{"login":"other"}}]}},
-                    {{"number":7,"title":"勝手に","labels":[{{"name":"ac:triage"}}],{ME}}}]"#),
+                    {{"number":7,"title":"勝手に","labels":[{{"name":"ac:triage"}}],{ME}}},
+                    {{"number":8,"title":"もう進んだ","labels":[{{"name":"ac:review"}}],{ME}}}]"#),
             )
-            .with(
-                "gh pr list --repo octo/app --label ac:review --state open --json number,title,labels,assignees,author,body --limit 100",
-                true,
-                &format!(r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME}}}]"#),
+            .with_list("pr", "octo/app", "ac:review", &format!(r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME}}}]"#),
             )
-            .with(
-                "gh pr list --repo octo/web --label ac:review --state open --json number,title,labels,assignees,author,body --limit 100",
-                true,
-                "[]",
+            .with_list("pr", "octo/web", "ac:review", "[]",
             );
         let probe = nothing_waiting(probe, &["octo/issues"], &["octo/app", "octo/web"]);
         let probe = approved(probe, "octo/issues", 9, "ac:triage");
@@ -719,6 +818,8 @@ next = ["done"]
             labeled("eager", "ac:triage", "2026-10-25T02:00:00Z"),
         ];
         let probe = with_history(probe, "octo/issues", 7, &eager, NO_EDITS);
+        // 8は、一覧に返っても、探したラベルが付いていないので拾わない
+        let probe = approved(probe, "octo/issues", 8, "ac:triage");
         let found = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap();
         let skipped: Vec<String> = found
             .skipped
@@ -773,13 +874,7 @@ next = ["done"]
             ("issue", "ac:review"),
             ("pr", "ac:review"),
         ] {
-            probe = probe.with(
-                &format!(
-                    "gh {kind} list --repo octo/issues --label {label} --state open --json number,title,labels,assignees,author,body --limit 100"
-                ),
-                true,
-                "[]",
-            );
+            probe = probe.with_list(kind, "octo/issues", label, "[]");
         }
         let probe = nothing_waiting(probe, &["octo/issues"], &["octo/issues"]);
         let made = std::cell::Cell::new(0);
@@ -801,25 +896,14 @@ next = ["done"]
     #[test]
     fn prs_made_by_agentcells_run_from_the_issue_approval_and_unreadable_items_are_skipped() {
         let (_dir, config) = config();
-        let list = |kind: &str, repo: &str, label: &str| {
-            format!(
-                "gh {kind} list --repo {repo} --label {label} --state open --json number,title,labels,assignees,author,body --limit 100"
-            )
-        };
         let probe = FakeProbe::default()
-            .with(
-                &list("issue", "octo/issues", "ac:triage"),
-                true,
-                &format!(r#"[{{"number":5,"title":"読めない","labels":[{{"name":"ac:triage"}}],{ME}}}]"#),
+            .with_list("issue", "octo/issues", "ac:triage", &format!(r#"[{{"number":5,"title":"読めない","labels":[{{"name":"ac:triage"}}],{ME}}}]"#),
             )
-            .with(
-                &list("pr", "octo/app", "ac:review"),
-                true,
-                &format!(
+            .with_list("pr", "octo/app", "ac:review", &format!(
                     r#"[{{"number":12,"title":"PR","labels":[{{"name":"ac:review"}}],{ME},"author":{{"login":"app/bot"}},"body":"Closes octo/issues#3"}}]"#
                 ),
             )
-            .with(&list("pr", "octo/web", "ac:review"), true, "[]");
+            .with_list("pr", "octo/web", "ac:review", "[]");
         let probe = nothing_waiting(probe, &["octo/issues"], &["octo/app", "octo/web"]);
         // agentcellsが作ったPRに、agentcellsがoperatorを割り当て、reviewのラベルを付けた
         let pr_events = [
@@ -883,27 +967,23 @@ next = ["implement", "done"]
         };
         let asked = "[agentcells] triage round 1\n\nAとBのどちらですか\n\n<!-- agentcells read-until 2026-10-25T03:00:00Z -->";
         let probe = FakeProbe::default()
-            .with(&list_command("issue", "octo/issues", "ac:triage"), true, "[]")
-            .with(&list_command("issue", "octo/issues", "ac:implement"), true, "[]")
-            .with(&list_command("pr", "octo/app", "ac:implement"), true, "[]")
-            .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
-            .with(
-                &waiting_command("issue", "octo/issues", "ac:needs-human"),
-                true,
-                &format!(
+            .with_list("issue", "octo/issues", "ac:triage", "[]")
+            .with_list("issue", "octo/issues", "ac:implement", "[]")
+            .with_list("pr", "octo/app", "ac:implement", "[]")
+            .with_list("pr", "octo/app", "ac:review", "[]")
+            .with_list("issue", "octo/issues", "ac:needs-human", &format!(
                     r#"[{{"number":21,"title":"まだ","labels":[{{"name":"ac:needs-human"}}],{ME}}},
                     {{"number":20,"title":"質問","labels":[{{"name":"ac:needs-human"}}],{ME}}},
-                    {{"number":22,"title":"やめた","labels":[{{"name":"ac:needs-human"}}],"assignees":[]}}]"#
+                    {{"number":22,"title":"やめた","labels":[{{"name":"ac:needs-human"}}],"assignees":[]}},
+                    {{"number":23,"title":"もう待っていない","labels":[{{"name":"bug"}}],{ME}}}]"#
                 ),
             )
-            .with(&waiting_command("pr", "octo/app", "ac:needs-human"), true, "[]")
-            .with(
-                &waiting_command("pr", "octo/app", "ac:in-review"),
-                true,
-                &format!(
+            .with_list("pr", "octo/app", "ac:needs-human", "[]")
+            .with_list("pr", "octo/app", "ac:in-review", &format!(
                     r#"[{{"number":30,"title":"検品","labels":[{{"name":"ac:in-review"}}],{ME},"author":{{"login":"me"}}}}]"#
                 ),
             );
+        // #23: 一覧に返っても、待っているラベルが付いていないので読まない
         // #20: 質問のあとに、operatorが答えた
         let probe = discussion::fake::with_item(
             probe,
@@ -994,13 +1074,10 @@ next = ["implement", "done"]
     fn replies_are_guarded_like_labels() {
         let (_dir, config) = config();
         let probe = FakeProbe::default()
-            .with(&list_command("issue", "octo/issues", "ac:triage"), true, "[]")
-            .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
-            .with(&list_command("pr", "octo/web", "ac:review"), true, "[]")
-            .with(
-                &waiting_command("issue", "octo/issues", "ac:needs-human"),
-                true,
-                &format!(
+            .with_list("issue", "octo/issues", "ac:triage", "[]")
+            .with_list("pr", "octo/app", "ac:review", "[]")
+            .with_list("pr", "octo/web", "ac:review", "[]")
+            .with_list("issue", "octo/issues", "ac:needs-human", &format!(
                     r#"[{{"number":20,"title":"質問","labels":[{{"name":"ac:needs-human"}}],{ME}}}]"#
                 ),
             );
@@ -1050,18 +1127,10 @@ next = ["implement", "done"]
         };
         let probe_with = |updated: &str| {
             let probe = FakeProbe::default()
-                .with(
-                    &list_command("issue", "octo/issues", "ac:triage"),
-                    true,
-                    "[]",
-                )
-                .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
-                .with(&list_command("pr", "octo/web", "ac:review"), true, "[]")
-                .with(
-                    &waiting_command("issue", "octo/issues", "ac:needs-human"),
-                    true,
-                    &listed(updated),
-                );
+                .with_list("issue", "octo/issues", "ac:triage", "[]")
+                .with_list("pr", "octo/app", "ac:review", "[]")
+                .with_list("pr", "octo/web", "ac:review", "[]")
+                .with_list("issue", "octo/issues", "ac:needs-human", &listed(updated));
             let probe = nothing_waiting(probe, &[], &["octo/app", "octo/web"]);
             let probe = discussion::fake::with_item(
                 probe,
