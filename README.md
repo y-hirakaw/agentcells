@@ -55,6 +55,7 @@ agentcells doctor
 | `agentcells labels sync [--dry-run]` | 設定ファイルのproductとcellに必要な `ac:` ラベルのうち、足りないものをGitHubに作る |
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |
 | `agentcells tick [--dry-run]` | 仕事（あなたが選んだ、cellのラベルが付いたIssue/PRと、人間を待っていたところにあなたが返事をしたもの）を探して、1件をcellで動かす。閉じたIssue/PRに残った `ac:` ラベルも外す。`--dry-run` なら表示だけ。implementはコミットを確かめてpushし、PRを作る。reviewはPRにレビューを投稿する |
+| `agentcells schedule install [--every <分>]` / `remove` | `tick` を決まった間隔（既定は10分）で動かすように、launchd（macOS）に登録する／外す。cellが動いている間は、次のtickは何もしない。ログは `~/.agentcells/logs/tick.log` |
 | `agentcells status` | 扱っているIssueごとに、今どこまで進んでいるか（作業中、返事待ち、検品待ち、順番待ち）と、いつからかを出す。PRができたIssueは、PRの状態を出す（読むだけ） |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |
 

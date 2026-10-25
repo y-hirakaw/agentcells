@@ -6,6 +6,22 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.11.0] - 2026-10-25
+
+### 追加
+
+- **`agentcells schedule install [--every <分>]` / `schedule remove`**: macOSのlaunchdに、`agentcells tick` を決まった間隔（既定は10分）で動かすように登録する／外す。今までは、tickを手で動かしたときしか動かなかったため
+  - cellが動いている間に次の時刻が来ても、二重には動かない（launchdは同じジョブを重ねて起動せず、tickはcellが終わるまでロックを持ち、動いているものには `ac:working` が付く）
+  - launchdはシェルの設定を読まないので、登録したときのPATHを渡す。そのPATHでgh、git、claude、betterleaksが見つからなければ、登録しない
+  - 出力は `~/.agentcells/logs/tick.log` に、時刻の行と一緒に残す
+  - 登録し直すときと外すときは、tickのロックを取ってから操作する。launchdがジョブを外すときに、cellを動かしているtickを止めてしまわないように
+  - ログが1MBを超えたら、`tick.log.1` に回す
+- `doctor` が、定期実行の登録を確かめる（macOSだけ）
+
+### 変えたこと
+
+- claudeが動いている間も、tick自身と見つけたclaudeの子孫を `stuck.json` に書いておく。tickが殺されても（ログアウト、Ctrl-Cなど）、別のプロセスグループで動くclaudeが残っている間は、次のtickが動かない。定期実行で目を離して動かすと、重なって動く危険が増えるため
+
 ## [0.10.0] - 2026-10-25
 
 ### 追加

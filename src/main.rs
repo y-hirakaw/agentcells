@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -15,6 +15,7 @@ use agentcells::labels;
 use agentcells::probe::SystemProbe;
 use agentcells::prompt;
 use agentcells::run;
+use agentcells::schedule;
 use agentcells::setup;
 use agentcells::status;
 use agentcells::tick;
@@ -56,6 +57,11 @@ enum Commands {
     },
     /// agentcellsが扱っているIssueごとに、今どこまで進んでいるかを出す（読むだけ）
     Status,
+    /// 定期実行（macOSのlaunchd）を扱う
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommands,
+    },
     /// cellとして動くAIが使うコマンド（agentcellsがAIを起動したときだけ使える）
     Cell {
         #[command(subcommand)]
@@ -85,6 +91,19 @@ enum CellCommands {
     },
     /// 設定（product.commands）に書いたコマンドを実行する
     Run { name: String },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommands {
+    /// `agentcells tick` を決まった間隔で動かすように、launchdに登録する（登録してあれば入れ替える）。
+    /// 仕事があれば、tickがcellを1件動かす。cellが動いている間は、次のtickは何もしない
+    Install {
+        /// 間隔（分）
+        #[arg(long, default_value_t = 10)]
+        every: u32,
+    },
+    /// 定期実行の登録を外す
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -192,6 +211,59 @@ fn run(command: Commands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Cell { command } => run_cell(command),
+        Commands::Schedule { command } => {
+            let plist = schedule_plist().ok_or_else(|| {
+                Error::new("定期実行の登録は、macOS（launchd）だけで使えます").with_hint(
+                    "ほかの環境では、cronなどで `agentcells tick` を定期的に動かしてください",
+                )
+            })?;
+            match command {
+                ScheduleCommands::Install { every } => {
+                    let program = std::env::current_exe()
+                        .and_then(|p| p.canonicalize())
+                        .map_err(|e| Error::new(format!("agentcellsの場所がわかりません: {e}")))?;
+                    let path_env =
+                        schedule::absolute_path(&std::env::var("PATH").unwrap_or_default());
+                    let agentcells_home = std::env::var_os("AGENTCELLS_HOME")
+                        .filter(|v| !v.is_empty())
+                        .map(PathBuf::from);
+                    let log = schedule::log_path(&home);
+                    let job = schedule::Job {
+                        program: &program,
+                        every,
+                        path_env: &path_env,
+                        agentcells_home: agentcells_home.as_deref(),
+                        log: &log,
+                    };
+                    schedule::install(&home, &SystemProbe, &plist, &job)?;
+                    println!(
+                        "登録しました: {every}分ごとに `{} tick` を動かします（最初は{every}分後）",
+                        program.display()
+                    );
+                    println!("ログ: {}", log.display());
+                    println!(
+                        "PATH: 今のPATHを渡します（gh、git、claude、betterleaksを同じ場所から使うため）"
+                    );
+                    let bin_dir = home.bin_dir().canonicalize().unwrap_or(home.bin_dir());
+                    if !program.starts_with(&bin_dir) {
+                        println!(
+                            "注意: {} の外のagentcellsを登録しました。install.sh で入れたもの（{}）から登録すると、更新しても登録し直さずに済みます",
+                            home.bin_dir().display(),
+                            home.bin_dir().join("agentcells").display()
+                        );
+                    }
+                    println!("外すときは `agentcells schedule remove` を実行してください");
+                }
+                ScheduleCommands::Remove => {
+                    if schedule::remove(&home, &SystemProbe, &plist)? {
+                        println!("定期実行の登録を外しました");
+                    } else {
+                        println!("定期実行は登録されていません");
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Status => {
             let config = Config::load(&home.config_path())?;
             let credentials_for =
@@ -237,6 +309,7 @@ fn run(command: Commands) -> Result<ExitCode> {
             })
         }
         Commands::Tick { dry_run } => {
+            schedule::rotate_log(&home);
             let Some(_lock) = tick::lock(&home)? else {
                 println!("ほかのtickが動いているので、何もしません");
                 return Ok(ExitCode::SUCCESS);
@@ -389,7 +462,8 @@ fn run_cell(command: CellCommands) -> Result<ExitCode> {
 
 fn print_doctor(home: &Home) -> ExitCode {
     let path = std::env::var_os("PATH");
-    let checks = doctor::run(home, path.as_deref(), &SystemProbe);
+    let plist = schedule_plist();
+    let checks = doctor::run(home, path.as_deref(), plist.as_deref(), &SystemProbe);
     for check in &checks {
         let mark = match check.status {
             Status::Ok => "✓",
@@ -409,6 +483,16 @@ fn print_doctor(home: &Home) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// 定期実行のplistの場所。launchdのない環境では `None`。
+fn schedule_plist() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|home| schedule::plist_path(Path::new(&home)))
 }
 
 /// PATHから、プログラムの絶対パスを探す。AIに別のものを動かされないよう、sandboxの外で決めておく。

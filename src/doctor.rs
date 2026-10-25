@@ -54,7 +54,13 @@ impl Check {
 }
 
 /// すべての項目を確かめる。前の項目がだめで確かめられないものは飛ばさずに、だめとして返す。
-pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Check> {
+/// `schedule` は、定期実行のplistの場所。launchdのない環境では `None`（確かめない）。
+pub fn run(
+    home: &Home,
+    path_env: Option<&OsStr>,
+    schedule: Option<&Path>,
+    probe: &dyn Probe,
+) -> Vec<Check> {
     let mut checks = vec![check_git(probe)];
     let gh = check_gh(probe);
     let gh_found = gh.status == Status::Ok;
@@ -74,6 +80,9 @@ pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Chec
         ));
     }
     checks.push(check_path(home, path_env));
+    if let Some(plist) = schedule {
+        checks.push(check_schedule(home, plist, probe));
+    }
     let (config_check, config) = check_config(home);
     // 設定が正しくないと、書き間違えたcellのラベルが抜けて「そろっています」と出ることがあるので、確かめない
     let config_ok = config_check.status != Status::Fail;
@@ -237,6 +246,43 @@ fn check_path(home: &Home, path_env: Option<&OsStr>) -> Check {
                 bin.display()
             ),
         )
+    }
+}
+
+fn check_schedule(home: &Home, plist: &Path, probe: &dyn Probe) -> Check {
+    const NAME: &str = "schedule";
+    match crate::schedule::state(probe, plist) {
+        crate::schedule::State::NotInstalled => Check::warn(
+            NAME,
+            "定期実行が登録されていません（tickは、手で動かしたときだけ動きます）",
+            "`agentcells schedule install --every 10` で、10分ごとに動くように登録できます",
+        ),
+        crate::schedule::State::NotLoaded => Check::warn(
+            NAME,
+            format!(
+                "{} はありますが、launchdに読み込まれていません",
+                plist.display()
+            ),
+            "`agentcells schedule install` で登録し直してください",
+        ),
+        crate::schedule::State::MissingProgram(program) => Check::fail(
+            NAME,
+            format!(
+                "定期実行が動かすagentcells（{}）がありません",
+                program.display()
+            ),
+            "install.sh で入れ直すか、`agentcells schedule install` で登録し直してください",
+        ),
+        crate::schedule::State::Loaded { every } => {
+            let every = every.map_or(String::new(), |m| format!("{m}分ごとに"));
+            Check::ok(
+                NAME,
+                format!(
+                    "{every}tickを動かしています（ログ: {}）",
+                    crate::schedule::log_path(home).display()
+                ),
+            )
+        }
     }
 }
 
@@ -535,7 +581,7 @@ private_key = "github-app.pem"
     fn missing_config_warns_and_points_to_setup() {
         let (_dir, home, path) = setup_home();
         std::fs::remove_file(home.config_path()).unwrap();
-        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "config").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("agentcells setup"));
     }
@@ -544,7 +590,7 @@ private_key = "github-app.pem"
     fn invalid_config_fails_with_problems() {
         let (_dir, home, path) = setup_home();
         std::fs::remove_file(home.root().join("triage.md")).unwrap();
-        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "config").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("triage.md"), "{}", check.detail);
     }
@@ -553,15 +599,30 @@ private_key = "github-app.pem"
     fn config_without_products_warns() {
         let (_dir, home, path) = setup_home();
         std::fs::write(home.config_path(), crate::config::TEMPLATE).unwrap();
-        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "config").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("[[product]]"));
     }
 
     #[test]
+    fn schedule_is_checked_only_when_launchd_is_available() {
+        let (dir, home, path) = setup_home();
+        let checks = run(&home, Some(&path), None, &healthy());
+        assert!(checks.iter().all(|c| c.name != "schedule"));
+        let plist = crate::schedule::plist_path(dir.path());
+        let check = find(
+            &run(&home, Some(&path), Some(&plist), &healthy()),
+            "schedule",
+        )
+        .clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.fix.unwrap().contains("agentcells schedule install"));
+    }
+
+    #[test]
     fn all_ok_when_everything_is_ready() {
         let (_dir, home, path) = setup_home();
-        let checks = run(&home, Some(&path), &healthy());
+        let checks = run(&home, Some(&path), None, &healthy());
         for c in &checks {
             assert_eq!(c.status, Status::Ok, "{}: {}", c.name, c.detail);
         }
@@ -573,7 +634,7 @@ private_key = "github-app.pem"
         let (_dir, home, path) = setup_home();
         let mut probe = healthy();
         probe.outputs.remove("gh --version");
-        let checks = run(&home, Some(&path), &probe);
+        let checks = run(&home, Some(&path), None, &probe);
         assert_eq!(find(&checks, "gh").status, Status::Fail);
         assert_eq!(find(&checks, "gh auth").status, Status::Fail);
         assert!(find(&checks, "gh").fix.is_some());
@@ -584,7 +645,7 @@ private_key = "github-app.pem"
     fn gh_not_logged_in_fails() {
         let (_dir, home, path) = setup_home();
         let probe = healthy().with("gh auth status", false, "");
-        let check = find(&run(&home, Some(&path), &probe), "gh auth").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "gh auth").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("gh auth login"));
     }
@@ -593,7 +654,7 @@ private_key = "github-app.pem"
     fn claude_not_logged_in_fails() {
         let (_dir, home, path) = setup_home();
         let probe = healthy().with("claude auth status", false, r#"{"loggedIn":false}"#);
-        let check = find(&run(&home, Some(&path), &probe), "claude auth").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "claude auth").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("claude auth login"));
     }
@@ -606,7 +667,7 @@ private_key = "github-app.pem"
             true,
             r#"{"loggedIn":true,"authMethod":"api_key"}"#,
         );
-        let check = find(&run(&home, Some(&path), &probe), "claude auth").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "claude auth").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("api_key"));
     }
@@ -615,7 +676,7 @@ private_key = "github-app.pem"
     fn unreadable_claude_auth_output_warns() {
         let (_dir, home, path) = setup_home();
         let probe = healthy().with("claude auth status", true, "Logged in");
-        let check = find(&run(&home, Some(&path), &probe), "claude auth").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "claude auth").clone();
         assert_eq!(check.status, Status::Warn);
     }
 
@@ -623,7 +684,7 @@ private_key = "github-app.pem"
     fn missing_home_fails_and_points_to_setup() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::new(dir.path().join("missing"));
-        let check = find(&run(&home, None, &healthy()), "home").clone();
+        let check = find(&run(&home, None, None, &healthy()), "home").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("agentcells setup"));
     }
@@ -656,7 +717,7 @@ private_key = "github-app.pem"
                 r#"{"slug":"agentcells-bot","permissions":{"contents":"write","metadata":"read"}}"#,
             ),
         );
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("issues: write"), "{}", check.detail);
         assert!(check.fix.unwrap().contains("/permissions"));
@@ -667,7 +728,7 @@ private_key = "github-app.pem"
         let (_dir, home, path) = setup_home();
         let mut probe = healthy();
         probe.outputs.remove("curl --version");
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("curl"));
     }
@@ -679,7 +740,7 @@ private_key = "github-app.pem"
         set_mode(&home.root().join("github-app.pem"), 0o644);
         let mut probe = healthy();
         probe.outputs.remove("curl --version");
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("chmod 600"));
     }
@@ -688,7 +749,7 @@ private_key = "github-app.pem"
     fn github_is_checked_even_when_prompts_are_missing() {
         let (_dir, home, path) = setup_home();
         std::fs::remove_file(home.root().join("triage.md")).unwrap();
-        let checks = run(&home, Some(&path), &healthy());
+        let checks = run(&home, Some(&path), None, &healthy());
         assert_eq!(find(&checks, "config").status, Status::Fail);
         let github = find(&checks, "github");
         assert_eq!(github.status, Status::Ok, "{}", github.detail);
@@ -698,7 +759,7 @@ private_key = "github-app.pem"
     fn github_check_warns_when_config_is_missing() {
         let (_dir, home, path) = setup_home();
         std::fs::remove_file(home.config_path()).unwrap();
-        let check = find(&run(&home, Some(&path), &healthy()), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "github").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("config"));
     }
@@ -708,7 +769,7 @@ private_key = "github-app.pem"
         let (_dir, home, path) = setup_home();
         std::fs::write(home.root().join("github-app.pem"), "not a key").unwrap();
         let probe = healthy();
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(
             check.detail.contains("秘密鍵として読めません"),
@@ -736,7 +797,7 @@ private_key = "github-app.pem"
             .with_output(installation("octo/web"), fake::response(200, r#"{"id":7}"#))
             .with_output(installation("octo/api"), not_found())
             .with_output(installation("octo/app"), not_found());
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(
             check.detail.ends_with("octo/api, octo/app"),
@@ -752,7 +813,7 @@ private_key = "github-app.pem"
             installation("octo/app"),
             fake::response(500, r#"{"message":"Server Error"}"#),
         );
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("HTTP 500"), "{}", check.detail);
         assert!(!check.detail.contains("インストールされていない"));
@@ -762,7 +823,7 @@ private_key = "github-app.pem"
     fn without_github_app_warns_that_ai_speaks_as_you() {
         let (_dir, home, path) = setup_home();
         std::fs::write(home.config_path(), CONFIG).unwrap();
-        let check = find(&run(&home, Some(&path), &healthy()), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "github").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(
             check.detail.contains("あなたのアカウント"),
@@ -776,7 +837,7 @@ private_key = "github-app.pem"
     fn github_app_not_installed_fails_with_install_url() {
         let (_dir, home, path) = setup_home();
         let probe = healthy().with_output(installation("octo/app"), not_found());
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("octo/app"), "{}", check.detail);
         assert!(
@@ -797,7 +858,7 @@ private_key = "github-app.pem"
                 r#"{"message":"A JSON web token could not be decoded"}"#,
             ),
         );
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("[github_app]"));
     }
@@ -807,7 +868,7 @@ private_key = "github-app.pem"
     fn readable_private_key_warns_with_chmod() {
         let (_dir, home, path) = setup_home();
         set_mode(&home.root().join("github-app.pem"), 0o644);
-        let check = find(&run(&home, Some(&path), &healthy()), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "github").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("chmod 600"));
     }
@@ -818,7 +879,7 @@ private_key = "github-app.pem"
         let (_dir, home, path) = setup_home();
         set_mode(&home.root().join("github-app.pem"), 0o644);
         let probe = healthy().with_output(installation("octo/app"), not_found());
-        let check = find(&run(&home, Some(&path), &probe), "github").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "github").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(check.fix.unwrap().contains("chmod 600"));
     }
@@ -827,7 +888,7 @@ private_key = "github-app.pem"
     fn bin_outside_path_warns_with_export_line() {
         let (_dir, home, _path) = setup_home();
         let path = OsString::from("/usr/bin:/bin");
-        let check = find(&run(&home, Some(&path), &healthy()), "PATH").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "PATH").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.unwrap().contains("export PATH="));
     }
@@ -840,7 +901,7 @@ private_key = "github-app.pem"
             "cells = [\"triage\"]\n\n[product.sandbox]\nread = [\"~\"]",
         );
         std::fs::write(home.config_path(), format!("{text}{GITHUB_APP}")).unwrap();
-        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "config").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("広すぎます"), "{}", check.detail);
     }
@@ -858,7 +919,7 @@ private_key = "github-app.pem"
                 stderr: String::new(),
             },
         );
-        let check = find(&run(&home, Some(&path), &probe), "labels").clone();
+        let check = find(&run(&home, Some(&path), None, &probe), "labels").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(
             check
@@ -888,7 +949,7 @@ private_key = "github-app.pem"
             ),
         );
         std::fs::write(home.config_path(), format!("{text}{GITHUB_APP}")).unwrap();
-        let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
+        let check = find(&run(&home, Some(&path), None, &healthy()), "config").clone();
         assert_eq!(check.status, Status::Fail);
         assert!(
             check.detail.contains("開けられない場所"),

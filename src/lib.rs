@@ -15,6 +15,7 @@ pub mod probe;
 pub mod prompt;
 pub mod review;
 pub mod run;
+pub mod schedule;
 pub mod settings;
 pub mod setup;
 pub mod status;

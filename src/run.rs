@@ -65,11 +65,18 @@ pub struct Leftover {
 
 /// 止めきれなかったプロセスの目印（`~/.agentcells/stuck.json`）。これがある間、tickは何も動かさない。
 /// 次の仕事の書き込みのトークンを、残ったプロセスに読ませないため。
+///
+/// claudeが動いている間も、tick自身と、それまでに見つけたclaudeの子孫を書いておく。tickが殺されると
+/// （launchdの登録し直し、ログアウト、Ctrl-Cなど）、後片付けをせずに終わり、別のプロセスグループで動く
+/// claudeは残る。そのときも、残ったプロセスがなくなるまで、次のtickが動かないようにするため。
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 struct Stuck {
     /// どの仕事か（`<owner>/<repo>/<番号>`）
     job: String,
     processes: Vec<Leftover>,
+    /// claudeが動いている間に書いたときの、tick自身。これが生きていれば、まだ動いている途中で、残ったものではない
+    #[serde(default)]
+    tick: Option<Leftover>,
 }
 
 fn stuck_path(home: &Home) -> PathBuf {
@@ -88,11 +95,12 @@ pub fn stuck(home: &Home) -> Option<String> {
         ));
     };
     let rows = process_table();
-    let alive: Vec<&Leftover> = stuck
-        .processes
-        .iter()
-        .filter(|p| rows.iter().any(|r| r.0 == p.pid && r.3 == p.started))
-        .collect();
+    let running = |p: &Leftover| rows.iter().any(|r| r.0 == p.pid && r.3 == p.started);
+    // 書いたtickがまだ動いていれば、cellが動いている途中（次のtickは、tickのロックで止まる）
+    if stuck.tick.as_ref().is_some_and(running) {
+        return None;
+    }
+    let alive: Vec<&Leftover> = stuck.processes.iter().filter(|p| running(p)).collect();
     if alive.is_empty() {
         let _ = std::fs::remove_file(&path);
         return None;
@@ -205,6 +213,7 @@ impl Runner<'_> {
                 let stuck = Stuck {
                     job: place.relative.display().to_string(),
                     processes: leftovers,
+                    tick: None,
                 };
                 if let Ok(text) = serde_json::to_string_pretty(&stuck) {
                     let _ = std::fs::write(stuck_path(self.home), text);
@@ -920,6 +929,10 @@ impl Ready {
             timeout: Duration::from_secs(u64::from(cell.timeout_minutes) * 60),
             log_dir: &place.run,
             job_dirs: &self.job_dirs,
+            record: Some((
+                stuck_path(runner.home),
+                place.relative.display().to_string(),
+            )),
         }
     }
 }
@@ -1246,6 +1259,8 @@ struct ClaudeRun<'a> {
     log_dir: &'a Path,
     /// この仕事の場所（worktree、一時ディレクトリ、キャッシュ）。ここで動いているプロセスは、終わったら止める
     job_dirs: &'a [PathBuf],
+    /// 動いている間、見つけたプロセスを書いておく目印（`stuck.json`）と、どの仕事か（[`Stuck`]）
+    record: Option<(PathBuf, String)>,
 }
 
 /// claudeの終わり方。プロセスを止めきれなかったときは、ここには来ない（`Failure::Unstopped`）。
@@ -1380,8 +1395,24 @@ impl ClaudeRun<'_> {
             ..Processes::default()
         };
         let deadline = Instant::now() + self.timeout;
+        let me = std::process::id();
+        let tick = process_table()
+            .into_iter()
+            .find(|r| r.0 == me)
+            .map(|r| Leftover {
+                pid: me,
+                started: r.3,
+            });
+        let mut recorded = 0;
         let timed_out = loop {
             seen.collect(pid);
+            // 見つけたものが増えたら書き直す（tickが殺されても、次のtickが残ったものに気づけるように）
+            if let Some((path, job)) = &self.record
+                && seen.known.len() != recorded
+            {
+                recorded = seen.known.len();
+                seen.record(path, job, tick.clone());
+            }
             match child.try_wait() {
                 Ok(Some(_)) => break false,
                 Ok(None) if Instant::now() >= deadline => break true,
@@ -1401,6 +1432,10 @@ impl ClaudeRun<'_> {
         let _ = child.wait();
         if let Err(leftovers) = stopped {
             return Err(Failure::Unstopped(leftovers));
+        }
+        // すべて止めたので、動いている間の目印は要らない
+        if let Some((path, _)) = &self.record {
+            let _ = std::fs::remove_file(path);
         }
         if timed_out {
             return Ok(ClaudeEnd::TimedOut);
@@ -1525,6 +1560,29 @@ fn process_table() -> Vec<(u32, u32, u32, String)> {
 }
 
 impl Processes {
+    /// 覚えたプロセスを、動いている間の目印として書く。書けなくても、cellは止めない。
+    fn record(&self, path: &Path, job: &str, tick: Option<Leftover>) {
+        let stuck = Stuck {
+            job: job.to_string(),
+            processes: self
+                .known
+                .iter()
+                .map(|(pid, started)| Leftover {
+                    pid: *pid,
+                    started: started.clone(),
+                })
+                .collect(),
+            tick,
+        };
+        // 書いている途中で殺されても壊れた目印が残らないよう、別のファイルに書いてから置き換える
+        if let Ok(text) = serde_json::to_string_pretty(&stuck) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
     /// 今のプロセスの一覧から、`root` の子孫（覚えているものの子孫も）と、覚えているグループのものを足す。
     /// 今の一覧を返す。
     fn collect(&mut self, root: u32) -> Vec<(u32, u32, u32, String)> {
@@ -1677,6 +1735,7 @@ mod tests {
             timeout,
             log_dir: dir,
             job_dirs: &[],
+            record: None,
         }
     }
 
@@ -1817,6 +1876,7 @@ mod tests {
             timeout: Duration::from_secs(300),
             log_dir: dir.path(),
             job_dirs: &job_dirs,
+            record: None,
         };
         let end = run.run().unwrap_or_else(|_| panic!("failed"));
         assert!(matches!(end, ClaudeEnd::Exited(_)));
@@ -1889,7 +1949,10 @@ mod tests {
             .map(|r| r.3)
             .unwrap();
         let e = runner.fail(
-            Failure::Unstopped(vec![Leftover { pid: me, started }]),
+            Failure::Unstopped(vec![Leftover {
+                pid: me,
+                started: started.clone(),
+            }]),
             &cell,
             &work,
             &issue,
@@ -1915,6 +1978,16 @@ mod tests {
         .unwrap();
         assert!(stuck(&home).is_none());
         assert!(!stuck_path(&home).exists());
+        // 動いている間の目印は、書いたtickが動いていれば、残ったものとみなさない。tickが殺されていれば、止める
+        let alive = format!(r#"{{"pid":{me},"started":"{started}"}}"#);
+        let running =
+            |tick: &str| format!(r#"{{"job":"octo/app/3","processes":[{alive}],"tick":{tick}}}"#);
+        std::fs::write(stuck_path(&home), running(&alive)).unwrap();
+        assert!(stuck(&home).is_none());
+        assert!(stuck_path(&home).exists());
+        std::fs::write(stuck_path(&home), running(r#"{"pid":1,"started":"never"}"#)).unwrap();
+        assert!(stuck(&home).unwrap().contains(&me.to_string()));
+        std::fs::remove_file(stuck_path(&home)).unwrap();
 
         // ふつうの失敗なら、人間に回すコメントとラベルを書く
         runner.fail(

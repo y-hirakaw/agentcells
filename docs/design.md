@@ -144,6 +144,23 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
   - `--dry-run` なら、外す予定を出すだけ。読めなかったり外せなかったりしても、仕事は進める（次のtickでまた試す）
   - 閉じたものを開き直しても、ラベルは戻らない。人間を待っていたものを開き直して続けるときは、待っているラベルかcellのラベルを付け直す
 - `~/.agentcells/tick.lock` をロックして、tickを同時に2つ動かさない。ほかのtickが動いていれば、何もせずに終わる
+
+### 定期実行（schedule）
+
+`agentcells schedule install [--every <分>]`（既定は10分）で、macOSのlaunchdに、tickを決まった間隔で動かすように登録する。`agentcells schedule remove` で外す。
+
+- `~/Library/LaunchAgents/dev.agentcells.tick.plist` を書き、`launchctl bootstrap gui/<uid>` で読み込む。登録してあれば、外してから読み込み直す（外した直後は読み込めないことがあるので、1秒おきに5回までやり直す）。ログインのたびに、launchdが読み込む
+- 登録し直すときと外すときは、tickのロックを取ってからlaunchdを操作する。取れなければ（tickが動いていれば）断る。launchdはジョブを外すときに、動いているtickを止めるので、cellが動いている途中で止めると、別のプロセスグループで動くclaudeが残るため
+- cellが動いている間に次の時刻が来ても、二重には動かない
+  - launchdは、同じジョブがまだ動いていれば、次を起動しない
+  - tickは、cellが終わるまで `tick.lock` を持つ。取れなければ何もせずに終わる
+  - 動いているIssue/PRには `ac:working` が付いていて、tickはそれを拾わない
+  - tickが殺されても（ログアウト、Ctrl-Cなど）、残ったclaudeとは重ならない。claudeが動いている間、tick自身と見つけたclaudeの子孫を `stuck.json` に書いておくため（「1件を動かす流れ」）
+- launchdから動くtickは、シェルの設定を読まない。そこで、登録したときのPATHをplistに書く（gh、git、claude、betterleaksを、手元と同じ場所から使うため）。相対パスの要素（`.` や空の要素）は外す（launchdでは作業のディレクトリが `/` なので）。登録の前に、そのPATHで4つとも実行できるファイルとして見つかることを確かめる。`AGENTCELLS_HOME` を設定して登録したら、それも渡す
+- 動かすのは、登録したagentcells（`schedule install` を実行したもの）。`~/.agentcells/bin` の外のもの（`cargo run` など）なら、そう知らせる。install.shで入れたものなら、更新しても登録し直さずに済む
+- tickの出力は `~/.agentcells/logs/tick.log` に足していく。読みやすいよう、tickの前に時刻の行を書く（何もないtickでも1回に2行ほど増える）。1MBを超えたら、tickの最初に `tick.log.1` に回す（前の `.1` は消える）
+- 動き出すのは、登録してから最初の間隔がたったとき（`RunAtLoad` はしない。登録した直後に、思わずcellが動かないように）。スリープ中の時刻は、起きたときにまとめて1回動く
+- `doctor` は、登録していなければ注意を、plistにあるagentcellsがなければ失敗を出す。macOS以外では確かめない（cronなどで `agentcells tick` を動かす）
 - 試すときは、環境変数 `AGENTCELLS_MODEL`（`haiku` など）で `claude -p` のモデルを変えられる
 
 ### 1件を動かす流れ
@@ -204,6 +221,7 @@ AIが動かしたプロセスを止める:
   - 環境変数に、実行ごとの目印 `AGENTCELLS_RUN=<目印>` を持つもの（Linuxだけ。macOSでは、sandboxの中のプロセスの環境変数を読めない。確かめた）
 - 止めたあとに残っていないことを確かめる。止めきれなければ、書き込みのトークンを作らず、GitHubには何も書かずにエラーにする（コメントもラベルの付け替えもしない）。`ac:working` は付いたままなので、次のtickもその仕事を拾わない。人が残ったプロセスを止め、`ac:working` を外して、cellのラベルを付け直す
 - 止めきれなかったときは、残ったプロセスのPIDと始まった時刻を `~/.agentcells/stuck.json` に残す（コマンドは `runs/.../error.txt` に書く）。これがある間、tickはほかの仕事も動かさない（`--dry-run` も止まる）。`doctor` も失敗にする。次の仕事の書き込みのトークンを、残ったプロセスに読ませないため。目印にあるPIDと始まった時刻のプロセスが1つもなくなれば、tickが目印を消して、また動く
+- claudeが動いている間も、tick自身と、それまでに見つけたclaudeの子孫を `stuck.json` に書いておく（見つけたものが増えるたびに書き直し、すべて止めたら消す）。書いたtickが動いていれば、動いている途中なので、残ったものとはみなさない。tickが殺されると（launchdの登録し直し、ログアウト、Ctrl-Cなど）、後片付けをせずに終わり、別のプロセスグループで動くclaudeは残る。そのときも、残ったプロセスがなくなるまで、次のtickが動かないようにするため。Issue/PRには `ac:working` が残るので、人が片付ける
 - プロセスグループの番号も使い回されるので、覚えたプロセス（始まった時刻も同じもの）がまだいるグループだけを止める
 - 本物の `claude -p` で、AIが `nohup ... &` で残したプロセスが止まることを確かめるテストがある（`cargo test -- --ignored real_claude`。haikuを使う）
 
