@@ -38,9 +38,16 @@ cd agentcells
 
 `~/.agentcells/bin/agentcells` に入り、続けて `agentcells setup` が動きます。足りないものがあれば、直し方が表示されます。置き場所は環境変数 `AGENTCELLS_HOME` で変えられます。
 
+新しい版にするときは、cloneしたリポジトリで次を実行します。入れ直さないと、手元の `agentcells` は古い版のままです（`agentcells --version` で確かめられます）。新しい版で設定の項目が増えたときは、[CHANGELOG.md](CHANGELOG.md) に書いてあります。
+
+```sh
+git pull
+./install.sh
+```
+
 | コマンド | 何をするか |
 | --- | --- |
-| `agentcells doctor` | 動かすのに必要なものがそろっているかを確かめ、だめなら直し方を出す |
+| `agentcells doctor` | 動かすのに必要なもの（ツール、ログイン、設定、GitHub App、ラベルなど）がそろっているかを確かめ、だめなら直し方を出す |
 | `agentcells setup` | 作業データの置き場所と、設定ファイルの雛形（`config.toml`）を用意する（何度実行してもよい） |
 | `agentcells labels sync [--dry-run]` | 設定ファイルのproductとcellに必要な `ac:` ラベルのうち、足りないものをGitHubに作る |
 | `agentcells files apply <owner/repo> <worktree>` | gitignoreされたファイルを、worktreeの同じパスに置く |

@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::config::Config;
 use crate::github;
 use crate::home::Home;
+use crate::labels;
 use crate::probe::Probe;
 use crate::settings;
 
@@ -69,6 +70,11 @@ pub fn run(home: &Home, path_env: Option<&OsStr>, probe: &dyn Probe) -> Vec<Chec
     let (config_check, config) = check_config(home);
     checks.push(config_check);
     checks.push(check_github(config.as_ref(), probe));
+    if let Some(config) = &config
+        && !config.products.is_empty()
+    {
+        checks.push(check_labels(config, probe));
+    }
     checks
 }
 
@@ -285,6 +291,28 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
     (check, Some(config))
 }
 
+/// cellが使うラベルが、リポジトリにそろっているか。足りなければ、作り方を出す（作りはしない）。
+fn check_labels(config: &Config, probe: &dyn Probe) -> Check {
+    const NAME: &str = "labels";
+    match labels::missing(config, probe) {
+        Ok(missing) if missing.is_empty() => Check::ok(NAME, "必要なラベルがそろっています"),
+        Ok(missing) => Check::fail(
+            NAME,
+            format!(
+                "足りないラベルがあります:\n{}",
+                labels::describe_missing(&missing)
+            ),
+            "`agentcells labels sync` で作れます（あるラベルは触りません）",
+        ),
+        Err(e) => Check::warn(
+            NAME,
+            format!("ラベルを確かめられません: {}", e.message),
+            e.hint
+                .unwrap_or_else(|| "ghのログインとリポジトリの名前を確かめてください".to_string()),
+        ),
+    }
+}
+
 /// 書き込みに使うアカウントを確かめる。GitHub Appを推奨し、なければghのアカウントで動くことを知らせる。
 fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
     const NAME: &str = "github";
@@ -420,6 +448,11 @@ mod tests {
             .with("gh auth status", true, "")
             .with("claude --version", true, "2.1.310 (Claude Code)\n")
             .with("betterleaks version", true, "1.9.0\n")
+            .with(
+                "gh label list --repo octo/app --json name --limit 1000",
+                true,
+                r#"[{"name":"ac:working"},{"name":"ac:needs-human"},{"name":"ac:triage"}]"#,
+            )
             .with(
                 "claude auth status",
                 true,
@@ -800,6 +833,29 @@ private_key = "github-app.pem"
         let check = find(&run(&home, Some(&path), &healthy()), "config").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("広すぎます"), "{}", check.detail);
+    }
+
+    #[test]
+    fn missing_labels_fail_and_point_to_labels_sync() {
+        let (_dir, home, path) = setup_home();
+        let mut probe = healthy();
+        probe.outputs.insert(
+            "gh label list --repo octo/app --json name --limit 1000".to_string(),
+            crate::probe::Output {
+                success: true,
+                code: Some(0),
+                stdout: r#"[{"name":"ac:working"}]"#.to_string(),
+                stderr: String::new(),
+            },
+        );
+        let check = find(&run(&home, Some(&path), &probe), "labels").clone();
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("octo/app: ac:needs-human, ac:triage"),
+            "{}",
+            check.detail
+        );
+        assert!(check.fix.unwrap().contains("agentcells labels sync"));
     }
 
     #[test]

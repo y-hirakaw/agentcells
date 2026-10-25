@@ -96,6 +96,26 @@ pub fn sync(
 }
 
 /// GitHubのラベル名は大文字と小文字を区別しないので、小文字にそろえて返す。
+/// 足りないラベルがあるリポジトリと、そのラベル。`doctor` と `tick` が知らせるのに使う（作りはしない）。
+pub fn missing(config: &Config, probe: &dyn Probe) -> Result<Vec<(RepoName, Vec<Label>)>> {
+    Ok(sync(config, probe, true)?
+        .into_iter()
+        .filter(|(_, labels)| !labels.is_empty())
+        .collect())
+}
+
+/// 足りないラベルを、1つのリポジトリにつき1行で並べる。
+pub fn describe_missing(missing: &[(RepoName, Vec<Label>)]) -> String {
+    missing
+        .iter()
+        .map(|(repo, labels)| {
+            let names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+            format!("{repo}: {}", names.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn existing_labels(repo: &RepoName, probe: &dyn Probe) -> Result<HashSet<String>> {
     let repo_arg = repo.to_string();
     let args = [
@@ -354,6 +374,20 @@ prompt = "review.md"
         let (_dir, config) = config();
         let err = sync(&config, &FakeProbe::default(), true).unwrap_err();
         assert!(err.hint.unwrap().contains("agentcells doctor"));
+    }
+
+    #[test]
+    fn missing_lists_only_repos_that_lack_labels() {
+        let (_dir, config) = config();
+        let probe = with_empty_list(FakeProbe::default(), &["octo/app", "octo/web"]).with(
+            "gh label list --repo octo/issues --json name --limit 1000",
+            true,
+            r#"[{"name":"ac:working"},{"name":"ac:needs-human"},{"name":"ac:triage"},{"name":"ac:implement"},{"name":"ac:review"}]"#,
+        );
+        let missing = missing(&config, &probe).unwrap();
+        let repos: Vec<String> = missing.iter().map(|(r, _)| r.to_string()).collect();
+        assert!(!repos.contains(&"octo/issues".to_string()), "{repos:?}");
+        assert!(describe_missing(&missing).contains("ac:working"));
     }
 
     #[test]
