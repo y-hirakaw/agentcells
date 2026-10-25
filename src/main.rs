@@ -217,7 +217,9 @@ fn run(command: Commands) -> Result<ExitCode> {
                 Ok(_) => {}
                 Err(e) => println!("注意: ラベルを確かめられません: {}\n", e.message),
             }
-            let found = tick::find(&config, &SystemProbe, &credentials_for, &actors)?;
+            let mut quiet = tick::Quiet::load(&home);
+            let found = tick::find(&config, &SystemProbe, &credentials_for, &actors, &mut quiet)?;
+            quiet.save(&home);
             for (w, reason) in &found.skipped {
                 println!("見送り: {}（{reason}）", w.describe());
             }

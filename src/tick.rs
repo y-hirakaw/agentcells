@@ -8,10 +8,10 @@
 //!
 //! そのうち、cellを使う人（operator）が自分で決めたものだけを動かす（[`guard`]）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Product, Target};
 use crate::discussion;
@@ -99,6 +99,9 @@ struct Listed {
     author: Option<ListedUser>,
     #[serde(default)]
     body: String,
+    /// 人間を待っているものだけ読む
+    #[serde(default, rename = "updatedAt")]
+    updated_at: String,
 }
 
 impl Listed {
@@ -137,6 +140,7 @@ pub fn find(
     probe: &dyn Probe,
     credentials_for: &dyn Fn(&RepoName) -> Result<Credentials>,
     actors: &Actors,
+    quiet: &mut Quiet,
 ) -> Result<Found> {
     let mut found = Found::default();
     let mut replied = Found::default();
@@ -169,7 +173,7 @@ pub fn find(
             for &item in &cell.on {
                 for repo in repos_for(product, item) {
                     let env = cache[repo].gh_env()?;
-                    let mut items = list(probe, &env, item, repo, &cell.label)?;
+                    let mut items = list(probe, &env, item, repo, &cell.label, FIELDS)?;
                     items.sort_by_key(|i| i.number);
                     for i in items {
                         // GitHubのラベル名は大文字・小文字を区別しない。人間を待っているものでも、
@@ -200,7 +204,8 @@ pub fn find(
                 }
                 for repo in repos_for(product, item) {
                     let env = cache[repo].gh_env()?;
-                    let mut items = list(probe, &env, item, repo, waiting.label())?;
+                    let fields = format!("{FIELDS},updatedAt");
+                    let mut items = list(probe, &env, item, repo, waiting.label(), &fields)?;
                     items.sort_by_key(|i| i.number);
                     for i in items {
                         // cellのラベルが付いていれば、上でそのcellの仕事として見ている
@@ -220,11 +225,16 @@ pub fn find(
                             title: i.title.clone(),
                             waiting: Some(waiting),
                         };
+                        // 前のtickで返事がなく、そのあと何も変わっていなければ、読み直さない
+                        let key = format!("{repo}#{}", i.number);
+                        if quiet.still_quiet(&key, &i.updated_at) {
+                            continue;
+                        }
                         let resumed = discussion::fetch(probe, &env, item, repo, i.number)
                             .map_err(|e| format!("やり取りを読めません: {}", e.message))
                             .and_then(|d| resumed_cell(config, product, item, waiting, &d, actors));
                         match resumed {
-                            Ok(None) => {}
+                            Ok(None) => quiet.remember(key, &i.updated_at),
                             Ok(Some(cell)) => {
                                 work.cell = cell;
                                 checker.check(&mut replied, work, &i, waiting.label())?;
@@ -384,12 +394,102 @@ impl Checker<'_> {
     }
 }
 
+/// 一覧で読む項目。
+const FIELDS: &str = "number,title,labels,assignees,author,body";
+
+/// 人間を待っているもので、返事がなかったときの、Issue/PRの更新時刻（`~/.agentcells/waiting.json`）。
+/// 更新時刻が変わっていなければ（コメントもレビューも増えていなければ）、やり取りを読み直さない。
+/// 待っているものはたまっていくので、tickのたびに全部を読むと、APIを使いすぎるため。
+///
+/// 手元の目安なので、取りこぼしても遅れるだけにする。
+/// - 読んでから [`QUIET_FOR`] が過ぎたら、更新時刻が同じでも読み直す。更新時刻は秒までなので、同じ秒に
+///   届いた返事は時刻が変わらず、どの操作で更新時刻が変わるかを、GitHubが保証してもいないため
+/// - 読めなかったり壊れていたりすれば、全部を読み直す
+#[derive(Debug, Default)]
+pub struct Quiet {
+    /// 前のtickで覚えたもの（`owner/repo#番号` → 覚えたこと）
+    checked: BTreeMap<String, Checked>,
+    /// このtickで覚えるもの。前のものは引き継がない（待たなくなったものを残さないため）
+    next: BTreeMap<String, Checked>,
+    /// 今の時刻（UNIXの秒）
+    now: u64,
+}
+
+/// 返事がないと読んだときのこと。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Checked {
+    /// そのときのIssue/PRの更新時刻（GitHubの時刻）
+    updated_at: String,
+    /// 読んだ時刻（手元の時計。UNIXの秒）
+    read_at: u64,
+}
+
+/// 返事がないと読んだものを、読み直さずにおく長さ（秒）。
+const QUIET_FOR: u64 = 30 * 60;
+
+impl Quiet {
+    fn path(home: &Home) -> std::path::PathBuf {
+        home.root().join("waiting.json")
+    }
+
+    pub fn load(home: &Home) -> Self {
+        let checked = std::fs::read_to_string(Self::path(home))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        Quiet {
+            checked,
+            next: BTreeMap::new(),
+            now,
+        }
+    }
+
+    /// このtickで覚えたものを書く。書けなくても、次のtickで読み直すだけなので、エラーにしない。
+    pub fn save(&self, home: &Home) {
+        if let Ok(text) = serde_json::to_string_pretty(&self.next) {
+            let _ = std::fs::write(Self::path(home), text);
+        }
+    }
+
+    /// 前に返事がないと読んでから、更新されておらず、時間もたっていなければ、覚えたことを引き継いで `true`。
+    fn still_quiet(&mut self, key: &str, updated_at: &str) -> bool {
+        let Some(checked) = self.checked.get(key) else {
+            return false;
+        };
+        let quiet = !updated_at.is_empty()
+            && checked.updated_at == updated_at
+            && self.now.saturating_sub(checked.read_at) < QUIET_FOR
+            // 手元の時計が戻ったときも、読み直す
+            && checked.read_at <= self.now;
+        if quiet {
+            self.next.insert(key.to_string(), checked.clone());
+        }
+        quiet
+    }
+
+    /// 今読んで、返事がなかった。
+    fn remember(&mut self, key: String, updated_at: &str) {
+        if !updated_at.is_empty() {
+            let checked = Checked {
+                updated_at: updated_at.to_string(),
+                read_at: self.now,
+            };
+            self.next.insert(key, checked);
+        }
+    }
+}
+
 fn list(
     probe: &dyn Probe,
     env: &[(&str, &str)],
     item: Target,
     repo: &RepoName,
     label: &str,
+    fields: &str,
 ) -> Result<Vec<Listed>> {
     let kind = match item {
         Target::Issue => "issue",
@@ -406,7 +506,7 @@ fn list(
         "--state",
         "open",
         "--json",
-        "number,title,labels,assignees,author,body",
+        fields,
         "--limit",
         "100",
     ];
@@ -482,14 +582,23 @@ next = ["done"]
         )
     }
 
+    /// 人間を待っているものの一覧は、更新時刻も読む。
+    fn waiting_command(kind: &str, repo: &str, label: &str) -> String {
+        list_command(kind, repo, label).replace(",body ", ",body,updatedAt ")
+    }
+
     /// 人間を待っているものはない。
     fn nothing_waiting(mut probe: FakeProbe, issues: &[&str], prs: &[&str]) -> FakeProbe {
         for repo in issues {
-            probe = probe.with(&list_command("issue", repo, "ac:needs-human"), true, "[]");
+            probe = probe.with(
+                &waiting_command("issue", repo, "ac:needs-human"),
+                true,
+                "[]",
+            );
         }
         for repo in prs {
             for label in ["ac:needs-human", "ac:in-review"] {
-                probe = probe.with(&list_command("pr", repo, label), true, "[]");
+                probe = probe.with(&waiting_command("pr", repo, label), true, "[]");
             }
         }
         probe
@@ -535,7 +644,7 @@ next = ["done"]
             labeled("eager", "ac:triage", "2026-10-25T02:00:00Z"),
         ];
         let probe = with_history(probe, "octo/issues", 7, &eager, NO_EDITS);
-        let found = find(&config, &probe, &token, &actors()).unwrap();
+        let found = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap();
         let skipped: Vec<String> = found
             .skipped
             .iter()
@@ -604,7 +713,7 @@ next = ["done"]
             token(repo)
         };
         assert!(
-            find(&config, &probe, &counting, &actors())
+            find(&config, &probe, &counting, &actors(), &mut Quiet::default())
                 .unwrap()
                 .work
                 .is_empty()
@@ -646,7 +755,7 @@ next = ["done"]
         // 元のIssueは、operatorが承認している
         let probe = approved(probe, "octo/issues", 3, "ac:triage");
         // octo/issues#5 の履歴は、応答を用意していないので読めない
-        let found = find(&config, &probe, &token, &actors()).unwrap();
+        let found = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap();
         let work: Vec<String> = found.work.iter().map(Work::describe).collect();
         assert_eq!(work, vec!["review PR octo/app#12「PR」"]);
         assert_eq!(found.skipped.len(), 1);
@@ -704,7 +813,7 @@ next = ["implement", "done"]
             .with(&list_command("pr", "octo/app", "ac:implement"), true, "[]")
             .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
             .with(
-                &list_command("issue", "octo/issues", "ac:needs-human"),
+                &waiting_command("issue", "octo/issues", "ac:needs-human"),
                 true,
                 &format!(
                     r#"[{{"number":21,"title":"まだ","labels":[{{"name":"ac:needs-human"}}],{ME}}},
@@ -712,9 +821,9 @@ next = ["implement", "done"]
                     {{"number":22,"title":"やめた","labels":[{{"name":"ac:needs-human"}}],"assignees":[]}}]"#
                 ),
             )
-            .with(&list_command("pr", "octo/app", "ac:needs-human"), true, "[]")
+            .with(&waiting_command("pr", "octo/app", "ac:needs-human"), true, "[]")
             .with(
-                &list_command("pr", "octo/app", "ac:in-review"),
+                &waiting_command("pr", "octo/app", "ac:in-review"),
                 true,
                 &format!(
                     r#"[{{"number":30,"title":"検品","labels":[{{"name":"ac:in-review"}}],{ME},"author":{{"login":"me"}}}}]"#
@@ -790,7 +899,7 @@ next = ["implement", "done"]
         ];
         let probe = with_history(probe, "octo/app", 30, &pr_events, NO_EDITS);
 
-        let found = find(&config, &probe, &token, &actors()).unwrap();
+        let found = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap();
         let work: Vec<String> = found.work.iter().map(Work::describe).collect();
         assert_eq!(
             work,
@@ -814,7 +923,7 @@ next = ["implement", "done"]
             .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
             .with(&list_command("pr", "octo/web", "ac:review"), true, "[]")
             .with(
-                &list_command("issue", "octo/issues", "ac:needs-human"),
+                &waiting_command("issue", "octo/issues", "ac:needs-human"),
                 true,
                 &format!(
                     r#"[{{"number":20,"title":"質問","labels":[{{"name":"ac:needs-human"}}],{ME}}}]"#
@@ -842,7 +951,7 @@ next = ["implement", "done"]
             labeled("eager", "ac:needs-human", "2026-10-25T03:06:00Z"),
         ];
         let probe = with_history(probe, "octo/issues", 20, &events, NO_EDITS);
-        let found = find(&config, &probe, &token, &actors()).unwrap();
+        let found = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap();
         assert!(found.work.is_empty());
         assert_eq!(found.skipped.len(), 1);
         assert!(
@@ -855,10 +964,89 @@ next = ["implement", "done"]
     }
 
     #[test]
+    fn waiting_items_without_changes_are_not_read_again() {
+        let (_dir, config) = config();
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = Home::new(home_dir.path().to_path_buf());
+        let listed = |updated: &str| {
+            format!(
+                r#"[{{"number":21,"title":"まだ","labels":[{{"name":"ac:needs-human"}}],{ME},"updatedAt":"{updated}"}}]"#
+            )
+        };
+        let probe_with = |updated: &str| {
+            let probe = FakeProbe::default()
+                .with(
+                    &list_command("issue", "octo/issues", "ac:triage"),
+                    true,
+                    "[]",
+                )
+                .with(&list_command("pr", "octo/app", "ac:review"), true, "[]")
+                .with(&list_command("pr", "octo/web", "ac:review"), true, "[]")
+                .with(
+                    &waiting_command("issue", "octo/issues", "ac:needs-human"),
+                    true,
+                    &listed(updated),
+                );
+            let probe = nothing_waiting(probe, &[], &["octo/app", "octo/web"]);
+            let probe = discussion::fake::with_item(
+                probe,
+                "octo/issues",
+                21,
+                r#"{"title":"まだ","user":{"login":"me"}}"#,
+            );
+            discussion::fake::with_list(
+                probe,
+                "/repos/octo/issues/issues/21/comments",
+                &[
+                    r#"{"user":{"login":"bot[bot]"},"body":"[agentcells] triage round 1\n\n質問","created_at":"2026-10-25T03:05:00Z"}"#,
+                ],
+            )
+        };
+        let reads = |probe: &FakeProbe| {
+            probe
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.contains("/issues/21/comments"))
+                .count()
+        };
+        let now = std::cell::Cell::new(1_000_000);
+        let tick = |probe: &FakeProbe| {
+            let mut quiet = Quiet::load(&home);
+            quiet.now = now.get();
+            let found = find(&config, probe, &token, &actors(), &mut quiet).unwrap();
+            quiet.save(&home);
+            assert!(found.work.is_empty() && found.skipped.is_empty());
+        };
+
+        // 返事がないことを読んで、覚える
+        let probe = probe_with("2026-10-25T03:05:00Z");
+        tick(&probe);
+        assert_eq!(reads(&probe), 1);
+        // 変わっていなければ、読み直さない（覚えたものは引き継ぐ）
+        let probe = probe_with("2026-10-25T03:05:00Z");
+        tick(&probe);
+        assert_eq!(reads(&probe), 0);
+        now.set(now.get() + QUIET_FOR - 1);
+        let probe = probe_with("2026-10-25T03:05:00Z");
+        tick(&probe);
+        assert_eq!(reads(&probe), 0);
+        // 読んでから時間がたったら、変わっていなくても読み直す（同じ秒に届いた返事を、取りこぼしたままにしない）
+        now.set(now.get() + 1);
+        let probe = probe_with("2026-10-25T03:05:00Z");
+        tick(&probe);
+        assert_eq!(reads(&probe), 1);
+        // 更新されたら、読み直す
+        let probe = probe_with("2026-10-25T03:10:00Z");
+        tick(&probe);
+        assert_eq!(reads(&probe), 1);
+    }
+
+    #[test]
     fn list_failures_point_to_doctor() {
         let (_dir, config) = config();
         let probe = FakeProbe::default().with_fallback(false);
-        let err = find(&config, &probe, &token, &actors()).unwrap_err();
+        let err = find(&config, &probe, &token, &actors(), &mut Quiet::default()).unwrap_err();
         assert!(err.hint.unwrap().contains("agentcells doctor"));
     }
 
