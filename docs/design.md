@@ -42,6 +42,14 @@ cellとして動くAIに渡すプロンプトは、3つの層を重ねて作る�
 - 実行のたびに、渡したプロンプトを `logs/` に残す（予定）
 - reviewのcellは、指摘の先頭に重さ（`[must]`、`[should]`、`[imo]`、`[nits]`）を付ける。must か should があれば implement に戻し、implement は must と should を直す。imo と nits は直すかどうかを任せる。指摘の返し方は `review` の設定に合わせる（true なら findings、false なら comment の箇条書き）
 - implementは、すでにあるコミットを書き換えない（CLIのpushはfast-forwardだけのため）。コミットがないときは review に回さず人間に回す
+- 今の作業と関係のない、元からある問題（時々落ちるテスト、ほかの機能の不具合など）は、その場で直したり、テストをゆるめたり消したりしない。AIは結果の `issues`（題と本文。1回に3件まで）に書き、CLIがproductの `issues` のリポジトリに別のIssueとして出す。PRがIssueの範囲を超えて検品で気づきにくくなるのを避け、直すかどうかを人が決めるため（2026-10-26に、implementが、元から時々落ちるテストを自分の判断でゆるめた）
+  - 出すのは書き込みのアカウント（App）。`ac:` のラベルは付けないので、operatorがラベルを付けるまでcellは動かない。本文はAIが書いたもので、ラベルを付けると、そのまま次のcellへの依頼になる。付ける前に、人が本文を確かめる
+  - 本文の最後に、見つけたcellと元のIssue/PR（`owner/repo#12`）と目印（`<!-- agentcells found owner/repo#12 -->`）を書く。元のIssue/PRへのコメントには、出したIssueの番号を書く
+  - AIが書いた題と本文から、`<!-- agentcells` を含む行を取り除く。inspectorの目印などを紛れ込ませて、inspectorの報告を止めたり、数を狂わせたりさせないため。本文は4000字まで
+  - 題と本文をbetterleaksで調べ、秘密らしいものがあれば出さない（題も書かない）。出せなくても、実行は止めない
+  - 重ねて出さない: 書き込みのアカウントが作った開いているIssue（新しいものから100件）をGraphQLで読み、同じ題（空白と大文字・小文字は問わない）があれば出さない。同じ実行の中で出した題も覚える。検索（`gh issue list --search`）は遅れて載るので使わない。読めなければ出さない
+  - 1つのIssue/PRから出して開いているものは、3件まで（目印で数える）。同じPRでimplementとreviewが何回か動いても、同じ問題を少しずつ違う題で出し続けないため
+  - 書き込みのトークンは仕事のリポジトリだけに絞って作るので、productの `issues` のリポジトリが違えば、そのリポジトリのトークンを別に作り、使い終わったら取り消す
 
 今回の仕事に入れるもの:
 
@@ -310,6 +318,7 @@ timeout_minutes = 30
   - `on: push` のworkflowに `branches-ignore: ['ac/**']` を付ける
   - リポジトリの設定で、`GITHUB_TOKEN` の既定の権限を読み取りだけにする
   - secretsは、承認が要るenvironmentに入れる
+  - `on: issues` のworkflowでは、Issueの題や本文を `run:` に `${{ github.event.issue.title }}` のように埋め込まず、環境変数で渡す。cellが別のIssueを出すとき（「作業と関係のない問題」）、題と本文はAIが書く。題や本文の `@` のメンションやほかのIssueへの参照で、通知やリンクも飛ぶ
 
 `claude -p` の動かし方:
 

@@ -727,6 +727,7 @@ impl Runner<'_> {
                     next: transition::NEEDS_HUMAN.to_string(),
                     comment: String::new(),
                     findings: Vec::new(),
+                    issues: Vec::new(),
                 }
             }
         };
@@ -845,6 +846,12 @@ impl Runner<'_> {
             )),
             None => {}
         }
+        // 作業と関係のない、元からある問題は、別のIssueにする（直すかどうかは人が決める）
+        let filed = self.file_found(product, work, cell, &task.writer, &outcome.issues, write);
+        if !filed.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&filed.join("\n"));
+        }
         if let Some(reason) = &reason {
             if !text.is_empty() {
                 text.push_str("\n\n");
@@ -938,6 +945,47 @@ impl Runner<'_> {
             model: self.model.or(cell.model.as_deref()).map(str::to_string),
             usage,
         })
+    }
+
+    /// AIが見つけた、作業と関係のない問題を、productのIssueのリポジトリに出す（[`crate::found`]）。
+    /// 書き込みのトークンは仕事のリポジトリだけに絞って作るので、Issueのリポジトリが違えば、別に作って取り消す。
+    fn file_found(
+        &self,
+        product: &Product,
+        work: &Work,
+        cell: &Cell,
+        writer: &str,
+        issues: &[transition::NewIssue],
+        write: &Credentials,
+    ) -> Vec<String> {
+        if issues.is_empty() {
+            return Vec::new();
+        }
+        let other = (product.issues != work.repo).then(|| self.write_credentials(&product.issues));
+        let credentials = match &other {
+            None => write,
+            Some(Ok(credentials)) => credentials,
+            Some(Err(e)) => {
+                return vec![format!(
+                    "別のIssueにする問題がありましたが、{} に書き込めないので、出しませんでした（{}）",
+                    product.issues, e.message
+                )];
+            }
+        };
+        let lines = crate::found::file(
+            self.probe,
+            credentials,
+            writer,
+            &product.issues,
+            &format!("{}#{}", work.repo, work.number),
+            &cell.name,
+            issues,
+            &|text| actions::scan_text(self.scanner, text).map(|found| !found.is_empty()),
+        );
+        if let Some(Ok(credentials)) = &other {
+            credentials.revoke(self.probe);
+        }
+        lines
     }
 
     /// pushしなかったAIの作業（コミット）を、手元に残し、取り出し方を返す。実行の記録の場所は、同じIssue/PRの

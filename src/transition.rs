@@ -88,7 +88,20 @@ pub struct Outcome {
     /// レビューのcell（`review = true`）が返す、コードへの指摘
     #[serde(default)]
     pub findings: Vec<Finding>,
+    /// 作業と関係のない、元からある問題。CLIが、別のIssueとして出す
+    #[serde(default)]
+    pub issues: Vec<NewIssue>,
 }
+
+/// AIが見つけた、別のIssueにする問題。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewIssue {
+    pub title: String,
+    pub body: String,
+}
+
+/// 1回の実行で出せる、別のIssueの数。AIが何件も出して、Issueを埋めないように
+pub const MAX_NEW_ISSUES: usize = 3;
 
 impl Outcome {
     /// `claude -p --output-format json --json-schema` の結果から読む。
@@ -124,6 +137,20 @@ pub fn output_schema(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> serd
             "comment": {
                 "type": "string",
                 "description": "Issue/PRに残すコメント。やったことと、次に進める理由を書く。needs-human のときは、人間に確かめたいこと（仕様の質問など）や、できなかったこととその結果、人間にやってほしいこと（環境のせいでビルドが通らないなど）を書く"
+            },
+            "issues": {
+                "type": "array",
+                "maxItems": MAX_NEW_ISSUES,
+                "description": "今の作業と関係のない、元からある問題（時々落ちるテスト、ほかの機能の不具合など）。その場では直さず、ここに書くと、CLIが別のIssueとして出す。なければ空にする",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "maxLength": 120, "description": "Issueの題" },
+                        "body": { "type": "string", "maxLength": crate::found::MAX_BODY_CHARS, "description": "何が起きたか、どう確かめたか、直し方の案" }
+                    },
+                    "required": ["title", "body"],
+                    "additionalProperties": false
+                }
             }
         },
         "required": ["next", "comment"],
@@ -541,6 +568,30 @@ max_rounds = 2
         let outcome = Outcome::from_result(&result).unwrap();
         assert_eq!(outcome.next, "implement");
         assert_eq!(outcome.comment, "小さなバグ修正です");
+        assert!(outcome.issues.is_empty());
+
+        let result = json!({
+            "structured_output": {"next": "review", "comment": "直しました",
+                "issues": [{"title": "鹿の検査が不安定", "body": "ときどき落ちます"}]}
+        });
+        let outcome = Outcome::from_result(&result).unwrap();
+        assert_eq!(
+            outcome.issues,
+            vec![NewIssue {
+                title: "鹿の検査が不安定".into(),
+                body: "ときどき落ちます".into()
+            }]
+        );
+        let (_dir, config) = config();
+        let schema = output_schema(config.cell("implement").unwrap(), None, false);
+        assert_eq!(schema["properties"]["issues"]["maxItems"], MAX_NEW_ISSUES);
+        // 書かなくてもよい
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("issues"))
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod display;
 pub mod doctor;
 pub mod error;
 pub mod files;
+pub mod found;
 pub mod github;
 pub mod guard;
 pub mod home;

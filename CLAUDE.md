@@ -1,6 +1,10 @@
 # agentcellsの開発ルール
 
-このリポジトリを開発するエージェントへの指示。cellとして動くエージェントへの指示ではない（それは `~/.agentcells` に置く）。
+このリポジトリを開発するエージェントへの指示。cellとして動くエージェントへの指示は `~/.agentcells` に置く。
+
+## agentcellsのcellとして、このリポジトリで作業するとき
+
+cellもこのファイルを読む。cellとして動くときは、「レビュー」の節（右のpaneに頼むこと）と、mainへの直接のpush、タグのpushは除く。PRはCLIが作り、レビューはreviewのcellがする。版とCHANGELOGは、PRの中で更新してよい（タグは、マージのあとに人が付ける）。
 
 ## やり取り
 
@@ -30,7 +34,7 @@
 
 ## 秘密
 
-- コミットの前に、betterleaksで秘密が入っていないかを調べる。`git config core.hooksPath .githooks` でフックを有効にしておく（betterleaksは `brew install betterleaks`）
+- コミットの前に、betterleaksで秘密が入っていないかを調べる。`git config core.hooksPath .githooks` でフックを有効にしておく（betterleaksは `brew install betterleaks`）。cellとして動くときは、`agentcells cell commit` が調べるので要らない
 
 ## 確かめること
 

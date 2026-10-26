@@ -799,7 +799,7 @@ fn issued_of(node: &Value, writer: &str) -> Option<(String, Issued)> {
     Some((fingerprint, issued))
 }
 
-fn create_issue(
+pub(crate) fn create_issue(
     probe: &dyn Probe,
     write: &github::Credentials,
     repo: &RepoName,
