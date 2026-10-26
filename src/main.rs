@@ -119,6 +119,9 @@ enum CellCommands {
         #[arg(long)]
         abort: bool,
     },
+    /// Bashを使う前にClaude Codeが動かすhook。`agentcells cell` 以外のコマンドを、代わりに使うものを添えて断る
+    #[command(hide = true)]
+    Hook,
 }
 
 #[derive(Subcommand)]
@@ -691,6 +694,17 @@ fn run(command: Commands) -> Result<ExitCode> {
 }
 
 fn run_cell(command: CellCommands) -> Result<ExitCode> {
+    if let CellCommands::Hook = command {
+        // 読めなくても断る答えを出せるように、今の仕事のファイルは読めたときだけ使う
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+            .map_err(|e| Error::new(format!("hookの入力を読めません: {e}")))?;
+        let context = actions::Context::load_from_env().ok();
+        if let Some(out) = agentcells::hook::pre_tool_use(&input, context.as_ref()) {
+            println!("{out}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let context = actions::Context::load_from_env()?;
     let cwd = std::env::current_dir()
         .map_err(|e| Error::new(format!("今のディレクトリが分かりません: {e}")))?;
@@ -721,6 +735,7 @@ fn run_cell(command: CellCommands) -> Result<ExitCode> {
             println!("マージをやめて、取り込む前に戻しました");
             Ok(ExitCode::SUCCESS)
         }
+        CellCommands::Hook => unreachable!("hookは上で扱う"),
         CellCommands::Merge { abort: false } => match actions::merge(&context)? {
             actions::Merged::Clean => {
                 println!("ベースのブランチを取り込みました（ぶつかりはありません）");

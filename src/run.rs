@@ -574,6 +574,7 @@ impl Runner<'_> {
             context: &context_path,
             placed: &placed_abs,
             programs: &programs,
+            agentcells: self.agentcells,
             tmp: &place.tmp,
             caches: &cache_list,
         };

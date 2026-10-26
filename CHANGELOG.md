@@ -6,6 +6,17 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.23.0] - 2026-10-26
+
+### 足したこと
+
+- AIがBashで `agentcells cell` 以外のコマンドを使おうとしたら、hookが先に断り、代わりに使うもの（Read・Grep・Glob、Edit・Write、`agentcells cell` の各コマンド）と、それでできないことが要るなら needs-human にすることを返す。これまでは「許しが要ります」とだけ返り、AIが書き方を変えて試し続けていた（implementが python・sed・perl での置換や `cd ... &&` を10回試し、1回の実行に26分かかった）
+
+### 直したこと
+
+- sandboxが有効だとClaude Codeが既定でBashのコマンドを自動で許すため、AIが `agentcells cell` 以外のコマンド（`python3`、`godot` など）もsandboxの中で直に動かせていた。`autoAllowBashIfSandboxed: false` を渡し、設計どおり `agentcells cell` だけにする。環境変数を付けて別の「今の仕事」のファイルを読ませる呼び方（`AGENTCELLS_CONTEXT=... agentcells cell`）も、これで止まる
+- worktreeの `.claude/` を、Edit・Writeだけでなく、sandboxの中のビルドやテストからも書けないようにした。hookを有効にしたので、hookを止める守りを重ねるため。hookとして動くagentcellsとbetterleaksも、ビルドから書き換えられないようにした
+
 ## [0.22.0] - 2026-10-26
 
 ### 足したこと

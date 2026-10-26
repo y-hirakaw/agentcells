@@ -9,6 +9,7 @@ pub mod files;
 pub mod github;
 pub mod guard;
 pub mod home;
+pub mod hook;
 pub mod inspect;
 pub mod labels;
 pub mod limit;

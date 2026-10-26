@@ -86,6 +86,8 @@ pub struct RunPaths<'a> {
     pub placed: &'a [PathBuf],
     /// sandboxの中で動かすプログラム（agentcellsとbetterleaks）。ホームの下にあっても動かせるようにする
     pub programs: &'a [PathBuf],
+    /// Bashを使う前のhookとして動かすagentcells（絶対パス）
+    pub agentcells: &'a Path,
     /// ビルドやテストの一時ディレクトリ（仕事ごと）。`agentcells cell run` が `TMPDIR` で渡す
     pub tmp: &'a Path,
     /// productのキャッシュ（`caches/<product>/<ツール>`）。`agentcells cell run` が環境変数でツールを向ける
@@ -98,6 +100,7 @@ pub struct RunPaths<'a> {
 /// - 読む（Read）のは、worktreeの中だけ
 /// - ファイルの作成と更新（Edit、Write）は、worktreeの中だけ。`.git` と置いた秘密のファイルは除く
 /// - Bashは `agentcells cell` だけ。WebFetchは使わせない
+/// - ほかのBashのコマンドは、hook（`agentcells cell hook`）が、代わりに使うものを添えて先に断る
 ///
 /// sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
 /// - 書けるのは、作業するcloneと、その `.git` の実体（仕事ごとの使い捨て）だけ。元のリポジトリには書けない
@@ -187,6 +190,18 @@ pub fn runtime_settings(
     {
         deny_write.extend(forms(&place)?);
     }
+    // ビルドやテストからも、Claude Codeの設定（hooksなど）を書かせない（Editのdenyは、Bashで動くものには効かない）
+    deny_write.extend(forms(&worktree.join(".claude"))?);
+    // hookとしてsandboxの外で動くagentcellsと、pushの前に使うbetterleaksを、ビルドに書き換えさせない
+    // （`sandbox.write` で、それらのある場所を開けていても）
+    for program in run
+        .programs
+        .iter()
+        .map(PathBuf::as_path)
+        .chain([run.agentcells])
+    {
+        deny_write.extend(forms(program)?);
+    }
 
     // sandboxの中では ~/.gitconfig が読めず、gitが止まる。使う人とシステムのgitの設定は読ませない
     let env: serde_json::Map<String, serde_json::Value> = ISOLATED_GIT_ENV
@@ -194,13 +209,24 @@ pub fn runtime_settings(
         .map(|(k, v)| (k.to_string(), json!(v)))
         .collect();
 
+    // hooksはsandboxの外で動く。`--setting-sources ""` で使う人とリポジトリの設定を読まないので、
+    // 動くのは、ここで渡すものだけ（リポジトリの .claude/settings.json やskillに書いたhooksは動かない。2.1.310で確かめた）
+    let hook = format!(
+        "{} cell hook",
+        shell_quote(&run.agentcells.to_string_lossy())
+    );
     Ok(json!({
-        // hooksはsandboxの外で動くので、どこから来たものも動かさない
-        "disableAllHooks": true,
+        "disableAllHooks": false,
+        "hooks": {
+            "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": hook }] }]
+        },
         "env": env,
         "permissions": { "allow": allow, "deny": deny },
         "sandbox": {
             "enabled": true,
+            // sandboxが有効だと、Claude Codeは既定でBashのコマンドをすべて許す（2.1.310で確かめた）。
+            // それだと `Bash(agentcells cell:*)` に限った意味がなくなるので止める
+            "autoAllowBashIfSandboxed": false,
             "allowUnsandboxedCommands": false,
             "filesystem": {
                 "allowWrite": dedup(allow_write),
@@ -313,6 +339,11 @@ pub fn sandbox_warnings(config: &Config) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// シェルに渡すために、単引用符で囲む。
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// 同じ場所か。大文字・小文字は問わない。
@@ -548,6 +579,7 @@ mod tests {
             context: Path::new("/home/me/.agentcells/runs/1/context.json"),
             placed,
             programs: &programs,
+            agentcells: Path::new("/home/me/.agentcells/bin/agentcells"),
             tmp: Path::new("/home/me/.agentcells/tmp/12"),
             caches: &[],
         };
@@ -707,6 +739,7 @@ mod tests {
             context: &link,
             placed: &[],
             programs: &[],
+            agentcells: Path::new("/home/me/.agentcells/bin/agentcells"),
             tmp: Path::new("/t"),
             caches: &[],
         };
@@ -762,6 +795,7 @@ mod tests {
             context: Path::new("/c.json"),
             placed: &placed,
             programs: &[],
+            agentcells: Path::new("/home/me/.agentcells/bin/agentcells"),
             tmp: Path::new("/t"),
             caches: &[],
         };
@@ -811,7 +845,26 @@ mod tests {
         assert_eq!(network["strictAllowlist"], true);
         // sandboxの中では ~/.gitconfig が読めないので、gitに使う人の設定を読ませない
         assert_eq!(settings["env"]["GIT_CONFIG_GLOBAL"], "/dev/null");
-        assert_eq!(settings["disableAllHooks"], true);
+        // Bashのコマンドは、sandboxの中でも自動では許さず、hookが先に案内して断る
+        assert_eq!(settings["sandbox"]["autoAllowBashIfSandboxed"], false);
+        assert_eq!(settings["disableAllHooks"], false);
+        let hooks = &settings["hooks"]["PreToolUse"];
+        assert_eq!(hooks.as_array().unwrap().len(), 1);
+        assert_eq!(hooks[0]["matcher"], "Bash");
+        assert_eq!(
+            hooks[0]["hooks"][0]["command"],
+            "'/home/me/.agentcells/bin/agentcells' cell hook"
+        );
+        let deny_write = strings(&fs["denyWrite"]);
+        for path in [
+            "/w/octo/app/12/.claude",
+            "/home/me/.agentcells/bin/agentcells",
+        ] {
+            assert!(
+                deny_write.contains(&path.to_string()),
+                "{path}: {deny_write:?}"
+            );
+        }
         assert_eq!(network["allowLocalBinding"], false);
         // ビルドやテストには、仕事ごとの一時ディレクトリを使わせる
         assert!(allow_read.contains(&"/home/me/.agentcells/tmp/12".to_string()));
@@ -881,6 +934,7 @@ mod tests {
             context: Path::new("/c.json"),
             placed: &[],
             programs: &[],
+            agentcells: Path::new("/home/me/.agentcells/bin/agentcells"),
             tmp: Path::new("/t"),
             caches: &[],
         };
@@ -941,6 +995,7 @@ mod tests {
             context: Path::new("/home/me/.agentcells/runs/1/context.json"),
             placed: &[],
             programs: &programs,
+            agentcells: Path::new("/home/me/.agentcells/bin/agentcells"),
             tmp: Path::new("/home/me/.agentcells/tmp/octo/app/12"),
             caches: &caches,
         };
