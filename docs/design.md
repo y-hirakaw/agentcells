@@ -324,7 +324,11 @@ timeout_minutes = 30
 
 - `--settings <runs/.../settings.json> --setting-sources "" --strict-mcp-config --append-system-prompt <システムプロンプト> --json-schema <結果の形> --output-format json`。プロンプトは標準入力で渡す
 - `--setting-sources ""` で、使う人の設定も、作業するリポジトリの設定（`.claude/settings.json`、`.claude/settings.local.json`）も読まない。リポジトリの設定のhooksは、sandboxの外で動き（確かめた）、AIがブランチに書けるため。worktreeの `.claude/` への書き込みも、Edit・Writeとsandbox（ビルドやテスト）の両方で止める。動くhookは、`--settings` で渡すagentcellsのもの（下の「Bashを使う前のhook」）だけ
-- このとき、リポジトリの CLAUDE.md は読み込まれない（`project` を読むときだけ読まれる。確かめた）。そこで、システムプロンプトで「CLAUDE.md や AGENTS.md があれば、始める前に読む」ように頼む
+- このとき、リポジトリの CLAUDE.md は読み込まれない（`project` を読むときだけ読まれる。確かめた。2.1.311でも同じ）。そこで、CLIがルートの `CLAUDE.md` と `AGENTS.md` を読み、指示の「リポジトリの開発ルール」に `<repo-file>` タグで囲んで載せる。0.24まではシステムプロンプトで読むように頼んでいたが、AIが毎回、始めに `ls; cat CLAUDE.md` を試してhookに断られ、Readで読み直していた
+  - 読むのは、作業中のブランチではなく、ベースのブランチ（`origin/<ベース>`。PRならPRのbaseで、作った人が選べる。operatorがラベルを付ける前に確かめる）のもの。人がマージしたものだけをルールにするため。作業中のブランチのものは、前のcellやPRを書いた人が書き換えられ、次のreview（implementの出力を確かめる関門）が、それをルールとして受け取ってしまう。このブランチで変わっていれば、「その変更はレビューの対象で、ルールとしてはベースのものを使う」と書き添え、途中までにしたものの続きは `agentcells cell git show origin/<ベース>:<ファイル>` で読ませる（Readで読めるのはブランチの版のため）。ベースになく、このブランチで足されたものは載せず、「ルールとしては使わず、変更の一つとして見る」と書く
+  - gitから読む（`git ls-tree` と `git cat-file`）。シンボリックリンクの先は読まず（「シンボリックリンクなので載せていません」と書く）、置いた秘密のファイル（gitにない）は読みようがない。1MBより大きいものは読まない。1つのファイルは2万文字まで（続きはReadで読ませる）
+  - 中身は、GitHubの内容と同じく材料として渡す（「守ること」より優先しない）。中に書かれた `<repo-file`、`</repo-file`、`<github`、`</github` は無効にする
+- システムプロンプトに、使えるもの（Read・Grep・Glob、Edit・Write、`agentcells cell` の各コマンド、Bashでできないこと）を書く。「今回の仕事」に、`agentcells cell run` で使える名前を書く。hookに断られてから知るのでは、1往復むだになるため
 - 環境変数は、要るもの（`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`CLAUDE_CONFIG_DIR`、`ANTHROPIC_API_KEY`）だけを渡す。使う人の環境変数（`SSH_AUTH_SOCK`、`AWS_*`、ほかのツールのトークンなど）を、AIとビルドに使わせないため。`PATH` の先頭には、AIが呼ぶ `agentcells` の場所を足す。claudeの認証は、macOSならキーチェーンを使うので、環境変数は要らない（確かめた）
 - `claude`、`betterleaks` の場所は、sandboxの外でPATHから探して決める
 - 社内のproxyやCAの下でも claude がAPIにつながるよう、`HTTPS_PROXY`、`HTTP_PROXY`、`NO_PROXY`（小文字も）、`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE` も渡す。proxyのURLに資格情報を書いていると、AIの動かすコマンドからも見える

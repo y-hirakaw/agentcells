@@ -536,6 +536,17 @@ impl Runner<'_> {
 
         // gitignoreされたファイルを置き、その中身のハッシュを、コミットさせないために覚えておく
         let placed = files::apply(self.home, &work_repo, &place.worktree)?;
+        let base = branch
+            .as_ref()
+            .map_or("HEAD".to_string(), |b| format!("origin/{}", b.base));
+        let wt_str = path_str(&place.worktree)?;
+        let git = |args: &[&str]| {
+            let mut all = vec!["-C", wt_str.as_str()];
+            all.extend(args);
+            git_out(self.probe, &all).ok()
+        };
+        task.guides = Some(prompt::read_guides(&git, &base));
+        task.commands = Some(product.commands.keys().cloned().collect());
         let placed_blobs = placed
             .iter()
             .map(|p| actions::blob_hash(&place.worktree, p))
