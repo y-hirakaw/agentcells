@@ -6,6 +6,14 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
 
+## [0.24.2] - 2026-10-27
+
+### 直したこと
+
+- cellに Grep と Glob のツールがなかった。Claude Code 2.1.310〜は、標準では Grep と Glob を出さず、Bashの `grep` や `find` で探させるが、それはhookが断るので、cellにはファイルを探す道がなかった（AIは `agentcells cell git show ... | grep` で回り道をし、hookと0.24.1の案内は、ないツールを勧めていた）。`--tools` で Bash、Read、Edit、Write、Grep、Glob を挙げて渡す。Grep と Glob は、Readと同じく worktree の中だけを読み、置いた秘密のファイルは結果に出ない
+- 挙げなかったツール（サブエージェント、WebSearch、定期実行、ほかのセッションへの送信など）は、cellに出さない。これまでも、許す決まりがないので使えなかったが、出すツールを減らして、守りを重ねる
+- Bashをバックグラウンドで動かすこと（`run_in_background`）は、hookが断る。出力を読むツールも止めるツールも渡さないため
+
 ## [0.24.1] - 2026-10-27
 
 ### 直したこと

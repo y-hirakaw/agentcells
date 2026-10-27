@@ -503,9 +503,12 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 | ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
 
 - Bashは `Bash(agentcells cell:*)` だけを許す。`ls` や `git diff` でも、オプションでファイルに書けるものがあるため
+- 渡すツールは、Bash、Read、Edit、Write、Grep、Glob だけにする（`--tools`）。Claude Code 2.1.310〜は、標準では Grep と Glob を出さず、Bashの `grep` や `find` で探させる。それはhookが断るので、0.24.1までは、cellに探す道がなかった（AIは `agentcells cell git show ... | grep` で回り道をしていた）。名前を挙げると、Grep と Glob が出る。挙げないもの（サブエージェント、WebSearch、定期実行、ほかのセッションへの送信など）は出さない
+  - Grep と Glob は、Readの決まりに従う（worktreeの中だけ。置いた秘密のファイルは、結果に出ない）
   - sandboxが有効だと、Claude Codeは既定で、許していないBashのコマンドもsandboxの中で動かす（`autoAllowBashIfSandboxed`）。それでは許す決まりの意味がないので、`false` にする（0.22.0までは入れておらず、AIが `python3`、`perl`、`godot` などを直に動かせていた）
 - Bashを使う前のhook（PreToolUse）として、`agentcells cell hook` を動かす。`agentcells cell` を1つだけ動かすコマンドでなければ、hookが先に断り、代わりに使うもの（Read・Grep・Glob、Edit・Write、`agentcells cell` の各コマンドと、`run` で使える名前）と、「それでできないことが要るなら、別の道を試さずに needs-human にする」をAIに返す。権限の設定で断られるだけだと、AIに届くのは「許しが要ります」だけで、書き方を変えて試し続けたため（2026-10-26に、implementが python・sed・perl での置換や `cd ... &&` を10回試し、26分かかった）
   - よくあるコマンド（python・sed・perl → Edit、`cd` → 要らない、`git` → `agentcells cell git`、`ls`・`cat`・`grep` → Read・Grep・Glob など）には、ひとこと案内を足す。`;`、`&&`、`||`、`&`、改行でつなげたもの、ファイルへのリダイレクト（`2>&1` のような付け替えは除く）、読むだけのコマンド（`tail`、`head`、`grep`、`wc`）でないものへのパイプ、`$(...)`、バッククォート、`<(`、コメント（`#`）を含むものは、`agentcells cell` で始まっていても断る（多めに断る向きにする）
+  - バックグラウンドで動かすもの（`run_in_background`）は、`agentcells cell` でも断る。出力を読むツールも止めるツールも渡していないため。そのため、1つのコマンドにかけられるのは、Bashのtimeoutの上限（10分）まで。それより長いビルドやテストは通せない（まだ決めていないこと。`BASH_MAX_TIMEOUT_MS` で上げられるか、上限を超えたときにClaude Codeがバックグラウンドに移すかは、確かめていない）
   - `agentcells cell` で始まる1つのコマンドは、hookでは決めずに権限の設定に任せる（`| tail` のような読むだけのコマンドへのパイプは、Claude Codeが許す）
   - hookはsandboxの外で動くので、入力（AIが書いたコマンド）を読んで答えを返すだけにし、何も実行しない。入力を読めなければ断る。許す答え（allow）は返さないので、権限の設定より広くはならない
   - hookとして動くagentcellsと、betterleaksは、sandboxの書けない場所に入れる。`sandbox.write` でそれらのある場所を開けていても、ビルドに書き換えさせて、sandboxの外で動かさないため
@@ -568,6 +571,7 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - 作業するリポジトリの `.claude/settings.json` のhooksは、`--setting-sources project,local` だと動いた。`disableAllHooks: true` を `--settings` で渡すか、`--setting-sources ""` にすると、動かなかった（2026-10-25）
 - `--setting-sources ""` で `--settings` にhooksを書くと、そのhookだけが動いた。リポジトリの `.claude/settings.json` のhooksも、`.claude/skills/` のskillや `.claude/agents/` のサブエージェントに書いたhooksも動かなかった（skillもサブエージェントも読み込まれなかった）。実行の途中で `.claude/settings.json` と `.claude/settings.local.json` を置いても、そのhooksは動かなかった。sandboxの `denyWrite` にworktreeの `.claude` を書くと、まだ `.claude` がなくても、sandboxの中のスクリプトから `.claude/settings.json` を書けなかった（macOS。Linuxのbubblewrapでは、ない場所の扱いを確かめ直す）。PreToolUseのhookが `permissionDecision: "deny"` で返した理由は、ツールの結果としてAIにそのまま届いた（2026-10-26）
 - sandboxが有効だと、`autoAllowBashIfSandboxed` の既定（有効）で、許していないBashのコマンド（`python3`、`touch` など）もsandboxの中で聞かずに動いた。`false` にすると「許しが要ります」で断られ、`ls` のような読むだけのコマンドと、許したコマンドだけが動いた（2026-10-26）
+- 2.1.310と2.1.311の `claude -p` は、`--tools` を渡さないと Grep と Glob を出さなかった（呼ぶと「Bashで `grep` を使え」と返る）。`--tools "Bash,Read,Edit,Write,Grep,Glob"` で出た。決まった形の結果を返すツール（StructuredOutput）は、`--tools` に挙げなくても `--json-schema` で出た。Readをdenyしたファイルは、Grep の結果にも Glob の結果にも出なかった（2026-10-27、haiku）
 
 ### sandboxに開ける場所
 

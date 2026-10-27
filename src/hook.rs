@@ -23,10 +23,22 @@ pub fn pre_tool_use(input: &str, context: Option<&Context>) -> Option<String> {
     if input.as_ref().is_some_and(|v| v["tool_name"] != "Bash") {
         return None;
     }
+    let background = input
+        .as_ref()
+        .is_some_and(|v| v["tool_input"]["run_in_background"] == true);
     let reason = match input
         .as_ref()
         .and_then(|v| v["tool_input"]["command"].as_str())
     {
+        // バックグラウンドで動かしたものは、出力を読むことも止めることもできない（そのツールは渡していない）
+        Some(command) if background => {
+            // コマンドにも断る理由があれば、つなげて返す（直したあとに、もう一度断らないように）
+            let hint = match reason_hint(command) {
+                Some(hint) => format!("{BACKGROUND}{hint}"),
+                None => BACKGROUND.to_string(),
+            };
+            reason_for(Some(&hint), context)
+        }
         Some(command) => reason(command, context)?,
         None => reason_for(None, context),
     };
@@ -42,8 +54,15 @@ pub fn pre_tool_use(input: &str, context: Option<&Context>) -> Option<String> {
     )
 }
 
+const BACKGROUND: &str = "バックグラウンドでは動かせません。run_in_background を付けずに動かしてください（時間がかかるものは、timeout を長くしてください。上限は10分です）。";
+
 /// 断る理由。`agentcells cell` を1つだけ動かすコマンドなら `None`。
 fn reason(command: &str, context: Option<&Context>) -> Option<String> {
+    reason_hint(command).map(|hint| reason_for(Some(hint), context))
+}
+
+/// 断るときの、コマンドに合わせた案内。`agentcells cell` を1つだけ動かすコマンドなら `None`。
+fn reason_hint(command: &str) -> Option<&'static str> {
     let command = command.trim();
     let allowed = command
         .strip_prefix(ALLOWED)
@@ -57,7 +76,7 @@ fn reason(command: &str, context: Option<&Context>) -> Option<String> {
         let first = command.split_whitespace().next().unwrap_or("");
         hint(first)
     };
-    Some(reason_for(Some(hint), context))
+    Some(hint)
 }
 
 fn reason_for(hint: Option<&str>, context: Option<&Context>) -> String {
@@ -281,6 +300,15 @@ mod tests {
         assert!(pre_tool_use("not json", None).is_some());
         let other = json!({"tool_name": "Bash", "tool_input": {}}).to_string();
         assert!(pre_tool_use(&other, None).is_some());
+        let background = json!({"tool_name": "Bash", "tool_input": {"command": "agentcells cell run test", "run_in_background": true}}).to_string();
+        let reason = pre_tool_use(&background, None).unwrap();
+        assert!(reason.contains("run_in_background を付けずに"), "{reason}");
+        let both = json!({"tool_name": "Bash", "tool_input": {"command": "grep -r x .", "run_in_background": true}}).to_string();
+        let reason = pre_tool_use(&both, None).unwrap();
+        assert!(
+            reason.contains("run_in_background") && reason.contains("Read、Grep、Glob"),
+            "{reason}"
+        );
         // Bashでないツールには何もしない
         let read = json!({"tool_name": "Read", "tool_input": {"file_path": "x"}}).to_string();
         assert_eq!(pre_tool_use(&read, None), None);
