@@ -165,6 +165,12 @@ Issue/PRへのコメントとレビューは、CLIが投稿する。AIは内容�
   - 1件ごとに、止めきれなかったプロセスが残っていないかを確かめ、残っていれば止める。失敗したら、そこで終わる
   - AIの実行そのものが失敗したら（結果が返らない、時間切れ）、その仕事は人間に回し、そのtickはそこで終わる。ログインの切れなどでは、続けると、たまっていた仕事が次々に同じように失敗して、まとめて人間に回ってしまうため
   - 使用量の上限: claudeの出力（`claude.jsonl`）の最後の `rate_limit_event` が `rejected` なら、上限に当たったとみなす。その仕事は人間に回さず、目印のコメントも書かずに、`ac:working` だけを外して元のラベルに戻す（往復の回数にも数えない）。そして、`resetsAt`（上限が戻る時刻）まで、tickは新しく始めない（`~/.agentcells/pause.json`）。上限が数時間続いても、tickのたびに1件ずつ人間に回らないようにするため
+  - 上限の手前で止まる: `rate_limit_event` には、上限ごと（`five_hour`、`seven_day`）の使用量（`unifiedWindows` の `utilization`。0〜1）も入る。cellの実行が終わったときに、どれかが設定（`[usage]` の `pause_at`。%。省略すると80）以上なら、その上限が戻る時刻まで、tickは新しく始めない（同じ `pause.json`。理由は「使用量（five_hour）が83%」のように書く）。仕事は普通に進める（人間に回したりはしない）。使う人が自分でClaude Codeを使う分を残すため。tickの終わりの記録の `why` は `usage`
+    - 見るのはcellの実行の中の使用量だけ。使う人が自分で使って超えていても、次のcellが1回動いてから止まる
+    - `rate_limit_event` は、実行の途中でも、使用量が変わるたびに出る（2.1.311で、1回の実行の中に 0.23、0.24 … 0.27 と5回出た）。最後のものを使うので、ほぼその実行が終わったときの値になる
+    - 7日の上限で超えると、数日止まることがある（`status` に出る）。`--ignore-pause` で動かしても、超えている間は1件動かすたびにまた止まる
+    - 割合は、%にして丸めてから比べる（0.57 × 100 が 56.99… になり、ちょうどの値を取りこぼすため）
+    - 100にすると、上限に当たるまで動く（これまでと同じ）
   - 上限の印がない失敗でも、claudeが失敗を返したとき（`error:...`。ログインの切れなど）と、出力を読めないときは、30分のあいだ新しく始めない。時間切れや、AIが決まった形で返さなかったときは、その仕事だけのことが多いので止まらない
   - 止まっている間、tickは知らせて何もしない（`--dry-run` なら知らせて続ける）。`status` にも出す。急ぐときは `agentcells tick --ignore-pause` で動かせる（そのtickだけ。定期実行は止まったまま）
   - 戻る時刻は、5分後から8日後の間に収める（時計のずれで過去なら、すぐにまた当たらないように。ミリ秒のような遠い値なら、黙って止まり続けないように）。`rate_limit_event` の `status` が `allowed` で始まらないものと、claudeがAPIの状態の番号として429を返したときを、上限とみなす（当たったときの値を確かめられていないため。外れても、人間に回さずに待つだけ）
@@ -272,7 +278,7 @@ timeout_minutes = 30
 
 ### 1件を動かす流れ
 
-`src/run.rs`。
+`src/run.rs`（`claude -p` の起動は `src/run/claude.rs`、プロセスの片付けは `process.rs`、作業の場所は `place.rs`、ブランチとpush、pushしない作業のbundleは `branch.rs`、Issue/PRへの書き込みは `issue.rs`）。
 
 1. `ac:working` を付ける
 2. Issueを読み、もう一度ガード（「動かすIssue/PRを決める」）を通す。確かめてから読むまでの間の書き換えを見逃さないため。見送るときは、コメントをせずに `ac:working` だけ外す（外せなくても、コメントはしない）
@@ -296,6 +302,8 @@ timeout_minutes = 30
 - claudeのあと、AIが足したコミット（動かす前のブランチの先から）があれば、次のとおりにする
   - CLIがその場で作ったbareリポジトリにブランチを移し（`pr::stage`）、そこで確かめる。AIが書き換えられる `.git/config` を読まないため
   - 確かめること（`pr::verify`）: 足したコミットのどれかに、置いた秘密のファイルと同じ中身のファイルがない（名前を変えても、途中のコミットだけでも）。人が開いたときに自動で動くファイル（`.claude/`、`.mcp.json`、`.vscode/`、`.idea/`、`.zed/`、`.cursor/`、`.devcontainer/`、`.devcontainer.json`、`.envrc`、`.husky/`、`.gitattributes`、`.gitmodules`、`.github/workflows/`。`.envrc`、`.gitattributes`、`.claude`、`.mcp.json` は下のディレクトリにあっても）を変えていない。シンボリックリンクとsubmoduleを足していない。足した行に、betterleaksが見つける秘密らしいものがない（途中のコミットで足して消したものも）。AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る
+  - 自動で動くファイル、シンボリックリンク、submoduleは、`agentcells cell commit` でも断る（判定は同じ関数 `pr::autorun`。マージの途中なら、自動でマージした結果と比べるので、ベースから来たものでは断らない）。pushの前に断られると、その実行の作業はまるごと人間に回るが、コミットの時点で断れば、AIがその変更を外して続けられる。作業にどうしても要るなら、AIはほかの変更をコミットしてから人間に回す
+    - これは早めに知らせるためのもの。ビルドは `.git` の実体（index、`MERGE_HEAD` など）に書けるので、コミットの時点の確かめは回避できる。本当の守りは、pushの前の `pr::verify`。こちらを緩めないこと
   - 問題があれば、pushせずに人間に回す（理由に秘密そのものは書かない）。コメントには、理由ごとに「次にすること」を書く（マージコミットなら、ぶつかりを手で解消してpushしてからコメントする、など）。何が起きて、何をすれば続きが動くかが分からないと、人が止まってしまうため
   - pushしなかったAIの作業（コミット）は、gitのbundleとして `~/.agentcells/kept/<owner>/<repo>/<番号>/<時刻>.bundle` に残し、取り出し方（`git fetch <bundle> <ブランチ>:ai-work`）をコメントに書く。作業場所は実行のあとに消え、実行の記録の場所は次の実行で空になるため。確かめで断ったときのほか、CLIが人間に回したとき（時間切れ、AIの結果を読めない、ラベルの変化など）も、コミットがあれば残す。秘密らしいもので断った作業も入るので、`kept/` から下は700、bundleは600にする。30日たったものは、次に残すときに消す。使用量の上限で止まったときは、同じ仕事を動かし直すので残さない
   - pushは、そのbareリポジトリから、書き込みのトークンで行う
@@ -318,13 +326,24 @@ timeout_minutes = 30
   - `on: push` のworkflowに `branches-ignore: ['ac/**']` を付ける
   - リポジトリの設定で、`GITHUB_TOKEN` の既定の権限を読み取りだけにする
   - secretsは、承認が要るenvironmentに入れる
+  - `doctor` は、作業するリポジトリの既定のブランチの `.github/workflows` を読み、次のものを知らせる（注意。止めはしない）
+    - `pull_request_target` か `workflow_run` で動くもの
+    - cellのブランチのコードで動きうるきっかけ（`push`、`pull_request`、`pull_request_review`、`pull_request_review_comment`、`create`。cellのレビューやコメントでも動く）で動き、`GITHUB_TOKEN` 以外のsecrets（`secrets: inherit`、`toJSON(secrets)` のような名前の分からない使い方を含む）を使うものか、`GITHUB_TOKEN` に書き込みの権限（`write-all`、`contents: write`）を付けるもの
+    - 中身を読めなかったworkflow（大きいか、文字でない）
+    - リポジトリの設定で、`GITHUB_TOKEN` の既定の権限が書き込みのとき（読めなければ、そう知らせる。管理の権限が要る）
+    - 書き込みの権限は、空白と引用符を除いてから、`write-all` と `contents`・`id-token`・`packages`・`actions`・`deployments` の `:write` を探す
+    - YAMLとしては読まず、文字列から探すので、ブランチを絞っていても出る（多めに出す向き）。`pull_request` の `branches` は、ベースのブランチを絞るもので、`branches: [main]` でもcellのPRで動くので、軽い判定では外さない
   - `on: issues` のworkflowでは、Issueの題や本文を `run:` に `${{ github.event.issue.title }}` のように埋め込まず、環境変数で渡す。cellが別のIssueを出すとき（「作業と関係のない問題」）、題と本文はAIが書く。題や本文の `@` のメンションやほかのIssueへの参照で、通知やリンクも飛ぶ
 
 `claude -p` の動かし方:
 
 - `--settings <runs/.../settings.json> --setting-sources "" --strict-mcp-config --append-system-prompt <システムプロンプト> --json-schema <結果の形> --output-format json`。プロンプトは標準入力で渡す
 - `--setting-sources ""` で、使う人の設定も、作業するリポジトリの設定（`.claude/settings.json`、`.claude/settings.local.json`）も読まない。リポジトリの設定のhooksは、sandboxの外で動き（確かめた）、AIがブランチに書けるため。worktreeの `.claude/` への書き込みも、Edit・Writeとsandbox（ビルドやテスト）の両方で止める。動くhookは、`--settings` で渡すagentcellsのもの（下の「Bashを使う前のhook」）だけ
-- このとき、リポジトリの CLAUDE.md は読み込まれない（`project` を読むときだけ読まれる。確かめた）。そこで、システムプロンプトで「CLAUDE.md や AGENTS.md があれば、始める前に読む」ように頼む
+- このとき、リポジトリの CLAUDE.md は読み込まれない（`project` を読むときだけ読まれる。確かめた。2.1.311でも同じ）。そこで、CLIがルートの `CLAUDE.md` と `AGENTS.md` を読み、指示の「リポジトリの開発ルール」に `<repo-file>` タグで囲んで載せる。0.24まではシステムプロンプトで読むように頼んでいたが、AIが毎回、始めに `ls; cat CLAUDE.md` を試してhookに断られ、Readで読み直していた
+  - 読むのは、作業中のブランチではなく、ベースのブランチ（`origin/<ベース>`。PRならPRのbaseで、作った人が選べる。operatorがラベルを付ける前に確かめる）のもの。人がマージしたものだけをルールにするため。作業中のブランチのものは、前のcellやPRを書いた人が書き換えられ、次のreview（implementの出力を確かめる関門）が、それをルールとして受け取ってしまう。このブランチで変わっていれば、「その変更はレビューの対象で、ルールとしてはベースのものを使う」と書き添え、途中までにしたものの続きは `agentcells cell git show origin/<ベース>:<ファイル>` で読ませる（Readで読めるのはブランチの版のため）。ベースになく、このブランチで足されたものは載せず、「ルールとしては使わず、変更の一つとして見る」と書く
+  - gitから読む（`git ls-tree` と `git cat-file`）。シンボリックリンクの先は読まず（「シンボリックリンクなので載せていません」と書く）、置いた秘密のファイル（gitにない）は読みようがない。1MBより大きいものは読まない。1つのファイルは2万文字まで（続きはReadで読ませる）
+  - 中身は、GitHubの内容と同じく材料として渡す（「守ること」より優先しない）。中に書かれた `<repo-file`、`</repo-file`、`<github`、`</github` は無効にする
+- システムプロンプトに、使えるもの（Read・Grep・Glob、Edit・Write、`agentcells cell` の各コマンド、Bashでできないこと）を書く。「今回の仕事」に、`agentcells cell run` で使える名前を書く。hookに断られてから知るのでは、1往復むだになるため
 - 環境変数は、要るもの（`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`CLAUDE_CONFIG_DIR`、`ANTHROPIC_API_KEY`）だけを渡す。使う人の環境変数（`SSH_AUTH_SOCK`、`AWS_*`、ほかのツールのトークンなど）を、AIとビルドに使わせないため。`PATH` の先頭には、AIが呼ぶ `agentcells` の場所を足す。claudeの認証は、macOSならキーチェーンを使うので、環境変数は要らない（確かめた）
 - `claude`、`betterleaks` の場所は、sandboxの外でPATHから探して決める
 - 社内のproxyやCAの下でも claude がAPIにつながるよう、`HTTPS_PROXY`、`HTTP_PROXY`、`NO_PROXY`（小文字も）、`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE` も渡す。proxyのURLに資格情報を書いていると、AIの動かすコマンドからも見える
@@ -558,6 +577,7 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
 - 置いた秘密のファイルは、読ませない。`[product.sandbox]` の `read_placed` に書いたもの（リポジトリからの相対パス）だけ、ビルドやテストに読ませる。ReadのdenyはClaude Codeがsandboxにも足すので、`read_placed` のファイルはAIのReadからも読める。ビルドに読ませれば、AIが書き換えたビルドを通して中身を取り出せるのと同じなので、分けない
 - 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない
 - 止めた通信の先は、Claude Codeがコマンドの結果に `deny network-outbound <ホスト>:<ポート>` として書き足し、AIに見える。AIは、止まった先と、足すとよい設定を書いて人間に回す（プロンプトで指示する）
+  - CLIもclaudeの出力から止められた先を拾い、足すとよい `network` の行を、手元（tickの出力）にだけ出す。人間に回すときは、公開のコメントに、止めたことだけを書く。claudeの出力にはビルドやテストが印字したものも入るので、AIが書き換えたビルドが、秘密を埋めた名前を `deny network-outbound ...` として印字すれば、そのまま公開されてしまう（実際に通信しなくてよく、小文字の英数字にすればbetterleaksにも当たらない）。攻撃がなくても、社内のプロキシやミラーの名前が出る。同じ理由で、AIにも、先の名前はコメントに書かず、何のための通信かを書くよう頼む。拾うのは、ホスト名として正しい形のもの（ラベルが英数字と `-`、2つ以上）だけを5件まで
 - sandboxの中では `~/.gitconfig` が読めず、gitが止まるので、使う人とシステムのgitの設定を読ませない環境変数（`GIT_CONFIG_GLOBAL=/dev/null` など）を設定の `env` で渡す
 - sandboxの外でコマンドを動かすことは許さない（`allowUnsandboxedCommands: false`）
 - sandboxの中からも、その仕事の `.git` の実体には書ける（`.git/config` やhooksを含む）。仕事ごとの使い捨てなので、ほかの仕事や元のリポジトリには効かない。AIが終わったあとにCLIがその作業場所で動かすgitは、使う人とシステムの設定を読まず、hooksとfsmonitorを止めて動かす。pushは、その場で作ったbareリポジトリから行う

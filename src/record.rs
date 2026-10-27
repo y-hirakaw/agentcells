@@ -282,6 +282,8 @@ mod tests {
             requested: Some("review".into()),
             failure: None,
             limited_until: None,
+            near_limit: None,
+            blocked: Vec::new(),
             pr: None,
             model: Some("sonnet".into()),
             usage: Usage {

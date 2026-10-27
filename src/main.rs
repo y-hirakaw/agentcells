@@ -520,9 +520,16 @@ fn run(command: Commands) -> Result<ExitCode> {
                                 "`agentcells doctor` でも確かめられます。プロセスがなくなれば、次のtickから動きます",
                             ));
                         }
-                        if session.halted() {
-                            println!("\nAIの実行が失敗したので、残りは次のtickで動かします");
-                            why = "ai_failed";
+                        if let Some(halted) = session.halted() {
+                            println!(
+                                "\n{}ので、残りは次のtickで動かします",
+                                if halted == "usage" {
+                                    "使用量が設定を超えた"
+                                } else {
+                                    "AIの実行が失敗した"
+                                }
+                            );
+                            why = halted;
                             break;
                         }
                         if session.exhausted() {
@@ -633,10 +640,23 @@ fn run(command: Commands) -> Result<ExitCode> {
                         Some(reason) => println!("{} に進めました（{reason}）", report.destination),
                         None => println!("{} に進めました", report.destination),
                     }
+                    if let Some(note) = agentcells::blocked::note(&report.blocked) {
+                        println!("{note}");
+                    }
                     session.ran(next, skipped);
                     runs = session.runs();
+                    // 使用量が設定を超えたら、上限に当たる前に止まる（使う人が自分で使う分を残すため）
+                    if let Some(near) = report.near_limit.as_ref().filter(|_| !report.ai_failed) {
+                        session.halt("usage");
+                        let reason = near.reason();
+                        agentcells::limit::pause(&home, near.until, &reason);
+                        println!(
+                            "{reason}のため、あと{}は新しく始めません（急ぐときは `agentcells tick --ignore-pause`。超えている間は、1件動かすたびにまた止まります）",
+                            agentcells::running::elapsed(near.until.saturating_sub(unix_now()))
+                        );
+                    }
                     if report.ai_failed {
-                        session.halt();
+                        session.halt("ai_failed");
                         // 使用量の上限なら戻る時刻まで、ほかの仕事も同じように失敗しそうなら（ログインの切れなど）
                         // しばらく、新しく始めない
                         let now = unix_now();

@@ -856,12 +856,25 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
 
-        /// 1回だけリクエストを受け、届いたヘッダーを返すサーバー。
+        /// 1回だけリクエストを受け、届いたヘッダーを返すサーバー。cellの中で、手元のポートで待ち受けられなければ
+        /// （cellのsandboxは、`bind_localhost` を開けていなければ止める）`None`。外で待ち受けられなければ落とす。
         fn serve_once(
             status: &str,
             body: &'static str,
-        ) -> (String, std::thread::JoinHandle<String>) {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        ) -> Option<(String, std::thread::JoinHandle<String>)> {
+            let listener = match TcpListener::bind("127.0.0.1:0") {
+                Ok(listener) => listener,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        && crate::run::inside_cell() =>
+                {
+                    eprintln!(
+                        "cellのsandboxでは、手元のポートで待ち受けられないので、飛ばします: {e}"
+                    );
+                    return None;
+                }
+                Err(e) => panic!("{e}"),
+            };
             let base = format!("http://{}", listener.local_addr().unwrap());
             let status = status.to_string();
             let handle = std::thread::spawn(move || {
@@ -885,7 +898,7 @@ mod tests {
                 .unwrap();
                 headers
             });
-            (base, handle)
+            Some((base, handle))
         }
 
         /// 環境変数を足して本物のコマンドを動かす。`CURL_HOME` に置いた .curlrc が読まれないかを確かめるのに使う。
@@ -929,7 +942,9 @@ mod tests {
                 "CURL_HOME".to_string(),
                 curl_home.path().display().to_string(),
             )]);
-            let (base, server) = serve_once("200 OK", r#"{"slug":"agentcells-bot"}"#);
+            let Some((base, server)) = serve_once("200 OK", r#"{"slug":"agentcells-bot"}"#) else {
+                return;
+            };
 
             let json = call_api(&probe, &base, "JWT.TEST.SIG", "GET", "/app", None)
                 .unwrap()
@@ -946,7 +961,10 @@ mod tests {
 
         #[test]
         fn reads_the_status_of_errors() {
-            let (base, server) = serve_once("404 Not Found", r#"{"message":"Not Found"}"#);
+            let Some((base, server)) = serve_once("404 Not Found", r#"{"message":"Not Found"}"#)
+            else {
+                return;
+            };
             let found = call_api(&without_proxy(vec![]), &base, "JWT", "GET", "/x", None).unwrap();
             assert_eq!(found, None);
             server.join().unwrap();

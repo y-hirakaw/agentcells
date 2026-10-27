@@ -128,15 +128,10 @@ GitHub Projectsのボード:
 
 ## あとでやること
 
-- 使用量の上限に近づいたら（`rate_limit_event` の `utilization` が設定した割合を超えたら）、上限に当たる前に新しく始めない。使う人が自分でClaude Codeを使う分を残すため（今は、当たってから止まる）
-
 - cellを専用のOSのユーザーで動かす（できれば。必須にはしない）。Claude Codeのsandboxでは、使う人のほかのセッションと共有の `/tmp/claude-<uid>` を塞げず、ホームの外（`/var/folders` など）も読めるため。ユーザーを分ければ、ホームも一時ディレクトリも分かれる
 - ビルドツールのキャッシュを、Issueを書いた人を信頼できるか（メンバーか）で分けるか、仕事ごとの写しにする。今はproductで共有していて、ある仕事のビルドが差し替えたキャッシュの中身（Gradle本体やjar）が、あとの仕事で動きうる
 - betterleaksが秘密でないものを見つけたとき（誤検知）に、人間が見逃してよいと決める方法。今はコミットできず、人間に回る
-- sandboxで止めた通信の先を、AIの報告に任せず、CLIがClaude Codeの出力（`<sandbox_violations>`）から拾って、人間へのコメントに足すとよい設定を書く
 - Claude Desktopのルーティン（A）で、sandboxの設定（読ませる場所、通信してよい先）をどう渡すか。`--settings` を渡せないので、ユーザー設定か作業フォルダの設定に書くことになる（実機で確かめる）
-- implementをつなぐときに、`agentcells cell commit` で、人がそのブランチを開いたときに自動で動くもの（`.claude/`、`.mcp.json`、`.vscode/tasks.json`、`.devcontainer/`、`.envrc`、`.husky/`）の変更を断る。Editのdenyでは、ビルドの中から書くのを止められないため
-- `doctor` で、作業するリポジトリのworkflowが `ac/**` のpushやPRでも動くかを読み、secretsを渡すものがあれば知らせる（AIが書いたコードが、CIでsecrets付きで動くため）
 - PRのブランチに、cellを使う人とagentcells以外の人がpushしたコミットがあれば止める。今は確かめていない（GitHubのAPIでは、誰がpushしたかを確かめにくい。agentcellsがpushしたコミットを覚えておき、それと違えば止める形を考えている）
 
 ## 同時に動かす
