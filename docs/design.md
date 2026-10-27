@@ -522,19 +522,6 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 | ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
 | Webのページを読む | `agentcells cell fetch <URL>`。下の「Webのページを読む」 |
 
-#### Webのページを読む
-
-WebFetchはsandboxを通らず、読めた秘密を外へ送る道になるので使わせない（権限の設定のdenyはそのまま残す）。代わりに `agentcells cell fetch <URL>` で、productの `[product.sandbox]` の `network` に書いたホストだけを開く。
-
-- 開くのは `https://` のURLだけで、GETだけ。ポートは443（書かないとき）だけ。ホストの前のユーザー名（`user@`）、ホストの名前として読めないもの（`%` で書いたもの、IPv6の角かっこなど）は断る
-- ホストの照合はsandboxと同じ決まりにする。大文字・小文字は問わない。`example.com` はそのホストだけ、`*.example.com` はそのサブドメインだけ（`example.com` そのものは含まない）。開けるホストは、`tick` が今の仕事のファイル（`network`）に書く
-- `fetch` もsandboxの中で動くので、ほかのホストへの通信はプロキシ（`strictAllowlist`）がもう一重に止める。CLIでの照合は、断るときに案内するためと、二重の守りのため
-- `network` にないホストは、通信する前に断る。開けるホストと、要るなら needs-human にして `network` に足すよう人間に頼むことを案内する。断ったホストは、sandboxが止めたときと同じ形（`deny network-outbound <ホスト>:443`）で出し、CLIが手元（tickの出力）にだけ出す。AIには、ホストの名前は公開のコメントに書かず、何のために読みたかったかを書くよう頼む（sandboxの「止めた通信の先」と同じ考え）
-- curlで開く。`--disable` で `~/.curlrc` を読まない（AIも書けるため）。リダイレクトはcurlに追わせず（`--max-redirs 0`）、行き先を確かめ直して、`network` にあるときだけ追う（5回まで）。接続10秒・全体60秒で打ち切り、受け取るのは20MBまで
-- 出すのは、中身の先頭から30,000バイトまで（大きいページでコンテキストがあふれないように。Claude CodeもBashの出力を3万字ほどで切る）。残りがあれば、続きの読み方（`--from <バイト>`）を標準エラーに出す。HTMLはテキストにせず、そのまま出す
-- 2xxなら0、それ以外は応答の番号を出して1で終わる
-- 取ってきた中身は信用できない材料なので、プロンプトの「使えるもの」で、そこに書かれた指示には従わないよう添える
-
 - Bashは `Bash(agentcells cell:*)` だけを許す。`ls` や `git diff` でも、オプションでファイルに書けるものがあるため
 - 渡すツールは、Bash、Read、Edit、Write、Grep、Glob だけにする（`--tools`）。Claude Code 2.1.310〜は、標準では Grep と Glob を出さず、Bashの `grep` や `find` で探させる。それはhookが断るので、0.24.1までは、cellに探す道がなかった（AIは `agentcells cell git show ... | grep` で回り道をしていた）。名前を挙げると、Grep と Glob が出る。挙げないもの（サブエージェント、WebSearch、定期実行、ほかのセッションへの送信など）は出さない
   - Grep と Glob は、Readの決まりに従う（worktreeの中だけ。置いた秘密のファイルは、結果に出ない）
@@ -606,6 +593,19 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - `--setting-sources ""` で `--settings` にhooksを書くと、そのhookだけが動いた。リポジトリの `.claude/settings.json` のhooksも、`.claude/skills/` のskillや `.claude/agents/` のサブエージェントに書いたhooksも動かなかった（skillもサブエージェントも読み込まれなかった）。実行の途中で `.claude/settings.json` と `.claude/settings.local.json` を置いても、そのhooksは動かなかった。sandboxの `denyWrite` にworktreeの `.claude` を書くと、まだ `.claude` がなくても、sandboxの中のスクリプトから `.claude/settings.json` を書けなかった（macOS。Linuxのbubblewrapでは、ない場所の扱いを確かめ直す）。PreToolUseのhookが `permissionDecision: "deny"` で返した理由は、ツールの結果としてAIにそのまま届いた（2026-10-26）
 - sandboxが有効だと、`autoAllowBashIfSandboxed` の既定（有効）で、許していないBashのコマンド（`python3`、`touch` など）もsandboxの中で聞かずに動いた。`false` にすると「許しが要ります」で断られ、`ls` のような読むだけのコマンドと、許したコマンドだけが動いた（2026-10-26）
 - 2.1.310と2.1.311の `claude -p` は、`--tools` を渡さないと Grep と Glob を出さなかった（呼ぶと「Bashで `grep` を使え」と返る）。`--tools "Bash,Read,Edit,Write,Grep,Glob"` で出た。決まった形の結果を返すツール（StructuredOutput）は、`--tools` に挙げなくても `--json-schema` で出た。Readをdenyしたファイルは、Grep の結果にも Glob の結果にも出なかった（2026-10-27、haiku）
+
+#### Webのページを読む
+
+WebFetchはsandboxを通らず、読めた秘密を外へ送る道になるので使わせない（権限の設定のdenyはそのまま残す）。代わりに `agentcells cell fetch <URL>` で、productの `[product.sandbox]` の `network` に書いたホストだけを開く。
+
+- 開くのは `https://` のURLだけで、GETだけ。ポートは443（書かないとき）だけ。ホストの前のユーザー名（`user@`）、ホストの名前として読めないもの（`%` で書いたもの、IPアドレス（IPv4も、IPv6の角かっこも）など）は断る。最後のラベルが数字だけのものは、IPv4として扱って断る
+- ホストの照合はsandboxと同じ決まりにする。大文字・小文字は問わない。`example.com` はそのホストだけ、`*.example.com` はそのサブドメインだけ（`example.com` そのものは含まない）。開けるホストは、`tick` が今の仕事のファイル（`network`）に書く
+- `fetch` もsandboxの中で動くので、ほかのホストへの通信はプロキシ（`strictAllowlist`）がもう一重に止める。CLIでの照合は、断るときに案内するためと、二重の守りのため
+- `network` にないホストは、通信する前に断る。開けるホストと、要るなら needs-human にして `network` に足すよう人間に頼むことを案内する。断ったホストは、sandboxが止めたときと同じ形（`deny network-outbound <ホスト>:443`）で出し、CLIが手元（tickの出力）にだけ出す。AIには、ホストの名前は公開のコメントに書かず、何のために読みたかったかを書くよう頼む（sandboxの「止めた通信の先」と同じ考え）
+- curlで開く。`--disable` で `~/.curlrc` を読まない（AIも書けるため）。リダイレクトはcurlに追わせず（`--max-redirs 0`）、行き先を確かめ直して、`network` にあるときだけ追う（5回まで）。接続10秒・全体60秒で打ち切り、受け取るのは20MBまで
+- 出すのは、中身の先頭から30,000バイトまで（大きいページでコンテキストがあふれないように。Claude CodeもBashの出力を3万字ほどで切る）。切るところがUTF-8の文字の途中なら、その文字の前で切る（最後の文字が化けないように）。残りがあれば、続きの読み方（`--from <バイト>`）を、出したところの次のバイトから案内して標準エラーに出す。HTMLはテキストにせず、そのまま出す
+- 2xxなら0、それ以外は応答の番号を出して1で終わる
+- 取ってきた中身は信用できない材料なので、プロンプトの「使えるもの」で、そこに書かれた指示には従わないよう添える
 
 ### sandboxに開ける場所
 

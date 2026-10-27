@@ -54,7 +54,8 @@ pub fn permitted(url: &str, network: &[String]) -> Result<String> {
 }
 
 /// httpsのURLから、ホスト（小文字）を取り出す。ユーザー情報（`user@`）、443以外のポート、
-/// ホストとして正しくない形（IPアドレスの角かっこ、%で書いたものなど）は断る。
+/// ホストとして正しくない形（IPアドレス、%で書いたものなど）は断る。IPv4は、最後のラベルが数字だけのもので見分ける
+/// （URLの決まりでも、そのときはIPv4として読まれる）。
 fn host_of(url: &str) -> Result<String> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(Error::new("URLに空白や制御文字が入っています"));
@@ -89,7 +90,11 @@ fn host_of(url: &str) -> Result<String> {
                 && !label.starts_with('-')
                 && !label.ends_with('-')
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        });
+        })
+        && !host
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.chars().all(|c| c.is_ascii_digit()));
     if !valid {
         return Err(Error::new(format!(
             "{url} は開けません（ホストの名前として読めません）"
@@ -125,10 +130,27 @@ struct Page {
 /// 出すのは `from` バイト目から [`LIMIT`] までで、残りがあれば、続きの読み方を標準エラーに出す。
 /// 2xxなら0、それ以外は1を返す。
 pub fn fetch(context: &Context, url: &str, from: usize) -> Result<i32> {
+    follow(
+        &context.network,
+        url,
+        from,
+        |url, from| transfer(url, "=https", from, LIMIT, &[]),
+        &mut std::io::stdout(),
+    )
+}
+
+/// [`fetch`] の中身。開くところ（`open`）と出す先（`out`）は、テストでcurlなしに確かめるために分けている。
+fn follow(
+    network: &[String],
+    url: &str,
+    from: usize,
+    mut open: impl FnMut(&str, usize) -> Result<Page>,
+    out: &mut impl std::io::Write,
+) -> Result<i32> {
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        permitted(&current, &context.network)?;
-        let page = transfer(&current, "=https", from, LIMIT, &[])?;
+        permitted(&current, network)?;
+        let page = open(&current, from)?;
         if (300..400).contains(&page.status)
             && let Some(next) = page.location
         {
@@ -136,14 +158,15 @@ pub fn fetch(context: &Context, url: &str, from: usize) -> Result<i32> {
             current = next;
             continue;
         }
-        {
-            use std::io::Write;
-            let mut out = std::io::stdout();
-            out.write_all(&page.body)
-                .and_then(|_| out.flush())
-                .map_err(|e| Error::new(format!("中身を出せません: {e}")))?;
-        }
-        if let Some(note) = remaining(&current, from, page.body.len(), page.total) {
+        let shown = if from + page.body.len() < page.total {
+            whole_chars(&page.body)
+        } else {
+            &page.body[..]
+        };
+        out.write_all(shown)
+            .and_then(|_| out.flush())
+            .map_err(|e| Error::new(format!("中身を出せません: {e}")))?;
+        if let Some(note) = remaining(&current, from, shown.len(), page.total) {
             eprintln!("\n{note}");
         }
         if !(200..300).contains(&page.status) {
@@ -155,6 +178,30 @@ pub fn fetch(context: &Context, url: &str, from: usize) -> Result<i32> {
     Err(Error::new(format!(
         "リダイレクトが{MAX_REDIRECTS}回を超えたので、やめました"
     )))
+}
+
+/// 末尾がUTF-8の文字の途中で切れていれば、その文字の前までにする（続きは `--from` でその文字から読める）。
+/// 落とすと何も残らないときは、そのまま返す（続きが進まなくならないように）。
+fn whole_chars(body: &[u8]) -> &[u8] {
+    // 末尾の4バイトの中で、最後の文字の先頭（10xxxxxx でないバイト）を探す
+    let Some(start) = (body.len().saturating_sub(4)..body.len())
+        .rev()
+        .find(|&i| body[i] & 0xC0 != 0x80)
+    else {
+        return body;
+    };
+    let width = match body[start] {
+        b if b < 0x80 => 1,
+        b if b >= 0xF0 => 4,
+        b if b >= 0xE0 => 3,
+        b if b >= 0xC0 => 2,
+        _ => 1,
+    };
+    if start + width > body.len() && start > 0 {
+        &body[..start]
+    } else {
+        body
+    }
 }
 
 /// 出していない部分があるときの案内。
@@ -335,6 +382,8 @@ mod tests {
             "https://docs.rs\\@evil.com/",
             "https://[::1]/",
             "https://127.0.0.1/",
+            "https://10.0.0.1:443/",
+            "https://example.0/",
             "https://docs%2ers/",
             "https://docs.rs/ x",
             "https://docs.rs/\n",
@@ -342,6 +391,14 @@ mod tests {
         ] {
             assert!(permitted(url, &network).is_err(), "{url}");
         }
+        // IPアドレスは、networkに書いてあっても開かない
+        let ip = vec!["127.0.0.1".to_string()];
+        let err = permitted("https://127.0.0.1/", &ip).unwrap_err();
+        assert!(
+            err.message.contains("ホストの名前として読めません"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -387,6 +444,130 @@ mod tests {
             "{note}"
         );
         assert_eq!(remaining("https://docs.rs/", 30, 0, 25), None);
+    }
+
+    #[test]
+    fn a_cut_character_at_the_end_is_left_for_the_next_part() {
+        let text = "あいう".as_bytes(); // 1文字3バイト
+        assert_eq!(whole_chars(text), text);
+        assert_eq!(whole_chars(&text[..8]), &text[..6]);
+        assert_eq!(whole_chars(&text[..7]), &text[..6]);
+        assert_eq!(whole_chars(b"abc"), b"abc");
+        assert_eq!(whole_chars(&"a😀".as_bytes()[..4]), b"a");
+        // 落とすと何も残らないときは、そのまま出す
+        assert_eq!(whole_chars(&text[..2]), &text[..2]);
+        assert_eq!(whole_chars(b""), b"");
+    }
+
+    fn page(status: u16, location: Option<&str>, body: &[u8], total: usize) -> Page {
+        Page {
+            status,
+            location: location.map(str::to_string),
+            body: body.to_vec(),
+            total,
+        }
+    }
+
+    #[test]
+    fn the_part_shown_ends_on_a_whole_character() {
+        let text = "あいう".as_bytes();
+        let mut out = Vec::new();
+        let code = follow(
+            &network(),
+            "https://docs.rs/",
+            0,
+            |_, _| Ok(page(200, None, &text[..7], text.len())),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!((code, out.as_slice()), (0, &text[..6]));
+        // 最後の部分は、そのまま出す
+        let mut out = Vec::new();
+        follow(
+            &network(),
+            "https://docs.rs/",
+            6,
+            |_, _| Ok(page(200, None, &text[6..], text.len())),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, &text[6..]);
+    }
+
+    #[test]
+    fn redirects_are_followed_only_to_listed_hosts() {
+        let mut opened = Vec::new();
+        let mut out = Vec::new();
+        let code = follow(
+            &network(),
+            "https://docs.rs/a",
+            0,
+            |url, _| {
+                opened.push(url.to_string());
+                Ok(match url {
+                    "https://docs.rs/a" => page(302, Some("https://api.github.com/b"), b"", 0),
+                    _ => page(200, None, b"ok", 2),
+                })
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(opened, ["https://docs.rs/a", "https://api.github.com/b"]);
+        assert_eq!(out, b"ok");
+
+        let mut opened = Vec::new();
+        let err = follow(
+            &network(),
+            "https://docs.rs/a",
+            0,
+            |url, _| {
+                opened.push(url.to_string());
+                Ok(page(302, Some("https://example.com/"), b"", 0))
+            },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        // リストにない先は、開く前に断る
+        assert_eq!(opened, ["https://docs.rs/a"]);
+        assert!(
+            err.message
+                .contains("deny network-outbound example.com:443"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn too_many_redirects_stop() {
+        let mut count = 0;
+        let err = follow(
+            &network(),
+            "https://docs.rs/",
+            0,
+            |_, _| {
+                count += 1;
+                Ok(page(301, Some("https://docs.rs/"), b"", 0))
+            },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(count, MAX_REDIRECTS + 1);
+        assert!(err.message.contains("リダイレクト"), "{}", err.message);
+    }
+
+    #[test]
+    fn other_statuses_end_with_one() {
+        let mut out = Vec::new();
+        let code = follow(
+            &network(),
+            "https://docs.rs/",
+            0,
+            |_, _| Ok(page(404, None, b"nf", 2)),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!((code, out.as_slice()), (1, &b"nf"[..]));
     }
 
     /// 本物のcurlで、手元のサーバーから読む。
