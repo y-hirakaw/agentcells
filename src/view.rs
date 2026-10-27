@@ -110,7 +110,9 @@ enum Route {
     Under(i64),
 }
 
-struct Belt {
+struct Belt<'a> {
+    from_name: &'a str,
+    to_name: &'a str,
     from: Place,
     to: Place,
     route: Route,
@@ -126,16 +128,22 @@ fn render_line(html: &mut String, line: &Line) {
     }
     let last_col = columns.keys().next_back().copied().unwrap_or(0) as i64;
     let exit_col = last_col + 1;
+    // stop は done の右の列に置く。done の下に置くと、上を回って stop へ行くベルトが done の箱を縦に抜けて、
+    // done から stop へ出ていくように見えるため
+    let stop_col = exit_col + 1;
     let rows = columns.values().map(Vec::len).max().unwrap_or(1).max(1) as i64;
     let uses_stop = line
         .stations
         .iter()
         .any(|s| s.cell.next.iter().any(|n| n == STOP));
+    let last_exit_col = if uses_stop { stop_col } else { exit_col };
 
     // 先に、上と下を回るベルトの数を数えて、その分の場所をあける
     let col_of = |name: &str| -> i64 {
-        if name == DONE || name == STOP {
+        if name == DONE {
             exit_col
+        } else if name == STOP {
+            stop_col
         } else {
             line.station(name).map_or(0, |s| s.depth as i64)
         }
@@ -157,7 +165,7 @@ fn render_line(html: &mut String, line: &Line) {
     let under_bottom = machines_bottom + 30 + under * 22;
     let rail_y = under_bottom + 40;
     let height = rail_y + 70;
-    let width = PAD_X * 2 + (exit_col + 1) * COL_W;
+    let width = PAD_X * 2 + (last_exit_col + 1) * COL_W;
 
     let mut places: BTreeMap<&str, Place> = BTreeMap::new();
     for (depth, stations) in &columns {
@@ -174,16 +182,17 @@ fn render_line(html: &mut String, line: &Line) {
             );
         }
     }
-    let exit_place = |row: i64| Place {
-        x: PAD_X + exit_col * COL_W,
-        y: top + row * ROW_H.min(EXIT_H + 40) + (MACHINE_H - EXIT_H) / 2,
+    // 出口は1段目の機械と同じ高さに置くので、箱の下の端は機械の下の端より上にある
+    let exit_place = |col: i64| Place {
+        x: PAD_X + col * COL_W,
+        y: top + (MACHINE_H - EXIT_H) / 2,
         w: EXIT_W,
         h: EXIT_H,
-        col: exit_col,
+        col,
     };
-    places.insert(DONE, exit_place(0));
+    places.insert(DONE, exit_place(exit_col));
     if uses_stop {
-        places.insert(STOP, exit_place(1));
+        places.insert(STOP, exit_place(stop_col));
     }
 
     let mut belts = Vec::new();
@@ -213,6 +222,8 @@ fn render_line(html: &mut String, line: &Line) {
                 "belt"
             };
             belts.push(Belt {
+                from_name: s.cell.name.as_str(),
+                to_name: next,
                 from,
                 to,
                 route,
@@ -348,8 +359,10 @@ fn render_belt(html: &mut String, belt: &Belt) {
     );
     let _ = write!(
         html,
-        "<g class=\"{}\"><path class=\"base\" d=\"{d}\"/><path class=\"stripes\" d=\"{d}\" marker-end=\"url(#arrow)\"/>",
-        belt.class
+        "<g class=\"{}\" data-from=\"{}\" data-to=\"{}\"><path class=\"base\" d=\"{d}\"/><path class=\"stripes\" d=\"{d}\" marker-end=\"url(#arrow)\"/>",
+        belt.class,
+        escape(belt.from_name),
+        escape(belt.to_name)
     );
     if let Some(note) = belt.note {
         // ベジェ曲線のまんなか（t = 0.5）
@@ -673,6 +686,70 @@ next = ["stop", "done"]
         assert!(html.contains("ac:review&lt;b&gt;"));
         assert!(!html.contains("ac:review<b>"));
         assert_eq!(escape("a&\"'<>"), "a&amp;&quot;&#39;&lt;&gt;");
+    }
+
+    /// `marker` のあとに出てくる、最初の `name="..."` の数。
+    fn number_after(html: &str, marker: &str, name: &str) -> i64 {
+        let rest = &html[html.find(marker).unwrap_or_else(|| panic!("{marker}"))..];
+        let key = format!("{name}=\"");
+        let rest = &rest[rest.find(&key).unwrap() + key.len()..];
+        rest[..rest.find('"').unwrap()].parse().unwrap()
+    }
+
+    /// 出口の箱（x, y, 幅, 高さ）。
+    fn exit_box(html: &str, name: &str) -> (i64, i64, i64, i64) {
+        let marker = format!("<g class=\"exit {name}\">");
+        let n = |attr| number_after(html, &marker, attr);
+        (n("x"), n("y"), n("width"), n("height"))
+    }
+
+    /// ベルトの道すじの点（M と C の4つ）。
+    fn belt_points(html: &str, from: &str, to: &str) -> Vec<(i64, i64)> {
+        let marker = format!("data-from=\"{from}\" data-to=\"{to}\"><path class=\"base\" d=\"");
+        let rest = &html[html.find(&marker).unwrap_or_else(|| panic!("{marker}")) + marker.len()..];
+        rest[..rest.find('"').unwrap()]
+            .split([' ', 'M', 'C'])
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (x, y) = p.split_once(',').unwrap();
+                (x.parse().unwrap(), y.parse().unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn belts_to_stop_do_not_run_through_done() {
+        // triage から stop へは、列を3つとばして上を回る
+        let text = CONFIG.replace(
+            "next = [\"implement\", \"done\"]\nmodel",
+            "next = [\"implement\", \"stop\", \"done\"]\nmodel",
+        );
+        let config = Config::parse(&text, std::path::Path::new("/")).unwrap();
+        let html = render(&flow::read(&config));
+        let line = &html[..html.find("LINE</span> docs").unwrap()];
+        let (dx, dy, dw, _) = exit_box(line, "done");
+        let (sx, _, _, _) = exit_box(line, "stop");
+        // stop は done の右に置く
+        assert!(sx >= dx + dw, "stop {sx} / done {dx}..{}", dx + dw);
+        for from in ["triage", "review"] {
+            let points = belt_points(line, from, "stop");
+            // 上を回る道は done の箱より上を通り、done の箱の幅の中で降りない
+            let (lane_end, end) = (points[2], points[3]);
+            assert!(lane_end.1 < dy, "{from}: {points:?}");
+            assert!(end.0 > dx + dw, "{from}: {points:?}");
+        }
+    }
+
+    #[test]
+    fn the_human_rail_runs_below_the_exits() {
+        let html = html();
+        // docs のラインは、機械が assess の1台だけで、下を回るベルトもない
+        let line = &html[html.find("LINE</span> docs").unwrap()..];
+        let rail_y = number_after(line, "<line class=\"rail\"", "y1");
+        for exit in ["done", "stop"] {
+            let (_, y, _, h) = exit_box(line, exit);
+            assert!(y + h < rail_y, "{exit}: {} / rail {rail_y}", y + h);
+        }
     }
 
     #[test]
