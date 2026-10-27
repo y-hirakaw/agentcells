@@ -34,6 +34,8 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # test = "npm test"
 # build = "npm run build"
 #
+# protected = ["src/hook.rs", "prompts/"]  # 守るファイル（リポジトリからの相対パス。ディレクトリならその下すべて）。変えたPRは、レビューのcellに特に確かめさせ、検品に回すときにそう書き足す
+#
 # [product.next]                     # このproductでだけ、cellの進め先を替える（cellはファイル全体で1つずつ定義するため）
 # assess = ["stop", "done"]
 #
@@ -183,6 +185,26 @@ pub struct Product {
     /// 1つずつ定義するので、productごとに進め先を変えたいときに使う
     #[serde(default)]
     pub next: BTreeMap<String, Vec<String>>,
+    /// 守るファイル（hookや権限、CIの設定など、AIの守りそのもの）。リポジトリからの相対パスで、その下すべても含む。変えたPRは、レビューのcellに特に確かめさせ、検品に回すときにCLIがそう書き足す
+    #[serde(default)]
+    pub protected: Vec<String>,
+}
+
+impl Product {
+    /// `path`（リポジトリからの相対パス）が、守るファイルか。
+    /// 書いたパスそのものと、その下すべてに当たる（`/` で終えるかどうかによらない。ディレクトリを
+    /// submoduleやファイルに置き換えたときも当たるように）。大文字と小文字は区別しない（macOSでは同じファイルになる）。
+    pub fn protects(&self, path: &str) -> bool {
+        let path = path.to_ascii_lowercase();
+        self.protected.iter().any(|entry| {
+            let entry = entry
+                .strip_suffix('/')
+                .unwrap_or(entry)
+                .to_ascii_lowercase();
+            path.strip_prefix(&entry)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    }
 }
 
 /// AIが動かすコマンドは、sandboxの中で動く。標準では、ホームの下は今の仕事の場所しか読めず、外へは通信できない。
@@ -498,6 +520,18 @@ impl Config {
                         "product「{}」の sandbox.read_placed の「{}」は、リポジトリからの相対パスで書いてください（`..` は使えません）",
                         p.name,
                         path.display()
+                    ));
+                }
+            }
+            for entry in &p.protected {
+                // gitのパスと同じ形でないと、何にも当たらないまま守ったつもりになる
+                let path = entry.strip_suffix('/').unwrap_or(entry);
+                if path.split('/').any(|part| {
+                    matches!(part, "" | "." | "..") || part.contains(['\\', '*', '?', '['])
+                }) {
+                    problems.push(format!(
+                        "product「{}」の protected の「{entry}」は、リポジトリからの相対パスで書いてください（例: src/hook.rs、prompts/。`.` や `..`、`\\`、`*` などのワイルドカードは使えません）",
+                        p.name
                     ));
                 }
             }
@@ -1126,6 +1160,55 @@ timeout_minutes = 10
         let message = problems_of(&bad);
         assert!(message.contains("「Run_Tests」に使えない文字"), "{message}");
         assert!(message.contains("が空です"), "{message}");
+    }
+
+    #[test]
+    fn products_can_protect_files() {
+        let text = VALID.replace(
+            "cells = [\"triage\", \"review\"]",
+            "cells = [\"triage\", \"review\"]\nprotected = [\"src/hook.rs\", \"prompts/\", \".github/\"]",
+        );
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(&text, dir.path()).unwrap();
+        let product = &config.products[0];
+        for path in [
+            "src/hook.rs",
+            "prompts/common.md",
+            ".github/workflows/ci.yml",
+        ] {
+            assert!(product.protects(path), "{path}");
+        }
+        for path in ["SRC/Hook.rs", ".GitHub/x", "prompts"] {
+            assert!(product.protects(path), "{path}");
+        }
+        for path in [
+            "src/hook.rs.bak",
+            "src/main.rs",
+            "prompts.md",
+            "src/prompts/x",
+        ] {
+            assert!(!product.protects(path), "{path}");
+        }
+        // 書かなければ、何も守らない
+        let config = Config::parse(VALID, dir.path()).unwrap();
+        assert!(!config.products[0].protects("src/hook.rs"));
+
+        let bad = text.replace(
+            "\"src/hook.rs\", \"prompts/\"",
+            "\"/src/hook.rs\", \"./prompts/\", \"a/../b\", \"src\\\\hook.rs\", \"/\", \"a//b\", \".github/*\"",
+        );
+        let message = problems_of(&bad);
+        for entry in [
+            "/src/hook.rs",
+            "./prompts/",
+            "a/../b",
+            "src\\hook.rs",
+            "「/」",
+            "a//b",
+            ".github/*",
+        ] {
+            assert!(message.contains(entry), "{entry}: {message}");
+        }
     }
 
     #[test]

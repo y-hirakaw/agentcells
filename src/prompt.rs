@@ -90,6 +90,8 @@ pub struct Task {
     pub guides: Option<Guides>,
     /// `agentcells cell run` で使える名前（productの `commands`）。動かすときにCLIが入れる
     pub commands: Option<Vec<String>>,
+    /// PRが変えた、守るファイル（productの `protected`）。動かすときにCLIがベースとの差分から入れる
+    pub protected: Vec<String>,
 }
 
 /// 開発のルールのファイルと、読んだブランチ。
@@ -478,6 +480,17 @@ fn task_section(cell: &Cell, task: &Task) -> String {
             "- ベースブランチ: {base}（差分は `agentcells cell git diff origin/{base}...HEAD` で見られます）"
         ));
     }
+    if cell.review && !task.protected.is_empty() {
+        let files: Vec<String> = task
+            .protected
+            .iter()
+            .map(|f| format!("`{}`", crate::display::printable(f).replace('`', "'")))
+            .collect();
+        out.push(format!(
+            "- **このPRは、守るファイルを変えています:** {}。AIの守り（断ること、絞ること、人に確かめること）にかかわるファイルです。守りを緩めていないか、すり抜ける道を作っていないかを、特に確かめてください",
+            files.join("、")
+        ));
+    }
     if let Some(conflict) = &task.conflict {
         // ファイル名は、ほかの人が入れたコミットから来るので、制御文字を置き換える
         let files: Vec<String> = conflict
@@ -718,6 +731,7 @@ pub fn fetch_task(
         conflict: None,
         guides: None,
         commands: None,
+        protected: Vec::new(),
     })
 }
 
@@ -882,7 +896,27 @@ mod tests {
             conflict: None,
             guides: None,
             commands: Some(vec!["lint".to_string(), "test".to_string()]),
+            protected: Vec::new(),
         }
+    }
+
+    #[test]
+    fn review_cells_are_told_about_protected_files() {
+        let mut task = task(Vec::new(), "bot[bot]");
+        task.protected = vec!["src/hook.rs".to_string()];
+        let review = Cell {
+            review: true,
+            ..cell("review", &["implement", "done"])
+        };
+        let prompt = user_prompt(&review, None, Some(&task));
+        assert!(
+            prompt.contains("守るファイルを変えています:** `src/hook.rs`"),
+            "{prompt}"
+        );
+        let implement = user_prompt(&cell("implement", &["review"]), None, Some(&task));
+        assert!(!implement.contains("守るファイル"), "{implement}");
+        task.protected.clear();
+        assert!(!user_prompt(&review, None, Some(&task)).contains("守るファイル"));
     }
 
     #[test]
