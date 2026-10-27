@@ -280,7 +280,7 @@ timeout_minutes = 30
 
 ### 1件を動かす流れ
 
-`src/run.rs`。
+`src/run.rs`（`claude -p` の起動は `src/run/claude.rs`、プロセスの片付けは `process.rs`、作業の場所は `place.rs`、ブランチとpush、pushしない作業のbundleは `branch.rs`、Issue/PRへの書き込みは `issue.rs`）。
 
 1. `ac:working` を付ける
 2. Issueを読み、もう一度ガード（「動かすIssue/PRを決める」）を通す。確かめてから読むまでの間の書き換えを見逃さないため。見送るときは、コメントをせずに `ac:working` だけ外す（外せなくても、コメントはしない）
