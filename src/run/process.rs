@@ -343,3 +343,28 @@ pub(super) fn is_alive(pid: u32) -> bool {
         })
         .unwrap_or(false)
 }
+
+/// cellの中（`agentcells cell run` のテスト）で動いているか。cellのsandboxでは、プロセスの一覧や手元のポートが
+/// 使えないので、それを使うテストは、cellの中のときだけ飛ばす（外で同じことが起きたら、壊れたとして落とす）。
+#[cfg(test)]
+pub(crate) fn inside_cell() -> bool {
+    std::env::var_os(RUN_MARK_ENV).is_some()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// 止めきれなかったプロセスの目印（`stuck`）は、この一覧で「まだ残っているか」を見る。一覧が壊れて空になると、
+    /// 残っていても「もうない」とみなして、次の仕事を始めてしまうので、自分が見えることを確かめる。
+    #[test]
+    fn the_process_table_sees_this_process() {
+        let me = std::process::id();
+        let seen = process_table().iter().any(|r| r.0 == me && !r.3.is_empty());
+        if !seen && inside_cell() {
+            eprintln!("cellのsandboxでは、プロセスの一覧が見えないので、飛ばします");
+            return;
+        }
+        assert!(seen, "ps の一覧に、このテストのプロセスが見えません");
+    }
+}

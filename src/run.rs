@@ -52,6 +52,8 @@ use claude::{CELL_TOOLS, CLAUDE_LOG, ClaudeEnd, ClaudeRun, failure_kind};
 use issue::{Issue, present};
 use place::Place;
 pub use place::claude_log;
+#[cfg(test)]
+pub(crate) use process::inside_cell;
 pub(crate) use process::is_alive_leftover;
 pub use process::{Leftover, stuck};
 use process::{Stuck, command_of, current_process, stuck_path};
@@ -1101,11 +1103,15 @@ mod tests {
         };
         // 止めきれなかったものとして、今動いているこのテストのプロセスを渡す
         let me = std::process::id();
-        let started = process_table()
-            .into_iter()
-            .find(|r| r.0 == me)
-            .map(|r| r.3)
-            .unwrap();
+        // cellのsandboxの中では、プロセスの一覧（ps）が見えないので飛ばす。外で見えなければ、壊れたとして落とす
+        let Some(started) = process_table().into_iter().find(|r| r.0 == me).map(|r| r.3) else {
+            assert!(
+                inside_cell(),
+                "ps の一覧に、このテストのプロセスが見えません"
+            );
+            eprintln!("cellのsandboxでは、プロセスの一覧が見えないので、飛ばします");
+            return;
+        };
         let e = runner.fail(
             Failure::Unstopped(vec![Leftover {
                 pid: me,
