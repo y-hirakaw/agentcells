@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::github;
-use crate::home::Home;
+use crate::home::{Home, RepoName};
 use crate::labels;
 use crate::probe::Probe;
 use crate::settings;
@@ -93,6 +93,7 @@ pub fn run(
         && !config.products.is_empty()
     {
         checks.push(check_labels(config, probe));
+        checks.push(check_workflows(config, probe));
     }
     checks
 }
@@ -396,6 +397,48 @@ fn check_labels(config: &Config, probe: &dyn Probe) -> Check {
     }
 }
 
+/// 作業するリポジトリのworkflowが、cellのブランチ（`ac/...`）のpushやPRで、secrets付きで動きうるかを確かめる。
+/// AIが書いたコードが、CIでsecrets付きで動くため（[`crate::workflows`]）。
+fn check_workflows(config: &Config, probe: &dyn Probe) -> Check {
+    const NAME: &str = "workflows";
+    let mut repos: Vec<&RepoName> = config.products.iter().flat_map(|p| &p.repos).collect();
+    repos.sort_by_key(|r| r.to_string());
+    repos.dedup();
+    let mut found = Vec::new();
+    let mut unread = Vec::new();
+    for repo in repos {
+        match crate::workflows::risks(probe, repo) {
+            Ok(risks) => found.extend(
+                risks
+                    .into_iter()
+                    .map(|r| format!("{repo} の {}: {}", r.file, r.why)),
+            ),
+            Err(e) => unread.push(e.message),
+        }
+    }
+    if !found.is_empty() {
+        return Check::warn(
+            NAME,
+            format!(
+                "AIが書いたコードを、CIでsecrets付きで動かしうるworkflowがあります:\n{}",
+                found.join("\n")
+            ),
+            "cellのブランチ（ac/...）で動かないように branches で絞るか、secretsを使うjobを environment の承認で守ってください。もう絞っていれば、そのままでかまいません（文字列から探しているので、多めに出ます）",
+        );
+    }
+    if !unread.is_empty() {
+        return Check::warn(
+            NAME,
+            format!("workflowを確かめられません: {}", unread.join(" / ")),
+            "ghのログインとリポジトリの名前を確かめてください",
+        );
+    }
+    Check::ok(
+        NAME,
+        "cellのブランチでsecretsを使うworkflowは見つかりませんでした",
+    )
+}
+
 /// 書き込みに使うアカウントを確かめる。GitHub Appを推奨し、なければghのアカウントで動くことを知らせる。
 fn check_github(config: Option<&Config>, probe: &dyn Probe) -> Check {
     const NAME: &str = "github";
@@ -539,8 +582,25 @@ mod tests {
         assert_eq!(check_git(&new).status, Status::Ok);
     }
 
+    fn workflows_key() -> String {
+        format!(
+            "gh api graphql -f query={} -f owner=octo -f name=app",
+            crate::workflows::QUERY
+        )
+    }
+
     fn healthy() -> FakeProbe {
         with_app(FakeProbe::default())
+            .with(
+                &workflows_key(),
+                true,
+                r#"{"data":{"repository":{"object":null}}}"#,
+            )
+            .with(
+                "gh api repos/octo/app/actions/permissions/workflow",
+                true,
+                r#"{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}"#,
+            )
             .with("git --version", true, "git version 2.50.1\n")
             .with("gh --version", true, "gh version 2.87.2\n")
             .with("gh auth status", true, "")
@@ -971,6 +1031,56 @@ private_key = "github-app.pem"
             check.detail
         );
         assert!(check.fix.unwrap().contains("agentcells labels sync"));
+    }
+
+    #[test]
+    fn workflows_that_run_with_secrets_warn() {
+        let (_dir, home, path) = setup_home();
+        let mut probe = healthy();
+        let workflows = serde_json::json!({"data": {"repository": {"object": {"entries": [
+            {"name": "ci.yml", "object": {"text": "on: [push]\nenv:\n  T: ${{ secrets.GITHUB_TOKEN }}\n"}},
+            {"name": "deploy.yml", "object": {"text": "on: [push]\nenv:\n  K: ${{ secrets.DEPLOY_KEY }}\n"}},
+            {"name": "README.md", "object": {"text": "on: push secrets.X"}},
+            {"name": "big.yml", "object": null}
+        ]}}}});
+        probe.outputs.insert(
+            workflows_key(),
+            crate::probe::Output {
+                success: true,
+                code: Some(0),
+                stdout: workflows.to_string(),
+                stderr: String::new(),
+            },
+        );
+        let check = find(&run(&home, Some(&path), None, &probe), "workflows").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check
+                .detail
+                .contains("octo/app の deploy.yml: cellのブランチのpushやPRで動きうるうえ、secrets（DEPLOY_KEY）を使っています"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains("ci.yml"), "{}", check.detail);
+        assert!(!check.detail.contains("README"), "{}", check.detail);
+        assert!(
+            check.detail.contains("big.yml: 中身を読めませんでした"),
+            "{}",
+            check.detail
+        );
+        // GITHUB_TOKEN の既定の権限が書き込みなら知らせる
+        let probe = healthy().with(
+            "gh api repos/octo/app/actions/permissions/workflow",
+            true,
+            r#"{"default_workflow_permissions":"write"}"#,
+        );
+        let check = find(&run(&home, Some(&path), None, &probe), "workflows").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("既定の権限が書き込み"),
+            "{}",
+            check.detail
+        );
     }
 
     #[test]

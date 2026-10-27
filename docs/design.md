@@ -304,6 +304,8 @@ timeout_minutes = 30
 - claudeのあと、AIが足したコミット（動かす前のブランチの先から）があれば、次のとおりにする
   - CLIがその場で作ったbareリポジトリにブランチを移し（`pr::stage`）、そこで確かめる。AIが書き換えられる `.git/config` を読まないため
   - 確かめること（`pr::verify`）: 足したコミットのどれかに、置いた秘密のファイルと同じ中身のファイルがない（名前を変えても、途中のコミットだけでも）。人が開いたときに自動で動くファイル（`.claude/`、`.mcp.json`、`.vscode/`、`.idea/`、`.zed/`、`.cursor/`、`.devcontainer/`、`.devcontainer.json`、`.envrc`、`.husky/`、`.gitattributes`、`.gitmodules`、`.github/workflows/`。`.envrc`、`.gitattributes`、`.claude`、`.mcp.json` は下のディレクトリにあっても）を変えていない。シンボリックリンクとsubmoduleを足していない。足した行に、betterleaksが見つける秘密らしいものがない（途中のコミットで足して消したものも）。AIはsandboxの中から、`agentcells cell commit` を通さずにコミットを作れるので、ここで見る
+  - 自動で動くファイル、シンボリックリンク、submoduleは、`agentcells cell commit` でも断る（判定は同じ関数 `pr::autorun`。マージの途中なら、自動でマージした結果と比べるので、ベースから来たものでは断らない）。pushの前に断られると、その実行の作業はまるごと人間に回るが、コミットの時点で断れば、AIがその変更を外して続けられる。作業にどうしても要るなら、AIはほかの変更をコミットしてから人間に回す
+    - これは早めに知らせるためのもの。ビルドは `.git` の実体（index、`MERGE_HEAD` など）に書けるので、コミットの時点の確かめは回避できる。本当の守りは、pushの前の `pr::verify`。こちらを緩めないこと
   - 問題があれば、pushせずに人間に回す（理由に秘密そのものは書かない）。コメントには、理由ごとに「次にすること」を書く（マージコミットなら、ぶつかりを手で解消してpushしてからコメントする、など）。何が起きて、何をすれば続きが動くかが分からないと、人が止まってしまうため
   - pushしなかったAIの作業（コミット）は、gitのbundleとして `~/.agentcells/kept/<owner>/<repo>/<番号>/<時刻>.bundle` に残し、取り出し方（`git fetch <bundle> <ブランチ>:ai-work`）をコメントに書く。作業場所は実行のあとに消え、実行の記録の場所は次の実行で空になるため。確かめで断ったときのほか、CLIが人間に回したとき（時間切れ、AIの結果を読めない、ラベルの変化など）も、コミットがあれば残す。秘密らしいもので断った作業も入るので、`kept/` から下は700、bundleは600にする。30日たったものは、次に残すときに消す。使用量の上限で止まったときは、同じ仕事を動かし直すので残さない
   - pushは、そのbareリポジトリから、書き込みのトークンで行う
@@ -326,6 +328,13 @@ timeout_minutes = 30
   - `on: push` のworkflowに `branches-ignore: ['ac/**']` を付ける
   - リポジトリの設定で、`GITHUB_TOKEN` の既定の権限を読み取りだけにする
   - secretsは、承認が要るenvironmentに入れる
+  - `doctor` は、作業するリポジトリの既定のブランチの `.github/workflows` を読み、次のものを知らせる（注意。止めはしない）
+    - `pull_request_target` か `workflow_run` で動くもの
+    - cellのブランチのコードで動きうるきっかけ（`push`、`pull_request`、`pull_request_review`、`pull_request_review_comment`、`create`。cellのレビューやコメントでも動く）で動き、`GITHUB_TOKEN` 以外のsecrets（`secrets: inherit`、`toJSON(secrets)` のような名前の分からない使い方を含む）を使うものか、`GITHUB_TOKEN` に書き込みの権限（`write-all`、`contents: write`）を付けるもの
+    - 中身を読めなかったworkflow（大きいか、文字でない）
+    - リポジトリの設定で、`GITHUB_TOKEN` の既定の権限が書き込みのとき（読めなければ、そう知らせる。管理の権限が要る）
+    - 書き込みの権限は、空白と引用符を除いてから、`write-all` と `contents`・`id-token`・`packages`・`actions`・`deployments` の `:write` を探す
+    - YAMLとしては読まず、文字列から探すので、ブランチを絞っていても出る（多めに出す向き）。`pull_request` の `branches` は、ベースのブランチを絞るもので、`branches: [main]` でもcellのPRで動くので、軽い判定では外さない
   - `on: issues` のworkflowでは、Issueの題や本文を `run:` に `${{ github.event.issue.title }}` のように埋め込まず、環境変数で渡す。cellが別のIssueを出すとき（「作業と関係のない問題」）、題と本文はAIが書く。題や本文の `@` のメンションやほかのIssueへの参照で、通知やリンクも飛ぶ
 
 `claude -p` の動かし方:
@@ -545,6 +554,7 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
 - 置いた秘密のファイルは、読ませない。`[product.sandbox]` の `read_placed` に書いたもの（リポジトリからの相対パス）だけ、ビルドやテストに読ませる。ReadのdenyはClaude Codeがsandboxにも足すので、`read_placed` のファイルはAIのReadからも読める。ビルドに読ませれば、AIが書き換えたビルドを通して中身を取り出せるのと同じなので、分けない
 - 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない。WebSearchもsandboxを通らないので、`network` は効かない（`web_search = true` のcellだけに許す。上を参照）
 - 止めた通信の先は、Claude Codeがコマンドの結果に `deny network-outbound <ホスト>:<ポート>` として書き足し、AIに見える。AIは、止まった先と、足すとよい設定を書いて人間に回す（プロンプトで指示する）
+  - CLIもclaudeの出力から止められた先を拾い、足すとよい `network` の行を、手元（tickの出力）にだけ出す。人間に回すときは、公開のコメントに、止めたことだけを書く。claudeの出力にはビルドやテストが印字したものも入るので、AIが書き換えたビルドが、秘密を埋めた名前を `deny network-outbound ...` として印字すれば、そのまま公開されてしまう（実際に通信しなくてよく、小文字の英数字にすればbetterleaksにも当たらない）。攻撃がなくても、社内のプロキシやミラーの名前が出る。同じ理由で、AIにも、先の名前はコメントに書かず、何のための通信かを書くよう頼む。拾うのは、ホスト名として正しい形のもの（ラベルが英数字と `-`、2つ以上）だけを5件まで
 - sandboxの中では `~/.gitconfig` が読めず、gitが止まるので、使う人とシステムのgitの設定を読ませない環境変数（`GIT_CONFIG_GLOBAL=/dev/null` など）を設定の `env` で渡す
 - sandboxの外でコマンドを動かすことは許さない（`allowUnsandboxedCommands: false`）
 - sandboxの中からも、その仕事の `.git` の実体には書ける（`.git/config` やhooksを含む）。仕事ごとの使い捨てなので、ほかの仕事や元のリポジトリには効かない。AIが終わったあとにCLIがその作業場所で動かすgitは、使う人とシステムの設定を読まず、hooksとfsmonitorを止めて動かす。pushは、その場で作ったbareリポジトリから行う

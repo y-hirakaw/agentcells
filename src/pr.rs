@@ -144,6 +144,21 @@ pub const AUTORUN_PATHS: &[&str] = &[
 /// 下のディレクトリにあっても効くもの。パスのどこかの部分がこの名前なら断る。
 const AUTORUN_NAMES: &[&str] = &[".envrc", ".gitattributes", ".claude", ".mcp.json"];
 
+/// 人が開いたときに自動で動くファイルなら、その印（`AUTORUN_PATHS` か `AUTORUN_NAMES` のどれか）。
+/// 大文字・小文字は問わない（macOSなどでは、`.Claude` も `.claude` として読まれるため）。
+pub fn autorun(path: &str) -> Option<&'static str> {
+    let lower = path.to_lowercase();
+    AUTORUN_PATHS
+        .iter()
+        .find(|g| lower == **g || lower.starts_with(&format!("{g}/")))
+        .or_else(|| {
+            AUTORUN_NAMES
+                .iter()
+                .find(|n| lower.split('/').any(|part| part == **n))
+        })
+        .copied()
+}
+
 /// pushしない理由と、人が次にすること。人間に回すコメントに書く（何が起きて、どこを見て、何をすれば
 /// 続きが動くかが分からないと、人が止まってしまうため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,16 +313,7 @@ pub fn verify(
         ISOLATED_GIT_ENV,
     )?;
     for path in changed.lines().filter(|l| !l.is_empty()) {
-        let lower = path.to_lowercase();
-        let guarded = AUTORUN_PATHS
-            .iter()
-            .find(|g| lower == **g || lower.starts_with(&format!("{g}/")))
-            .or_else(|| {
-                AUTORUN_NAMES
-                    .iter()
-                    .find(|n| lower.split('/').any(|part| part == **n))
-            });
-        if let Some(guarded) = guarded {
+        if let Some(guarded) = autorun(path) {
             return Ok(Some(Refusal::new(
                 format!(
                     "人が開いたときに自動で動くファイル（{guarded}）を変えるコミットがあります: {path}"

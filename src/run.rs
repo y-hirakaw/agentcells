@@ -58,6 +58,8 @@ pub struct Report {
     pub limited_until: Option<u64>,
     /// 上限には当たっていないが、使用量が設定（`[usage]` の `pause_at`）を超えた
     pub near_limit: Option<crate::limit::Near>,
+    /// sandboxが止めた通信の先（手元にだけ出す。[`crate::blocked`]）
+    pub blocked: Vec<String>,
     /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
     pub pr: Option<u64>,
     /// 使ったモデル（指定しなかったら `None`）
@@ -388,6 +390,7 @@ impl Runner<'_> {
                     failure: None,
                     limited_until: None,
                     near_limit: None,
+                    blocked: Vec::new(),
                     pr: None,
                     model: None,
                     usage: Usage::default(),
@@ -776,6 +779,7 @@ impl Runner<'_> {
                 failure: Some(format!("rate_limit:{kind}")),
                 limited_until: Some(crate::limit::until(limit.and_then(|l| l.resets_at), now)),
                 near_limit: None,
+                blocked: Vec::new(),
                 pr: None,
                 model: self.model.or(cell.model.as_deref()).map(str::to_string),
                 usage,
@@ -869,6 +873,12 @@ impl Runner<'_> {
             text.push_str("\n\n");
             text.push_str(&filed.join("\n"));
         }
+        // sandboxが止めた通信の先を拾い、手元にだけ出す。人間に回すときは、公開のコメントに止めたことだけを書く
+        let blocked = crate::blocked::hosts(&place.run.join(CLAUDE_LOG));
+        if !blocked.is_empty() && plan.destination == transition::Destination::NeedsHuman {
+            text.push_str("\n\n");
+            text.push_str(crate::blocked::COMMENT);
+        }
         if let Some(reason) = &reason {
             if !text.is_empty() {
                 text.push_str("\n\n");
@@ -958,6 +968,7 @@ impl Runner<'_> {
             requested: (!ai_failed).then(|| outcome.next.clone()),
             failure,
             limited_until: None,
+            blocked,
             near_limit: limit.as_ref().and_then(|l| {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
