@@ -34,7 +34,7 @@ pub fn render(
         "agentcells ダッシュボード（cellの様子は2秒ごと、GitHubは{interval}秒ごとに読み直します。Ctrl-Cで終わる）"
     )];
     match (snapshot.read_at, &snapshot.error) {
-        (_, Some(error)) => out.push(format!("エラー: GitHubを読めません: {error}")),
+        (_, Some(error)) => out.push(format!("エラー: 状態を読めません: {error}")),
         (Some(at), None) => out.push(format!(
             "GitHubを最後に読んだのは{}前",
             running::elapsed(now.saturating_sub(at))
@@ -326,7 +326,7 @@ mod tests {
         let lines = render(&failed, None, &[], 60, 0);
         assert_eq!(
             lines[1],
-            "エラー: GitHubを読めません: config.toml がありません"
+            "エラー: 状態を読めません: config.toml がありません"
         );
         // 前に読めたものは出し続ける
         assert!(lines.iter().any(|l| l.starts_with("■ app")), "{lines:?}");
