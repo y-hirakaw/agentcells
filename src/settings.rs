@@ -43,7 +43,8 @@ pub const DENY_GH: &[&str] = &[
 pub const ALLOW_BASH: &str = "Bash(agentcells cell:*)";
 
 /// cellに渡すツール（`--tools`）。名前を挙げないと、Claude Code（2.1.310〜）は Grep と Glob を出さず、Bashの `grep` を使わせる
-/// （それはhookが断るので、探す道がなくなる）。挙げなかったもの（サブエージェント、WebSearch、定期実行など）は出さない。
+/// （それはhookが断るので、探す道がなくなる）。挙げなかったもの（サブエージェント、WebSearch、定期実行など）は出さない
+/// （`web_search = true` のcellには、`cell_tools` が WebSearch を足す）。
 /// Grep と Glob は、Readの決まり（worktreeの中だけ、置いた秘密のファイルは除く）に従う（2.1.311で確かめた）
 pub const CELL_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob";
 
