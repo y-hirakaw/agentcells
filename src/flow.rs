@@ -50,8 +50,19 @@ pub enum Notice {
     Unreachable,
     /// ほかのcellの `next` から来ず、入口でもない（人がラベルを付けたときだけ動く）
     NotFed,
-    /// `done` にも `stop` にも進めない。`in_loop` なら、抜けられない輪の中にある
-    NoExit { in_loop: bool },
+    /// `done` にも `stop` にも進めない。どうしてかは [`NoExit`]
+    NoExit(NoExit),
+}
+
+/// `done` にも `stop` にも進めない cell が、どうなっているか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoExit {
+    /// 行き止まり。進める先の cell がなく、`needs-human` しか選べない
+    DeadEnd,
+    /// 抜けられない輪の中にある
+    InLoop,
+    /// 進める先が、行き止まりか抜けられない輪にしか行けない cell だけ
+    LeadsNowhere,
 }
 
 impl Notice {
@@ -61,11 +72,14 @@ impl Notice {
             Notice::NotFed => {
                 "ほかのcellの next から来ず、Issueを扱わないので入口にもなりません（人がラベルを付けたときだけ動きます）"
             }
-            Notice::NoExit { in_loop: true } => {
+            Notice::NoExit(NoExit::DeadEnd) => {
+                "done にも stop にも進めません（選べるのは needs-human だけです）"
+            }
+            Notice::NoExit(NoExit::InLoop) => {
                 "done にも stop にも行けない輪の中にあります（抜けるには人間が要ります）"
             }
-            Notice::NoExit { in_loop: false } => {
-                "done にも stop にも進めません（選べるのは needs-human だけです）"
+            Notice::NoExit(NoExit::LeadsNowhere) => {
+                "進める先が、done にも stop にも行けない cell だけです（抜けるには人間が要ります）"
             }
         }
     }
@@ -195,9 +209,14 @@ fn read_line(config: &Config, product: &Product) -> Line {
                 notices.push(Notice::Unreachable);
             }
             if !exits.contains(name) {
-                notices.push(Notice::NoExit {
-                    in_loop: reach(&[name]).contains(name),
-                });
+                let kind = if nexts(cell).is_empty() {
+                    NoExit::DeadEnd
+                } else if reach(&[name]).contains(name) {
+                    NoExit::InLoop
+                } else {
+                    NoExit::LeadsNowhere
+                };
+                notices.push(Notice::NoExit(kind));
             }
             let replaced = product.next.contains_key(name).then(|| {
                 config
@@ -296,12 +315,34 @@ next = ["implement", "done"]
         for cell in ["implement", "review"] {
             assert_eq!(
                 notices(&factory, cell),
-                [Notice::NoExit { in_loop: true }],
+                [Notice::NoExit(NoExit::InLoop)],
                 "{cell}"
             );
         }
         // triage は done に進めるので、輪には入らない
         assert!(notices(&factory, "triage").is_empty());
+    }
+
+    #[test]
+    fn a_cell_that_only_feeds_a_loop_is_not_in_it() {
+        let text = CONFIG
+            .replace(
+                "label = \"ac:review\"\nnext = [\"implement\", \"done\"]",
+                "label = \"ac:review\"\nnext = [\"implement\"]",
+            )
+            .replace(
+                "label = \"ac:triage\"\nnext = [\"implement\", \"done\"]",
+                "label = \"ac:triage\"\nnext = [\"implement\"]",
+            );
+        let factory = factory(&text);
+        assert_eq!(
+            notices(&factory, "triage"),
+            [Notice::NoExit(NoExit::LeadsNowhere)]
+        );
+        assert_eq!(
+            notices(&factory, "implement"),
+            [Notice::NoExit(NoExit::InLoop)]
+        );
     }
 
     #[test]
@@ -313,11 +354,12 @@ next = ["implement", "done"]
         let factory = factory(&text);
         assert_eq!(
             notices(&factory, "review"),
-            [Notice::NoExit { in_loop: false }]
+            [Notice::NoExit(NoExit::DeadEnd)]
         );
+        // implement は review に進めるので、行き止まりではない
         assert_eq!(
             notices(&factory, "implement"),
-            [Notice::NoExit { in_loop: false }]
+            [Notice::NoExit(NoExit::LeadsNowhere)]
         );
     }
 
