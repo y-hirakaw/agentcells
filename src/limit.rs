@@ -4,6 +4,9 @@
 //! （`resetsAt`、UNIXの秒）が入る。上限に当たったら（`status` が `rejected`）、戻る時刻を
 //! `~/.agentcells/pause.json` に書き、それまでtickは新しく始めない。続けて動かすと、たまっていた仕事が
 //! 次々に同じように失敗して、人間に回ってしまうため。
+//!
+//! 上限ごと（5時間、7日）の使用量（`unifiedWindows` の `utilization`。0〜1）も入る。設定（`[usage]` の
+//! `pause_at`）を超えたら、上限に当たる前に、同じように止まる。使う人が自分でClaude Codeを使う分を残すため。
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +18,7 @@ use crate::home::Home;
 pub const AFTER_FAILURE: u64 = 30 * 60;
 
 /// claudeの出力にあった、最後の上限の状態。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RateLimit {
     /// `allowed`、`allowed_warning`、`rejected` など
     pub status: String,
@@ -23,6 +26,25 @@ pub struct RateLimit {
     pub resets_at: Option<u64>,
     /// どの上限か（`five_hour`、`seven_day` など）
     pub kind: Option<String>,
+    /// 上限ごとの使用量
+    pub windows: Vec<Window>,
+}
+
+/// 1つの上限（5時間、7日など）の使用量。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    pub kind: String,
+    /// 使った割合（0〜1）
+    pub utilization: f64,
+    /// 戻る時刻（UNIXの秒）
+    pub resets_at: Option<u64>,
+}
+
+impl Window {
+    /// 使った割合（%）。浮動小数のずれ（0.57 * 100 が 56.99...）で、ちょうどの値を取りこぼさないように丸める
+    fn percent(&self) -> f64 {
+        (self.utilization * 100.0).round()
+    }
 }
 
 impl RateLimit {
@@ -31,6 +53,18 @@ impl RateLimit {
     pub fn rejected(&self) -> bool {
         !self.status.starts_with("allowed")
     }
+
+    /// 使用量が `percent`（%）以上になった上限のうち、いちばん遅く戻るもの。
+    pub fn over(&self, percent: u8) -> Option<&Window> {
+        self.windows
+            .iter()
+            .filter(|w| w.percent() >= f64::from(percent))
+            .max_by_key(|w| w.resets_at.unwrap_or(u64::MAX))
+    }
+}
+
+fn seconds(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_f64().map(|f| f as u64))
 }
 
 /// 止まる時刻を、5分後から8日後（週の上限より少し長い）の間に収める。戻る時刻が過去（時計のずれ）なら、
@@ -50,14 +84,58 @@ pub fn last_event(log: &Path) -> Option<RateLimit> {
         .find_map(|line| {
             let value: serde_json::Value = serde_json::from_str(line).ok()?;
             let info = &value["rate_limit_info"];
+            let windows = info["unifiedWindows"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(kind, w)| {
+                    Some(Window {
+                        kind: kind.clone(),
+                        utilization: w["utilization"].as_f64()?,
+                        resets_at: seconds(&w["resetsAt"]),
+                    })
+                })
+                .collect();
             Some(RateLimit {
                 status: info["status"].as_str()?.to_string(),
-                resets_at: info["resetsAt"]
-                    .as_u64()
-                    .or_else(|| info["resetsAt"].as_f64().map(|f| f as u64)),
+                resets_at: seconds(&info["resetsAt"]),
                 kind: info["rateLimitType"].as_str().map(str::to_string),
+                windows,
             })
         })
+}
+
+/// 使用量が設定（`[usage]` の `pause_at`）を超えた上限。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Near {
+    /// どの上限か（`five_hour`、`seven_day` など。英小文字・数字・_ だけ）
+    pub kind: String,
+    /// 使った割合（%）
+    pub percent: u8,
+    /// 止まる時刻（UNIXの秒。[`until`] で収めたもの）
+    pub until: u64,
+}
+
+impl Near {
+    /// 止まる理由（「〜のため」に続く形）。
+    pub fn reason(&self) -> String {
+        format!("使用量（{}）が{}%", self.kind, self.percent)
+    }
+}
+
+/// 使用量が `pause_at`（%）以上になった上限があれば、それが戻るまで止まる時刻。
+pub fn near(limit: &RateLimit, pause_at: u8, now: u64) -> Option<Near> {
+    let window = limit.over(pause_at)?;
+    Some(Near {
+        kind: window
+            .kind
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+            .take(40)
+            .collect(),
+        percent: window.percent().clamp(0.0, 255.0) as u8,
+        until: until(window.resets_at, now),
+    })
 }
 
 /// 新しく始めないでいる間。
@@ -123,11 +201,72 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_usage_of_each_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("claude.jsonl");
+        // 実際の出力（2.1.311）と同じ形
+        std::fs::write(
+            &log,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":100,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.83,"resetsAt":100,"status":"allowed"},"seven_day":{"utilization":0.13,"resetsAt":900.0,"status":"allowed"}}}}
+"#,
+        )
+        .unwrap();
+        let limit = last_event(&log).unwrap();
+        assert!(!limit.rejected());
+        assert_eq!(
+            limit.windows,
+            vec![
+                Window {
+                    kind: "five_hour".into(),
+                    utilization: 0.83,
+                    resets_at: Some(100)
+                },
+                Window {
+                    kind: "seven_day".into(),
+                    utilization: 0.13,
+                    resets_at: Some(900)
+                },
+            ]
+        );
+        assert_eq!(limit.over(80).map(|w| w.kind.as_str()), Some("five_hour"));
+        assert_eq!(limit.over(84), None);
+        // 両方超えたら、遅く戻るほうまで止まる
+        assert_eq!(limit.over(10).map(|w| w.kind.as_str()), Some("seven_day"));
+        assert_eq!(limit.over(100), None);
+        assert_eq!(
+            near(&limit, 80, 0),
+            Some(Near {
+                kind: "five_hour".into(),
+                percent: 83,
+                until: 5 * 60
+            })
+        );
+        assert_eq!(
+            near(&limit, 80, 0).unwrap().reason(),
+            "使用量（five_hour）が83%"
+        );
+        assert_eq!(near(&limit, 90, 0), None);
+        // ちょうどの値を取りこぼさない
+        let exact = RateLimit {
+            status: "allowed".into(),
+            resets_at: None,
+            kind: None,
+            windows: vec![Window {
+                kind: "five_hour".into(),
+                utilization: 0.57,
+                resets_at: Some(1000),
+            }],
+        };
+        assert_eq!(near(&exact, 57, 0).map(|n| n.percent), Some(57));
+    }
+
+    #[test]
     fn statuses_other_than_allowed_count_as_limited() {
         let limit = |status: &str| RateLimit {
             status: status.into(),
             resets_at: None,
             kind: None,
+            windows: Vec::new(),
         };
         assert!(!limit("allowed").rejected());
         assert!(!limit("allowed_warning").rejected());
