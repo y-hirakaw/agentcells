@@ -5,6 +5,7 @@ agentcellsの変更の履歴。版ごとに、何をしたかと、なぜやっ�
 - 版は [Semantic Versioning](https://semver.org/lang/ja/) に従う。1.0.0までは、機能を足したらマイナー（0.x.0）、直しだけならパッチ（0.0.x）を上げる
 - 版は `Cargo.toml` の `version` と、gitのタグ `v<版>` で示す
 - 仕様の詳細は [docs/design.md](docs/design.md) にある
+- まだ版にしていない変更（マージしたPRのもの）は `changes/` にある
 
 ## [0.28.0] - 2026-10-27
 
