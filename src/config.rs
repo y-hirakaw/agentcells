@@ -57,6 +57,7 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # model = "sonnet"                   # 使うモデル（省略すると、Claude Codeの既定のもの）
 # confirm = false                    # true にすると、人間が着手を認めるまで次のcellに進めない（assess は省略すると true）
 # timeout_minutes = 30               # 1回の実行の上限（省略すると30）
+# web_search = false                 # true にすると、WebSearchで調べられる（sandboxの外で動き、network は効かない。WebFetchは使えないまま）
 #
 # inspector: tickの記録（~/.agentcells/logs/events.jsonl）を1日に1回調べ、ラインの不具合（同じcellが続けて動いた、
 # AIの実行が失敗した、など）を見つけて、原因と直し方の案を書く。書かなければ動かさない
@@ -224,6 +225,10 @@ pub struct Cell {
     /// `stop` を選べる）。書かなければ、assess だけ確かめる
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// WebSearchを使わせる。WebSearchはsandboxの外で動き、`[product.sandbox]` の `network` が効かないので、
+    /// 調べものをさせたいcellだけに許す。WebFetchは、これを有効にしても使わせない
+    #[serde(default)]
+    pub web_search: bool,
 }
 
 impl Cell {
@@ -796,6 +801,22 @@ timeout_minutes = 10
             );
             assert!(problems_of(&text).contains("model"), "{bad}");
         }
+    }
+
+    #[test]
+    fn web_search_is_off_unless_the_cell_turns_it_on() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(VALID, dir.path()).unwrap();
+        assert!(config.cells.iter().all(|c| !c.web_search));
+
+        let on = VALID.replace("max_rounds = 2", "max_rounds = 2\nweb_search = true");
+        let config = Config::parse(&on, dir.path()).unwrap();
+        assert!(config.cell("review").unwrap().web_search);
+        assert!(!config.cell("triage").unwrap().web_search);
+
+        let bad = VALID.replace("max_rounds = 2", "max_rounds = 2\nweb_search = \"yes\"");
+        let err = Config::parse(&bad, dir.path()).unwrap_err();
+        assert!(err.message.contains("web_search"), "{}", err.message);
     }
 
     #[test]

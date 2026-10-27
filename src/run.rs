@@ -578,7 +578,8 @@ impl Runner<'_> {
             tmp: &place.tmp,
             caches: &cache_list,
         };
-        let settings = settings::runtime_settings(self.home, self.config, product, &run_paths)?;
+        let settings =
+            settings::runtime_settings(self.home, self.config, product, cell, &run_paths)?;
         let settings_path = place.run.join("settings.json");
         write_json(&settings_path, &settings)?;
 
@@ -595,6 +596,7 @@ impl Runner<'_> {
             system: prompt::system_prompt(cell, replied_in, asked),
             schema: transition::output_schema(cell, replied_in, asked),
             settings_path,
+            tools: settings::cell_tools(cell),
             context_path,
             labels_before: issue.labels(item_read)?,
             job_dirs: [
@@ -1231,6 +1233,8 @@ struct Ready {
     system: String,
     schema: serde_json::Value,
     settings_path: PathBuf,
+    /// 使えるツール（`--tools`）
+    tools: String,
     context_path: PathBuf,
     labels_before: Vec<String>,
     task: prompt::Task,
@@ -1277,7 +1281,7 @@ impl Ready {
             path_prefix: runner.agentcells.parent(),
             // 試すときの指定（AGENTCELLS_MODEL）を、cellの設定より先にする
             model: runner.model.or(cell.model.as_deref()),
-            tools: Some(CELL_TOOLS),
+            tools: Some(&self.tools),
             timeout: Duration::from_secs(u64::from(cell.timeout_minutes) * 60),
             log_dir: &place.run,
             job_dirs: &self.job_dirs,
@@ -1660,11 +1664,6 @@ fn path_str(path: &Path) -> Result<String> {
         .map(str::to_string)
         .ok_or_else(|| Error::new(format!("パスに使えない文字があります: {}", path.display())))
 }
-
-/// cellに渡すツール。名前を挙げないと、Claude Code（2.1.310〜）は Grep と Glob を出さず、Bashの `grep` を使わせる
-/// （それはhookが断るので、探す道がなくなる）。挙げなかったもの（サブエージェント、WebSearch、定期実行など）は出さない。
-/// Grep と Glob は、Readの決まり（worktreeの中だけ、置いた秘密のファイルは除く）に従う（2.1.311で確かめた）
-const CELL_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob";
 
 /// `claude -p` の1回の実行。
 struct ClaudeRun<'a> {
@@ -2332,7 +2331,7 @@ mod tests {
             context: Path::new("/c.json"),
             path_prefix: Some(Path::new("/opt/agentcells/bin")),
             model: Some("haiku"),
-            tools: Some(CELL_TOOLS),
+            tools: Some(settings::CELL_TOOLS),
             timeout,
             log_dir: dir,
             job_dirs: &[],
@@ -2367,7 +2366,7 @@ mod tests {
         assert!(pair("--setting-sources", ""), "{args:?}");
         assert!(pair("--settings", "/s.json"), "{args:?}");
         assert!(pair("--model", "haiku"), "{args:?}");
-        assert!(pair("--tools", CELL_TOOLS), "{args:?}");
+        assert!(pair("--tools", settings::CELL_TOOLS), "{args:?}");
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(read("path.txt").starts_with("/opt/agentcells/bin:"));
         assert_eq!(read("context.txt").trim(), "/c.json");
@@ -2541,6 +2540,7 @@ mod tests {
             timeout_minutes: 30,
             model: None,
             confirm: None,
+            web_search: false,
         };
         let work = Work {
             product: "app".to_string(),
