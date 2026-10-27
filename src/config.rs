@@ -67,6 +67,12 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # every_hours = 24                   # 何時間ごとに動かすか
 # model = "sonnet"
 #
+# usage: 使用量の上限の手前で止まる。5時間か7日の上限に対する使用量がこれ以上になったら、その上限が戻るまで
+# 新しく始めない（動いているものは最後まで動く）。あなたが自分でClaude Codeを使う分を残すため
+#
+# [usage]
+# pause_at = 80                      # %（省略すると80。100にすると、上限に当たるまで動く。7日の上限で超えると、数日止まることがある。止まっている間は status に出る）
+#
 # github_app: GitHubへの書き込み（コメント、ラベル、push、PR）に使うGitHub App（推奨）
 # 書かなければ、ghにログインしているあなたのアカウントで書き込みます。
 # Appで書き込むと、コメントやPRが「<Appの名前>[bot]」になり、人間の発言と見分けられます。
@@ -100,6 +106,31 @@ pub struct Config {
     /// tickの記録を調べて、ラインの不具合を見つける（書かなければ動かさない）
     #[serde(default)]
     pub inspector: Option<Inspector>,
+    /// 使用量の上限の手前で止まる（`[usage]`）
+    #[serde(default)]
+    pub usage: UsageLimit,
+}
+
+/// 使用量の上限の手前で止まる設定（`[usage]`）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageLimit {
+    /// 使用量（5時間や7日の上限に対する割合。%）がこれ以上になったら、その上限が戻るまで新しく始めない。
+    /// 使う人が自分でClaude Codeを使う分を残すため。100にすると、上限に当たるまで動く
+    #[serde(default = "default_pause_at")]
+    pub pause_at: u8,
+}
+
+impl Default for UsageLimit {
+    fn default() -> Self {
+        UsageLimit {
+            pause_at: default_pause_at(),
+        }
+    }
+}
+
+fn default_pause_at() -> u8 {
+    80
 }
 
 /// inspectorの設定（`[inspector]`）。
@@ -623,6 +654,9 @@ impl Config {
                 ));
             }
         }
+        if !(1..=100).contains(&self.usage.pause_at) {
+            problems.push("[usage] の pause_at は1〜100（%）にしてください".to_string());
+        }
         if let Some(inspector) = &self.inspector {
             if inspector.every_hours == 0 {
                 problems.push("[inspector] の every_hours は1以上にしてください".to_string());
@@ -933,6 +967,20 @@ timeout_minutes = 10
     fn problems_of(text: &str) -> String {
         let dir = base_with_prompts(&["triage.md", "review.md"]);
         Config::parse(text, dir.path()).unwrap_err().message
+    }
+
+    #[test]
+    fn usage_pause_defaults_to_80_and_is_checked() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(VALID, dir.path()).unwrap();
+        assert_eq!(config.usage.pause_at, 80);
+        let config =
+            Config::parse(&format!("{VALID}\n[usage]\npause_at = 95\n"), dir.path()).unwrap();
+        assert_eq!(config.usage.pause_at, 95);
+        for bad in ["0", "101"] {
+            let message = problems_of(&format!("{VALID}\n[usage]\npause_at = {bad}\n"));
+            assert!(message.contains("pause_at は1〜100"), "{bad}: {message}");
+        }
     }
 
     #[test]

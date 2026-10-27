@@ -56,6 +56,8 @@ pub struct Report {
     pub failure: Option<String>,
     /// 使用量の上限に当たったときの、戻る時刻（UNIXの秒）
     pub limited_until: Option<u64>,
+    /// 上限には当たっていないが、使用量が設定（`[usage]` の `pause_at`）を超えた
+    pub near_limit: Option<crate::limit::Near>,
     /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
     pub pr: Option<u64>,
     /// 使ったモデル（指定しなかったら `None`）
@@ -385,6 +387,7 @@ impl Runner<'_> {
                     requested: None,
                     failure: None,
                     limited_until: None,
+                    near_limit: None,
                     pr: None,
                     model: None,
                     usage: Usage::default(),
@@ -772,6 +775,7 @@ impl Runner<'_> {
                 requested: None,
                 failure: Some(format!("rate_limit:{kind}")),
                 limited_until: Some(crate::limit::until(limit.and_then(|l| l.resets_at), now)),
+                near_limit: None,
                 pr: None,
                 model: self.model.or(cell.model.as_deref()).map(str::to_string),
                 usage,
@@ -954,6 +958,13 @@ impl Runner<'_> {
             requested: (!ai_failed).then(|| outcome.next.clone()),
             failure,
             limited_until: None,
+            near_limit: limit.as_ref().and_then(|l| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default();
+                crate::limit::near(l, self.config.usage.pause_at, now)
+            }),
             pr: pr_number,
             model: self.model.or(cell.model.as_deref()).map(str::to_string),
             usage,

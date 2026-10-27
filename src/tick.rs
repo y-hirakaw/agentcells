@@ -87,8 +87,8 @@ pub struct Session {
     max: std::time::Duration,
     runs: usize,
     skipped: Vec<(Target, RepoName, u64)>,
-    /// これ以上続けない（AIの実行が失敗したなど）
-    halted: bool,
+    /// これ以上続けない理由（`ai_failed`、`usage`）。tickの終わりの記録に使う
+    halted: Option<&'static str>,
 }
 
 impl Session {
@@ -98,17 +98,18 @@ impl Session {
             max,
             runs: 0,
             skipped: Vec::new(),
-            halted: false,
+            halted: None,
         }
     }
 
-    /// これ以上続けない。AIの実行そのものが失敗したら（使用量の上限、ログインの切れなど）、
+    /// これ以上続けない。AIの実行そのものが失敗したら（`ai_failed`。使用量の上限、ログインの切れなど）、
     /// ほかの仕事も同じように失敗して、たまっていた仕事がまとめて人間に回ってしまうため。
-    pub fn halt(&mut self) {
-        self.halted = true;
+    /// 使用量が設定を超えたとき（`usage`）も、使う人の分を残すために止まる。
+    pub fn halt(&mut self, why: &'static str) {
+        self.halted = Some(why);
     }
 
-    pub fn halted(&self) -> bool {
+    pub fn halted(&self) -> Option<&'static str> {
         self.halted
     }
 
@@ -119,7 +120,9 @@ impl Session {
     /// もう新しく始めないか。
     pub fn exhausted(&self) -> bool {
         self.runs > 0
-            && (self.halted || self.runs >= MAX_RUNS || self.started.elapsed() >= self.max)
+            && (self.halted.is_some()
+                || self.runs >= MAX_RUNS
+                || self.started.elapsed() >= self.max)
     }
 
     /// 次に動かすもの。このtickで見送ったものは飛ばす。
@@ -1554,8 +1557,9 @@ next = ["implement", "done"]
         let mut halted = Session::new(std::time::Duration::from_secs(3600));
         halted.ran(&found[0], false);
         assert!(!halted.exhausted());
-        halted.halt();
+        halted.halt("ai_failed");
         assert!(halted.exhausted());
+        assert_eq!(halted.halted(), Some("ai_failed"));
 
         // 時間の上限が0でも、1件は動かす
         let mut once = Session::new(std::time::Duration::ZERO);
