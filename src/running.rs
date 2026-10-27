@@ -199,6 +199,11 @@ pub fn describe(home: &Home, now: u64, recent: usize) -> Vec<String> {
     let Some((running, alive)) = load(home) else {
         return vec!["動いているcellはありません".to_string()];
     };
+    describe_running(&running, alive, now, recent)
+}
+
+/// [`describe`] の、動いているcellがあるときの中身。`alive` は、動かしているtickがまだ動いているか。
+pub fn describe_running(running: &Running, alive: bool, now: u64, recent: usize) -> Vec<String> {
     let events = events(&running.log);
     // 結果を返すための呼び出しは、作業ではないので数えない
     let tools = events
