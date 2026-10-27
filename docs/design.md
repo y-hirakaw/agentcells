@@ -499,7 +499,7 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 | ファイルの削除と移動 | `agentcells cell rm` / `agentcells cell mv`。CLIがworktreeの中か（シンボリックリンクの先を含めて）を確かめ、`.git`（大文字・小文字を問わない）と置いた秘密のファイルは断る |
 | コミット | `agentcells cell commit -m`。置いた秘密のファイルと同じ中身（blobのハッシュ）のファイルが入っていたら断る（名前を変えたり写したりしても止める）。足した行をbetterleaksで調べ、秘密らしいものがあれば断る（下の「秘密を探す」）。マージの途中なら、1つ目の親ではなく、自動でマージした結果（`git merge-tree --write-tree HEAD MERGE_HEAD`）と比べて調べる（ベースで人が足した行で断らないため。pushの前の `--remerge-diff` と同じ範囲）。ぶつかったファイルに、ぶつかりの印（`<<<<<<<`、`>>>>>>>`）が残っていれば断る。hooksとfsmonitorは動かさず、使う人とシステムのgitの設定は読まない。作者は今の仕事のファイルで渡す |
 | ベースの取り込み | `agentcells cell merge`。取り込めるのは、今の仕事のファイルにあるベースのブランチ（`origin/<ベース>`）だけ。ぶつかったら、そのファイルを出して1で終わる。`--abort` で取り込む前に戻す |
-| gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output`、`--ext-diff`、`--no-index` は断る |
+| gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output`、`--ext-diff`、`--no-index` は断る。`grep`・`ls-files` を断るときは、Grep・Glob のツールを案内する（`git grep` には外のコマンドを動かす `-O` があるので許さない） |
 | ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
 
 - Bashは `Bash(agentcells cell:*)` だけを許す。`ls` や `git diff` でも、オプションでファイルに書けるものがあるため

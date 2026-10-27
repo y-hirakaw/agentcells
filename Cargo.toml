@@ -1,6 +1,6 @@
 [package]
 name = "agentcells"
-version = "0.24.0"
+version = "0.24.1"
 edition = "2024"
 repository = "https://github.com/y-hirakaw/agentcells"
 

@@ -268,8 +268,14 @@ const GIT_READ: &[&str] = &["status", "diff", "log", "show", "blame"];
 /// 読むためのgitの引数を作る。ファイルに書けるオプションや、外のコマンドを動かすオプションは断る。
 pub fn git_read_args(subcommand: &str, args: &[String]) -> Result<Vec<String>> {
     if !GIT_READ.contains(&subcommand) {
-        return Err(Error::new(format!("git {subcommand} は使えません"))
-            .with_hint(format!("使えるのは git {} です", GIT_READ.join(" / git "))));
+        let mut hint = format!("使えるのは git {} です", GIT_READ.join(" / git "));
+        // 代わりのツールがあるものは、それを案内する（git grep は外のコマンドを動かす -O があるので許さない）
+        match subcommand {
+            "grep" => hint.push_str("。ファイルの中を探すには Grep ツールを使ってください"),
+            "ls-files" => hint.push_str("。ファイルを探すには Glob ツールを使ってください"),
+            _ => {}
+        }
+        return Err(Error::new(format!("git {subcommand} は使えません")).with_hint(hint));
     }
     for arg in args {
         let lower = arg.to_ascii_lowercase();
@@ -1226,6 +1232,14 @@ echo "[]"
         }
         assert!(git_read_args("push", &[]).is_err());
         assert!(git_read_args("config", &[]).is_err());
+        let hint = |sub: &str| git_read_args(sub, &[]).unwrap_err().hint.unwrap();
+        assert!(hint("grep").contains("Grep ツール"), "{}", hint("grep"));
+        assert!(
+            hint("ls-files").contains("Glob ツール"),
+            "{}",
+            hint("ls-files")
+        );
+        assert!(!hint("push").contains("ツール"), "{}", hint("push"));
     }
 
     #[test]
