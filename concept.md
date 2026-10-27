@@ -72,6 +72,9 @@ inspectorの1段目（構造化した記録から規則で見つけ、agentcells
 
 リリースを担当する。製造とは責務を分ける。出荷してよいかの判定を持つ。
 
+- 版とCHANGELOGは、PRでは変えず、変更ごとのファイル（agentcellsでは `changes/<Issue番号>.md`）に書かせる。PRごとに版やCHANGELOGを書き換えると、ほかのPRやmainとぶつかり続ける（agentcellsのPRで、cellが取り込みと版の付け直しに往復を使い切った）。マージのあとに、それをまとめて版を上げる
+- まとめて版を上げるのは、shippingのcellにさせるか。cellはmainへpushせず、タグも付けない（`ac/...` のブランチとPRだけ）ので、shippingのcellは「版を上げるPR」を作り、人がマージし、タグはCLIかmainを扱う人が付ける形になる。ファイルを集めるのは決まった手順なので、AIでなくCLIでしてもよい
+
 ## 実行のしかた
 
 当面はClaude Codeを使い、サブスクリプションの範囲で回せることを中心にする。
