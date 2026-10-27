@@ -356,6 +356,8 @@ fn run(command: Commands) -> Result<ExitCode> {
             let snapshot = std::sync::Arc::new(std::sync::Mutex::new(
                 agentcells::dashboard::Snapshot::default(),
             ));
+            // 動いているcellが変わったら、間隔を待たずにGitHubを読み直すよう、読むスレッドを起こす
+            let (wake, woken) = std::sync::mpsc::channel::<()>();
             // GitHubは時間がかかるので、別のスレッドで読み直す。画面は、その間も書き直す
             {
                 let snapshot = std::sync::Arc::clone(&snapshot);
@@ -374,13 +376,22 @@ fn run(command: Commands) -> Result<ExitCode> {
                                 Err(e) => s.error = Some(e.message),
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_secs(interval));
+                        // 起こされるか、間隔が過ぎるまで待つ
+                        let _ = woken.recv_timeout(std::time::Duration::from_secs(interval));
                     }
                 });
             }
+            let mut last_running = None;
             loop {
                 let now = unix_now();
                 let running = agentcells::running::load(&home);
+                let current = running
+                    .as_ref()
+                    .map(|(r, _)| (r.repo.clone(), r.number, r.started));
+                if last_running.as_ref().is_some_and(|last| *last != current) {
+                    let _ = wake.send(());
+                }
+                last_running = Some(current);
                 let notices = tick_notices(&home, now);
                 let lines = {
                     let s = snapshot.lock().unwrap_or_else(|e| e.into_inner());

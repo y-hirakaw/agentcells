@@ -47,13 +47,10 @@ pub fn render(
 
     let detail = running.map(|(r, alive)| (r, running::describe_running(r, alive, now, RECENT)));
     // 動いているcellの行が、どこかのproductにあれば、その下に広げる。なければ上にまとめて出す
-    let placed = detail.as_ref().is_some_and(|(r, _)| {
-        snapshot
-            .products
-            .iter()
-            .any(|(_, report)| report.lines.iter().any(|l| runs_on(l, r)))
-    });
-    if !placed {
+    let expand_at = detail
+        .as_ref()
+        .and_then(|(r, _)| expand_at(&snapshot.products, r));
+    if expand_at.is_none() {
         out.push(String::new());
         out.push("動いているcell".to_string());
         match &detail {
@@ -66,7 +63,7 @@ pub fn render(
         out.push(String::new());
         out.push("productがないので、扱っているIssueはありません".to_string());
     }
-    for (name, report) in &snapshot.products {
+    for (p, (name, report)) in snapshot.products.iter().enumerate() {
         out.push(String::new());
         out.push(format!("■ {name}  {}", summary(report)));
         for error in &report.errors {
@@ -75,19 +72,39 @@ pub fn render(
         for note in &report.notes {
             out.push(format!("  注意: {note}"));
         }
-        for line in &report.lines {
+        for (i, line) in report.lines.iter().enumerate() {
             let detail = detail.as_ref().filter(|(r, _)| runs_on(line, r));
             let mark = if detail.is_some() { "▶" } else { " " };
             out.push(format!(" {mark}{}", line.describe(now)));
-            // 同じIssueが2行に出ても、広げるのは作業中の行だけ
             if let Some((_, lines)) = detail
-                && matches!(line.state, State::Working { .. })
+                && expand_at == Some((p, i))
             {
                 out.extend(lines.iter().map(|l| format!("      {l}")));
             }
         }
     }
     out
+}
+
+/// 動いているcellの様子を、どの行（productの番号、行の番号）の下に広げるか。
+/// 同じIssueが2行に出ても、広げるのは1か所だけで、作業中の行を選ぶ。GitHubを読み直す前は、
+/// cellが動き始めたIssue/PRが、まだ順番待ちや返事待ちのままのことがあるので、作業中の行がなければ、
+/// 合った最初の行の下に広げる。
+fn expand_at(products: &[(String, Report)], running: &Running) -> Option<(usize, usize)> {
+    let matched = || {
+        products.iter().enumerate().flat_map(|(p, (_, report))| {
+            report
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| runs_on(l, running))
+                .map(move |(i, l)| ((p, i), l))
+        })
+    };
+    matched()
+        .find(|(_, l)| matches!(l.state, State::Working { .. }))
+        .or_else(|| matched().next())
+        .map(|(at, _)| at)
 }
 
 /// 状態ごとの件数を、1行で書く。
@@ -236,6 +253,43 @@ mod tests {
         assert_eq!(marked.len(), 2, "{lines:?}");
         assert!(lines[marked[0] + 1].starts_with("      implement"));
         assert_eq!(lines[marked[1]], " ▶返事待ち  octo/issues#7「両方」");
+        assert!(!lines[marked[1] + 1].starts_with("      "), "{lines:?}");
+    }
+
+    #[test]
+    fn expands_under_a_stale_line_when_no_working_line_matches() {
+        // GitHubを読み直す前で、cellが動き始めたIssueがまだ返事待ちのまま
+        let dir = tempfile::tempdir().unwrap();
+        let running = running(dir.path(), "octo/issues", 2);
+        let lines = render(&snapshot(), Some((&running, true)), &[], 60, 1065);
+        assert!(!lines.contains(&"動いているcell".to_string()), "{lines:?}");
+        let at = lines
+            .iter()
+            .position(|l| l == " ▶返事待ち  octo/issues#2「質問した」")
+            .unwrap();
+        assert!(
+            lines[at + 1].starts_with("      implement  PR octo/issues#2"),
+            "{lines:?}"
+        );
+
+        // 作業中の行がなく、合う行が2つあれば、最初の行の下にだけ広げる
+        let mut stale = snapshot();
+        stale.products[0].1.lines[0].state = State::Queued {
+            cell: "implement".into(),
+        };
+        let running = Running {
+            number: 7,
+            ..running
+        };
+        let lines = render(&stale, Some((&running, true)), &[], 60, 1065);
+        let marked: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with(" ▶"))
+            .collect();
+        assert_eq!(marked.len(), 2, "{lines:?}");
+        assert!(
+            lines[marked[0] + 1].starts_with("      implement"),
+            "{lines:?}"
+        );
         assert!(!lines[marked[1] + 1].starts_with("      "), "{lines:?}");
     }
 
