@@ -482,6 +482,50 @@ fn unresolved(worktree: &Path, conflicted: &[String]) -> Result<()> {
     .with_hint("ぶつかったところを直してから、もう一度コミットしてください"))
 }
 
+/// 人が開いたときに自動で動くファイル（[`crate::pr::autorun`]）の変更、シンボリックリンク、submoduleを、
+/// コミットの時点で断る。pushの前の確かめ（[`crate::pr::verify`]）でも断るが、そこで断られると、その実行の
+/// 作業はまるごと人間に回る。ここで断れば、AIがその変更を外して続けられる。
+/// `against` はマージの途中なら自動でマージした結果の木で、それと比べる（ベースのブランチから来た変更では断らない）。
+fn guarded_changes(worktree: &Path, against: Option<&str>) -> Result<()> {
+    let raw = git_output(
+        worktree,
+        &[
+            "diff",
+            "--cached",
+            "--raw",
+            "--no-renames",
+            "-z",
+            against.unwrap_or("HEAD"),
+        ],
+    )?;
+    // ":<古いmode> <新しいmode> <古いhash> <新しいhash> <状態>\0<パス>\0" が並ぶ
+    let mut fields = raw.split('\0').filter(|f| !f.is_empty());
+    let mut refused = Vec::new();
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let new_mode = meta.split_whitespace().nth(1);
+        let why = if let Some(guarded) = crate::pr::autorun(path) {
+            format!("人が開いたときに自動で動くファイル（{guarded}）")
+        } else if new_mode == Some("120000") {
+            "シンボリックリンク".to_string()
+        } else if new_mode == Some("160000") {
+            "submodule".to_string()
+        } else {
+            continue;
+        };
+        refused.push(format!("  - {path}: {why}"));
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "次の変更は、agentcellsではコミットできません:\n{}",
+        refused.join("\n")
+    ))
+    .with_hint(
+        "その変更を元に戻してから（足したものは `agentcells cell rm`、変えたものは Edit で元の中身に）、もう一度コミットしてください。作業にどうしても要るなら、ほかの変更をコミットしてから needs-human にし、何をどう変えてほしいかを comment に書いてください（人が中身を確かめて入れます）",
+    ))
+}
+
 /// 途中のマージをやめて、取り込む前に戻す。
 pub fn merge_abort(context: &Context) -> Result<()> {
     git_output(&context.worktree, &["merge", "--abort"]).map(|_| ())
@@ -528,6 +572,7 @@ pub fn commit(context: &Context, message: &str) -> Result<String> {
     if let Some((_, conflicted)) = &merging {
         unresolved(wt, conflicted)?;
     }
+    guarded_changes(wt, merging.as_ref().map(|(tree, _)| tree.as_str()))?;
     scan_secrets(context, merging.as_ref().map(|(tree, _)| tree.as_str()))?;
     let mut args: Vec<String> = vec![
         "-c".to_string(),
@@ -1261,6 +1306,70 @@ echo "[]"
         assert!(err.message.contains("secret.env"), "{}", err.message);
         assert_eq!(git(&wt, &["diff", "--cached", "--name-only"]), "");
         assert_eq!(git(&wt, &["log", "-1", "--format=%s"]), "Add b");
+    }
+
+    #[test]
+    fn commit_refuses_files_that_run_when_a_person_opens_the_branch() {
+        let (_dir, ctx) = setup();
+        let wt = ctx.worktree.clone();
+        std::fs::create_dir_all(wt.join(".vscode")).unwrap();
+        std::fs::write(wt.join(".vscode/tasks.json"), "{}").unwrap();
+        // 大文字・小文字を変えても、下のディレクトリに置いても断る
+        std::fs::create_dir_all(wt.join(".Claude")).unwrap();
+        std::fs::write(wt.join(".Claude/settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        std::fs::write(wt.join("sub/.envrc"), "echo hi").unwrap();
+        std::os::unix::fs::symlink("a.txt", wt.join("link")).unwrap();
+        std::fs::write(wt.join("ok.txt"), "ok").unwrap();
+        let err = commit(&ctx, "x").unwrap_err();
+        for path in [
+            ".vscode/tasks.json",
+            ".Claude/settings.json",
+            "sub/.envrc",
+            "link",
+        ] {
+            assert!(err.message.contains(path), "{path}: {}", err.message);
+        }
+        assert!(!err.message.contains("ok.txt"), "{}", err.message);
+        assert!(err.hint.unwrap().contains("needs-human"));
+        assert_eq!(git(&wt, &["log", "-1", "--format=%s"]), "base");
+        // 外せば、ほかの変更はコミットできる
+        for path in [".vscode", ".Claude", "sub", "link"] {
+            remove(&ctx, &wt, &[PathBuf::from(path)]).unwrap();
+        }
+        commit(&ctx, "Add ok").unwrap();
+        assert_eq!(git(&wt, &["log", "-1", "--format=%s"]), "Add ok");
+    }
+
+    #[test]
+    fn guarded_files_from_the_base_do_not_block_a_merge_commit() {
+        let (_dir, ctx) = setup();
+        let wt = ctx.worktree.clone();
+        let start = git(&wt, &["rev-parse", "HEAD"]);
+        git(&wt, &["update-ref", "refs/remotes/origin/main", &start]);
+        git(&wt, &["checkout", "-q", "-b", "ac/x"]);
+        std::fs::write(wt.join("a.txt"), "from pr").unwrap();
+        git(&wt, &["commit", "-qam", "pr"]);
+        // ベースのブランチで、人がworkflowを足し、同じ行を変えた
+        git(&wt, &["checkout", "-q", "--detach", &start]);
+        std::fs::create_dir_all(wt.join(".github/workflows")).unwrap();
+        std::fs::write(wt.join(".github/workflows/ci.yml"), "on: push").unwrap();
+        std::fs::write(wt.join("a.txt"), "from main").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "main"]);
+        let tip = git(&wt, &["rev-parse", "HEAD"]);
+        git(&wt, &["update-ref", "refs/remotes/origin/main", &tip]);
+        git(&wt, &["checkout", "-q", "ac/x"]);
+        assert_eq!(
+            merge(&ctx).unwrap(),
+            Merged::Conflicts(vec!["a.txt".to_string()])
+        );
+        std::fs::write(wt.join("a.txt"), "both").unwrap();
+        commit(&ctx, "Merge main").unwrap();
+        assert_eq!(
+            git(&wt, &["show", "-s", "--format=%P"]).split(' ').count(),
+            2
+        );
     }
 
     #[test]

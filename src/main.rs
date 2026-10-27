@@ -650,6 +650,9 @@ fn run(command: Commands) -> Result<ExitCode> {
                         Some(reason) => println!("{} に進めました（{reason}）", report.destination),
                         None => println!("{} に進めました", report.destination),
                     }
+                    if let Some(note) = agentcells::blocked::note(&report.blocked) {
+                        println!("{note}");
+                    }
                     session.ran(next, skipped);
                     runs = session.runs();
                     // 使用量が設定を超えたら、上限に当たる前に止まる（使う人が自分で使う分を残すため）

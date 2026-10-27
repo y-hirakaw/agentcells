@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod blocked;
 pub mod caches;
 pub mod config;
 pub mod dashboard;
@@ -31,3 +32,4 @@ pub mod status;
 pub mod tick;
 pub mod tidy;
 pub mod transition;
+pub mod workflows;
