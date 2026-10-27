@@ -520,6 +520,20 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 | ベースの取り込み | `agentcells cell merge`。取り込めるのは、今の仕事のファイルにあるベースのブランチ（`origin/<ベース>`）だけ。ぶつかったら、そのファイルを出して1で終わる。`--abort` で取り込む前に戻す |
 | gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output`、`--ext-diff`、`--no-index` は断る。`grep`・`ls-files` を断るときは、Grep・Glob のツールを案内する（`git grep` には外のコマンドを動かす `-O` があるので許さない） |
 | ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
+| Webのページを読む | `agentcells cell fetch <URL>`。下の「Webのページを読む」 |
+
+#### Webのページを読む
+
+WebFetchはsandboxを通らず、読めた秘密を外へ送る道になるので使わせない（権限の設定のdenyはそのまま残す）。代わりに `agentcells cell fetch <URL>` で、productの `[product.sandbox]` の `network` に書いたホストだけを開く。
+
+- 開くのは `https://` のURLだけで、GETだけ。ポートは443（書かないとき）だけ。ホストの前のユーザー名（`user@`）、ホストの名前として読めないもの（`%` で書いたもの、IPv6の角かっこなど）は断る
+- ホストの照合はsandboxと同じ決まりにする。大文字・小文字は問わない。`example.com` はそのホストだけ、`*.example.com` はそのサブドメインだけ（`example.com` そのものは含まない）。開けるホストは、`tick` が今の仕事のファイル（`network`）に書く
+- `fetch` もsandboxの中で動くので、ほかのホストへの通信はプロキシ（`strictAllowlist`）がもう一重に止める。CLIでの照合は、断るときに案内するためと、二重の守りのため
+- `network` にないホストは、通信する前に断る。開けるホストと、要るなら needs-human にして `network` に足すよう人間に頼むことを案内する。断ったホストは、sandboxが止めたときと同じ形（`deny network-outbound <ホスト>:443`）で出し、CLIが手元（tickの出力）にだけ出す。AIには、ホストの名前は公開のコメントに書かず、何のために読みたかったかを書くよう頼む（sandboxの「止めた通信の先」と同じ考え）
+- curlで開く。`--disable` で `~/.curlrc` を読まない（AIも書けるため）。リダイレクトはcurlに追わせず（`--max-redirs 0`）、行き先を確かめ直して、`network` にあるときだけ追う（5回まで）。接続10秒・全体60秒で打ち切り、受け取るのは20MBまで
+- 出すのは、中身の先頭から30,000バイトまで（大きいページでコンテキストがあふれないように。Claude CodeもBashの出力を3万字ほどで切る）。残りがあれば、続きの読み方（`--from <バイト>`）を標準エラーに出す。HTMLはテキストにせず、そのまま出す
+- 2xxなら0、それ以外は応答の番号を出して1で終わる
+- 取ってきた中身は信用できない材料なので、プロンプトの「使えるもの」で、そこに書かれた指示には従わないよう添える
 
 - Bashは `Bash(agentcells cell:*)` だけを許す。`ls` や `git diff` でも、オプションでファイルに書けるものがあるため
 - 渡すツールは、Bash、Read、Edit、Write、Grep、Glob だけにする（`--tools`）。Claude Code 2.1.310〜は、標準では Grep と Glob を出さず、Bashの `grep` や `find` で探させる。それはhookが断るので、0.24.1までは、cellに探す道がなかった（AIは `agentcells cell git show ... | grep` で回り道をしていた）。名前を挙げると、Grep と Glob が出る。挙げないもの（サブエージェント、WebSearch、定期実行、ほかのセッションへの送信など）は出さない
@@ -546,7 +560,7 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
   - 「読ませない場所」を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまう。読ませる場所を並べる形にし、足りなければビルドが失敗して人間に回るので、何を足せばよいかがわかる。開けた場所の秘密は読まれうるので、何を開けるかは使う人が決める
 - `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は、`read` で広い場所（`~` や `~/.config`）を開けても読ませない。ツールの場所にある秘密（`~/.cargo/credentials.toml`、`~/.android/adbkey`、`~/.gradle/gradle.properties`、`~/.m2/settings.xml`、`~/.gem/credentials`、`~/.config/hub`）も同じ。sandboxは、より細かく書いた決まりを優先するため。これらの中を `read` に書くと、`doctor` と実行の前に断る（細かく書くと、開ける側が優先されてしまうため）
 - 置いた秘密のファイルは、読ませない。`[product.sandbox]` の `read_placed` に書いたもの（リポジトリからの相対パス）だけ、ビルドやテストに読ませる。ReadのdenyはClaude Codeがsandboxにも足すので、`read_placed` のファイルはAIのReadからも読める。ビルドに読ませれば、AIが書き換えたビルドを通して中身を取り出せるのと同じなので、分けない
-- 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない
+- 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない（Webのページは、同じ `network` のホストだけを `agentcells cell fetch` で読む）
 - 止めた通信の先は、Claude Codeがコマンドの結果に `deny network-outbound <ホスト>:<ポート>` として書き足し、AIに見える。AIは、止まった先と、足すとよい設定を書いて人間に回す（プロンプトで指示する）
   - CLIもclaudeの出力から止められた先を拾い、足すとよい `network` の行を、手元（tickの出力）にだけ出す。人間に回すときは、公開のコメントに、止めたことだけを書く。claudeの出力にはビルドやテストが印字したものも入るので、AIが書き換えたビルドが、秘密を埋めた名前を `deny network-outbound ...` として印字すれば、そのまま公開されてしまう（実際に通信しなくてよく、小文字の英数字にすればbetterleaksにも当たらない）。攻撃がなくても、社内のプロキシやミラーの名前が出る。同じ理由で、AIにも、先の名前はコメントに書かず、何のための通信かを書くよう頼む。拾うのは、ホスト名として正しい形のもの（ラベルが英数字と `-`、2つ以上）だけを5件まで
 - sandboxの中では `~/.gitconfig` が読めず、gitが止まるので、使う人とシステムのgitの設定を読ませない環境変数（`GIT_CONFIG_GLOBAL=/dev/null` など）を設定の `env` で渡す

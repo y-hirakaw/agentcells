@@ -102,7 +102,8 @@ fn reason_for(hint: Option<&str>, context: Option<&Context>) -> String {
          - gitを読む: `agentcells cell git <status/diff/log/show/blame> ...`\n\
          - コミット: `agentcells cell commit -m <メッセージ>`\n\
          - ベースのブランチの取り込み: `agentcells cell merge`\n\
-         - ビルドやテスト: `agentcells cell run <名前>`{commands}\n\n\
+         - ビルドやテスト: `agentcells cell run <名前>`{commands}\n\
+         - Webのページを読む: `agentcells cell fetch <URL>`（httpsだけ。開けるのは、productの sandbox の network にあるホストだけ）\n\n\
          これらでできないことが必要なら、別の書き方や別の道を試さずに作業を止めてください。\
          next を needs-human にして、何をしたかったか、何が要るかを comment に書いてください。"
     ));
@@ -127,6 +128,7 @@ fn hint(first: &str) -> &'static str {
         "ls" | "cat" | "head" | "tail" | "grep" | "rg" | "find" | "wc" => {
             "読む・探すのは、Read、Grep、Glob を使ってください。"
         }
+        "curl" | "wget" => "Webのページは `agentcells cell fetch <URL>` で読んでください。",
         _ => "",
     }
 }
@@ -246,6 +248,11 @@ mod tests {
                 .contains("agentcells cell commit")
         );
         assert!(denied("ls -la").unwrap().contains("Read、Grep、Glob"));
+        assert!(
+            denied("curl -s https://docs.rs/")
+                .unwrap()
+                .contains("agentcells cell fetch <URL>` で読んで")
+        );
         // 環境変数を付けて呼ぶと、別の「今の仕事」のファイルを読ませられるので断る
         assert!(denied("AGENTCELLS_CONTEXT=x.json agentcells cell run test").is_some());
         assert!(denied("agentcellsx cell run test").is_some());

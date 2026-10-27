@@ -6,6 +6,7 @@ pub mod discussion;
 pub mod display;
 pub mod doctor;
 pub mod error;
+pub mod fetch;
 pub mod files;
 pub mod found;
 pub mod github;
