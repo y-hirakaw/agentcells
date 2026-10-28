@@ -46,19 +46,26 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # read_placed = []                   # files/ から置いたファイルのうち、ビルドに読ませるもの（リポジトリからの相対パス）
 # bind_localhost = false             # テストが localhost でサーバーを開けるようにする（手元のほかのサーバーにもつながるようになる）
 #
-# cell: どのラベルが付いたIssue/PRを拾い、どのプロンプトで動くか
+# cell: どのラベルが付いたIssue/PRを拾い、どのプロンプトで動くか。1つのcellを1つのファイル（このファイルの隣の
+# cells/<名前>.md）に書く。頭の +++ の行で囲んだところに設定を、そのあとに追加の指示を書く。名前はファイルの名前
 #
-# [[cell]]
-# name = "triage"
-# on = "issue"                       # issue か pull_request（両方なら ["issue", "pull_request"]）
-# label = "ac:triage"                # 拾うラベル（ac: で始める）
-# prompt = "cells/triage.md"         # 追加の指示のファイル（このファイルからの相対パス）。標準のcell（triage、implement、review、assess）なら省略できる
-# next = ["implement", "done"]       # 進めてよい先（cellの名前、done、stop）。needs-human はいつでも選べる
-# review = false                     # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
-# max_rounds = 3                     # 往復の上限（1〜3。省略すると3）
-# model = "sonnet"                   # 使うモデル（省略すると、Claude Codeの既定のもの）
-# confirm = false                    # true にすると、人間が着手を認めるまで次のcellに進めない（assess は省略すると true）
-# timeout_minutes = 30               # 1回の実行の上限（省略すると30）
+# cells/triage.md:
+#   +++
+#   on = "issue"                     # issue か pull_request（両方なら ["issue", "pull_request"]）
+#   label = "ac:triage"              # 拾うラベル（ac: で始める）
+#   next = ["implement", "done"]     # 進めてよい先（cellの名前、done、stop）。needs-human はいつでも選べる
+#   review = false                   # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
+#   max_rounds = 3                   # 往復の上限（1〜3。省略すると3）
+#   model = "sonnet"                 # 使うモデル（省略すると、Claude Codeの既定のもの）
+#   confirm = false                  # true にすると、人間が着手を認めるまで次のcellに進めない（assess は省略すると true）
+#   timeout_minutes = 30             # 1回の実行の上限（省略すると30）
+#   commands = ["test"]              # 使えるコマンド（productの commands の名前から選ぶ。省略するとすべて、[] なら使えない）
+#   +++
+#
+#   （追加の指示。標準のcell（triage、implement、review、assess）なら、書かなくても標準の役割で動く。
+#   それ以外のcellには、役割と、何を作るかを書く。例: https://github.com/y-hirakaw/agentcells/tree/main/examples/cells）
+#
+# このファイルに [[cell]] として書くこともできる（name と、追加の指示のファイル prompt を足す）
 #
 # inspector: tickの記録（~/.agentcells/logs/events.jsonl）を1日に1回調べ、ラインの不具合（同じcellが続けて動いた、
 # AIの実行が失敗した、など）を見つけて、原因と直し方の案を書く。書かなければ動かさない
@@ -191,6 +198,19 @@ pub struct Product {
 }
 
 impl Product {
+    /// `cell` が `agentcells cell run` で使えるコマンド。cellの `commands` で選んだものだけ（書かなければすべて）。
+    pub fn commands_for(&self, cell: &Cell) -> BTreeMap<String, String> {
+        self.commands
+            .iter()
+            .filter(|(name, _)| {
+                cell.commands
+                    .as_ref()
+                    .is_none_or(|names| names.contains(name))
+            })
+            .map(|(name, command)| (name.clone(), command.clone()))
+            .collect()
+    }
+
     /// `path`（リポジトリからの相対パス）が、守るファイルか。
     /// 書いたパスそのものと、その下すべてに当たる（`/` で終えるかどうかによらない。ディレクトリを
     /// submoduleやファイルに置き換えたときも当たるように）。大文字と小文字は区別しない（macOSでは同じファイルになる）。
@@ -277,9 +297,28 @@ pub struct Cell {
     /// `stop` を選べる）。書かなければ、assess だけ確かめる
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// `agentcells cell run` で使える名前（productの `commands` から選ぶ）。書かなければ、productのものをすべて使える
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
+    /// `cells/<名前>.md` の頭に書いたcellか（`[[cell]]` ではなく）
+    #[serde(skip)]
+    pub from_file: bool,
 }
 
 impl Cell {
+    /// 追加の指示（`prompt` のファイルの中身）。cellのファイルなら、頭の設定を除いた本文。
+    pub fn extra_prompt(&self) -> Result<Option<String>> {
+        let Some(path) = &self.prompt else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::new(format!("追加の指示 {} を読めません: {e}", path.display())))?;
+        Ok(Some(match front_matter(&text) {
+            Ok(Some((_, body))) => body.to_string(),
+            _ => text,
+        }))
+    }
+
     /// 次のcellに進む前に、人間に確かめるか。
     pub fn confirms(&self) -> bool {
         self.confirm.unwrap_or(self.name == "assess")
@@ -386,6 +425,7 @@ impl Config {
                 *prompt = base.join(&*prompt);
             }
         }
+        config.cells.extend(cell_files(&base.join(CELLS_DIR))?);
         if let Some(app) = &mut config.github_app {
             app.private_key = base.join(&app.private_key);
         }
@@ -446,7 +486,7 @@ impl Config {
                 problems.push(format!("cell「{}」の next に自分自身があります", c.name));
             } else if !transition::is_reserved(next) && self.cell(next).is_none() {
                 problems.push(format!(
-                    "cell「{}」の next の「{next}」が [[cell]] に定義されていません（cellの名前か {} か {} を書きます）",
+                    "cell「{}」の next の「{next}」が定義されていません（cellの名前か {} か {} を書きます。cellは cells/<名前>.md か [[cell]] で定義します）",
                     c.name,
                     transition::DONE,
                     transition::STOP
@@ -563,7 +603,7 @@ impl Config {
             for name in &p.cells {
                 let Some(cell) = self.cell_in(p, name) else {
                     problems.push(format!(
-                        "product「{}」のcell「{name}」が [[cell]] に定義されていません",
+                        "product「{}」のcell「{name}」が定義されていません（cells/<名前>.md か [[cell]] で定義します）",
                         p.name
                     ));
                     continue;
@@ -649,6 +689,19 @@ impl Config {
                     c.name
                 )),
                 _ => {}
+            }
+            for name in c.commands.iter().flatten() {
+                let users: Vec<&Product> = self
+                    .products
+                    .iter()
+                    .filter(|p| p.cells.contains(&c.name))
+                    .collect();
+                if !users.is_empty() && !users.iter().any(|p| p.commands.contains_key(name)) {
+                    problems.push(format!(
+                        "cell「{}」の commands の「{name}」が、このcellを使うproductの commands にありません",
+                        c.name
+                    ));
+                }
             }
             if c.review && c.on != [Target::PullRequest] {
                 problems.push(format!(
@@ -743,6 +796,90 @@ fn is_valid_login(login: &str) -> bool {
         && !login.starts_with('-')
         && !login.ends_with('-')
         && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// cellのファイルを置くディレクトリ（設定ファイルからの相対パス）。
+pub const CELLS_DIR: &str = "cells";
+
+/// `cells/` の、頭に設定（`+++` で囲んだTOML）を書いたmdファイルを、cellとして読む。名前はファイルの名前。
+/// 頭のないファイルは、`[[cell]]` の `prompt` から指す追加の指示なので、読まない。
+fn cell_files(dir: &Path) -> Result<Vec<Cell>> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new());
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        // . で始まるもの（エディタの一時ファイルや、macOSが作る ._<名前>.md など）は読まない
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "md")
+                && !p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+                && p.is_file()
+        })
+        .collect();
+    paths.sort();
+    let mut cells = Vec::new();
+    for path in paths {
+        let fail = |message: String| Error::new(format!("{}: {message}", path.display()));
+        let text = std::fs::read_to_string(&path).map_err(|e| fail(format!("読めません: {e}")))?;
+        let Some((head, body)) = front_matter(&text).map_err(fail)? else {
+            continue;
+        };
+        let mut table: toml::Table =
+            toml::from_str(head).map_err(|e| fail(e.to_string().trim_end().to_string()))?;
+        for key in ["name", "prompt"] {
+            if table.contains_key(key) {
+                return Err(fail(format!(
+                    "{key} は書けません（名前はファイルの名前、指示はこのファイルの本文です）"
+                )));
+            }
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| fail("ファイルの名前を読めません".to_string()))?;
+        table.insert("name".to_string(), name.into());
+        let mut cell: Cell = toml::Value::Table(table)
+            .try_into()
+            .map_err(|e: toml::de::Error| fail(e.to_string().trim_end().to_string()))?;
+        // 標準の役割がないcellは、本文（役割の指示）がないと、何をするかが分からないまま動く
+        if body.trim().is_empty() && prompt::builtin(&cell.name).is_none() {
+            return Err(fail(format!(
+                "cell「{}」には標準の役割がないので、頭の設定のあとに、役割と何をするかを書いてください",
+                cell.name
+            )));
+        }
+        cell.prompt = Some(path.clone());
+        cell.from_file = true;
+        cells.push(cell);
+    }
+    Ok(cells)
+}
+
+/// ファイルの頭の、`+++` の行で囲んだ設定と、そのあとの本文。頭がなければ `None`。閉じていなければエラー。
+/// 行の終わりの空白と、ファイルの始めのBOMは見ない（エディタによって付くため）。
+fn front_matter(text: &str) -> std::result::Result<Option<(&str, &str)>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let Some((first, rest)) = text.split_once('\n') else {
+        return Ok(None);
+    };
+    if first.trim_end() != "+++" {
+        return Ok(None);
+    }
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end() == "+++" {
+            let body = &rest[offset + line.len()..];
+            return Ok(Some((
+                &rest[..offset],
+                body.trim_start_matches(['\r', '\n']),
+            )));
+        }
+        offset += line.len();
+    }
+    Err("頭の設定が +++ の行で閉じていません".to_string())
 }
 
 fn has_parent_dir(path: &Path) -> bool {
@@ -883,7 +1020,10 @@ timeout_minutes = 10
         );
         let message = problems_of(&text);
         assert!(message.contains("自分自身"), "{message}");
-        assert!(message.contains("「deploy」が [[cell]]"), "{message}");
+        assert!(
+            message.contains("「deploy」が定義されていません"),
+            "{message}"
+        );
         assert!(!message.contains("「done」"), "{message}");
         assert!(!message.contains("「needs-human」"), "{message}");
     }
@@ -1160,6 +1300,134 @@ timeout_minutes = 10
         let message = problems_of(&bad);
         assert!(message.contains("「Run_Tests」に使えない文字"), "{message}");
         assert!(message.contains("が空です"), "{message}");
+    }
+
+    #[test]
+    fn cells_can_be_written_as_files() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let cells = dir.path().join("cells");
+        std::fs::write(
+            cells.join("design.md"),
+            "+++\non = \"issue\"\nlabel = \"ac:design\"\nnext = [\"triage\"]\nconfirm = true\ncommands = [\"lint\"]\n+++\n\n# 役割: design\n設計を書く\n",
+        )
+        .unwrap();
+        // 頭のないファイル（[[cell]] の prompt から指すもの）や、md でないものは、cellにしない
+        std::fs::write(cells.join("notes.md"), "+ メモ\n").unwrap();
+        std::fs::write(cells.join("._design.md"), [0xff, 0xfe]).unwrap();
+        std::fs::write(cells.join("deploy.txt"), "+++\non = \"issue\"\n+++\n").unwrap();
+        let text = VALID
+            .replace(
+                "cells = [\"triage\", \"review\"]",
+                "cells = [\"triage\", \"review\", \"design\"]\n\n[product.commands]\nlint = \"make lint\"\ntest = \"make test\"",
+            )
+            .replace("next = [\"review\", \"done\"]", "next = [\"review\", \"design\", \"done\"]");
+        let config = Config::parse(&text, dir.path()).unwrap();
+        assert_eq!(config.cells.len(), 3);
+        let design = config.cell("design").unwrap();
+        assert!(design.from_file);
+        assert!(!config.cell("triage").unwrap().from_file);
+        assert_eq!(design.label, "ac:design");
+        assert!(design.confirms());
+        assert_eq!(design.max_rounds, DEFAULT_MAX_ROUNDS);
+        assert_eq!(design.prompt, Some(cells.join("design.md")));
+        // 指示は、頭の設定を除いた本文
+        assert_eq!(
+            design.extra_prompt().unwrap().unwrap(),
+            "# 役割: design\n設計を書く\n"
+        );
+        assert_eq!(
+            config.cell("triage").unwrap().extra_prompt().unwrap(),
+            Some("prompt".to_string())
+        );
+        // 使えるコマンドは、選んだものだけ（書かなければすべて）
+        let product = &config.products[0];
+        assert_eq!(
+            product.commands_for(design).keys().collect::<Vec<_>>(),
+            ["lint"]
+        );
+        assert_eq!(
+            product.commands_for(config.cell("triage").unwrap()).len(),
+            2
+        );
+
+        // productのコマンドにない名前は断る
+        std::fs::write(
+            cells.join("design.md"),
+            "+++\non = \"issue\"\nlabel = \"ac:design\"\ncommands = [\"deploy\"]\n+++\n設計を書く\n",
+        )
+        .unwrap();
+        let message = Config::parse(&text, dir.path()).unwrap_err().message;
+        assert!(message.contains("commands の「deploy」"), "{message}");
+
+        // [[cell]] と同じ名前は、重なりとして断る
+        std::fs::write(
+            cells.join("triage.md"),
+            "+++\non = \"issue\"\nlabel = \"ac:triage2\"\n+++\n",
+        )
+        .unwrap();
+        let message = Config::parse(&text, dir.path()).unwrap_err().message;
+        assert!(message.contains("「triage」が重複"), "{message}");
+        std::fs::write(cells.join("triage.md"), "prompt").unwrap();
+
+        // 頭の書き間違いは、ファイルの名前を付けて断る
+        for (head, expected) in [
+            (
+                "+++\nname = \"x\"\non = \"issue\"\nlabel = \"ac:x\"\n+++\n",
+                "name は書けません",
+            ),
+            (
+                "+++\non = \"issue\"\nlabel = \"ac:x\"\nprompt = \"a.md\"\n+++\n",
+                "prompt は書けません",
+            ),
+            (
+                "+++\non = \"issue\"\nlabel = \"ac:x\"\ncolor = 1\n+++\n",
+                "color",
+            ),
+            ("+++\non = \"issue\"\nlabel = \"ac:x\"\n", "閉じていません"),
+            (
+                "+++\non = \"issue\"\nlabel = \"ac:x\"\n+++\n\n",
+                "役割と何をするか",
+            ),
+        ] {
+            std::fs::write(cells.join("design.md"), head).unwrap();
+            let message = Config::parse(&text, dir.path()).unwrap_err().message;
+            assert!(message.contains("design.md"), "{message}");
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+    }
+
+    #[test]
+    fn example_cells_can_be_read() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/cells");
+        let cells = cell_files(&dir).unwrap();
+        let names: Vec<&str> = cells.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["design", "release-prep"]);
+        for cell in &cells {
+            let body = cell.extra_prompt().unwrap().unwrap();
+            assert!(
+                body.starts_with(&format!("## この cell の役割: {}", cell.name)),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn front_matter_is_split_from_the_body() {
+        assert_eq!(front_matter("本文"), Ok(None));
+        assert_eq!(
+            front_matter("+++\na = 1\n+++\n本文"),
+            Ok(Some(("a = 1\n", "本文")))
+        );
+        assert_eq!(
+            front_matter("+++\r\na = 1\r\n+++\r\n\r\n本文"),
+            Ok(Some(("a = 1\r\n", "本文")))
+        );
+        assert_eq!(front_matter("+++\n+++"), Ok(Some(("", ""))));
+        assert_eq!(
+            front_matter("\u{feff}+++ \r\na = 1\n+++  \n本文"),
+            Ok(Some(("a = 1\n", "本文")))
+        );
+        assert!(front_matter("+++\na = 1\n++++\n").is_err());
     }
 
     #[test]

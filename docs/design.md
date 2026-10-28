@@ -8,20 +8,29 @@ agentcellsで、作ったものと決まったことの仕様。ひと通り整�
 
 ## cellの設定
 
-cellは設定ファイル（`~/.agentcells/config.toml`、TOML）の `[[cell]]` に書く。
+1つのcellを1つのファイル（`~/.agentcells/cells/<名前>.md`）に書く。頭の `+++` の行で囲んだところに設定（TOML）を、そのあとに追加の指示を書く。名前はファイルの名前。
 
-```toml
-[[cell]]
-name = "review"
+```markdown
++++
 on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
-prompt = "cells/review.md"   # 追加の指示のファイル（標準のcellなら省略できる）
 next = ["implement", "done"] # 進めてよい先（cellの名前、done、stop）
+review = true                # PRへのレビューとして、指摘を行ごとに投稿する（on は pull_request だけ）
 max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 model = "sonnet"             # 使うモデル（省略すると、Claude Codeの既定のもの）
 confirm = false              # 人間が着手を認めるまで、次のcellに進めない（assess は省略すると true）
+commands = ["test", "lint"]  # 使えるコマンド（productの commands の名前から選ぶ。省略するとすべて、[] なら使えない）
++++
+
+（追加の指示）
 ```
+
+- cellを足すたびに設定ファイルが長くならないように、また、cellをファイル1つで写したり配ったりできるように、ファイルに分ける。標準のcellを増やすのではなく、使う人が自分のcellを定義する（例は [examples/cells/](../examples/cells/)。設計を書くcell、リリースの準備をするcell）
+- 頭のないmdファイルと、`.` で始まるファイル（エディタの一時ファイルや、macOSが作る `._<名前>.md`）は、cellにしない（頭のないものは、`[[cell]]` の `prompt` から指す追加の指示のため）。1行目のBOMと、`+++` の行の終わりの空白は見ない。標準の役割がないcellで、本文が空なら、エラーにする（役割のないまま動かないように）。頭に `name` と `prompt` は書けない（名前はファイルの名前、指示は本文）。頭の書き間違い（知らない項目、閉じていない）は、ファイルの名前を付けてエラーにする
+- 設定ファイルの `[[cell]]` にも書ける（`name` と、追加の指示のファイル `prompt` を足す）。同じ名前を両方に書くと、重なりとしてエラーにする。`doctor` は、`[[cell]]` で書いたcellがあれば、ファイルに移すと短くできることを知らせる
+- cellはファイル全体で1つずつ定義し、productは `cells` で名前を選ぶ。読む順は、`[[cell]]`、そのあとファイルの名前の順（tickで同じ深さのものを並べる順になる）
+- `commands` は、`agentcells cell run` で使える名前を、productの `commands` から選ぶ。コマンドの中身はproductごとに違うので、中身はproductに書き、cellでは名前を選ぶだけにする。デプロイの準備のように、あるcellにだけ要るコマンドを、ほかのcell（implementなど）に使わせないため。選んだ名前が、そのcellを使うどのproductの `commands` にもなければ、書き間違いとしてエラーにする（使うproductのうち、一部にしかない名前は書ける。ないproductでは使えないだけ）
 
 - `model` は `claude -p --model` に渡す。cellごとに、重さに合ったモデルを選べるようにするため（判断だけのcellは sonnet など）。試すときの環境変数 `AGENTCELLS_MODEL` があれば、そちらを使う
 
@@ -36,8 +45,8 @@ cellとして動くAIに渡すプロンプトは、3つの層を重ねて作る�
 | 今回の仕事 | CLI | Issue/PRの中身、前のcellからの引き継ぎ、直してほしい指摘、そのあとの人間のコメント、何回目か、作業場所、ベースブランチ | 指示の本文 |
 
 - 標準のプロンプトは、このリポジトリの `prompts/` にmdで置き、ビルドのときにバイナリに埋め込む。公開しているので、誰でも中身を読める
-- 標準のcellは triage、implement、review、assess。設定の `prompt` は省略できる。書けば、そのファイルが追加の指示になる
-- 使う人が足したcell（例: design）には標準の役割がないので、`prompt` が要る（共通の決まりと進め先は付く）
+- 標準のcellは triage、implement、review、assess。追加の指示は書かなくてよい。書けば（cellのファイルの本文か、`[[cell]]` の `prompt` のファイル）、追加の指示になる
+- 使う人が足したcell（例: design）には標準の役割がないので、追加の指示が要る（共通の決まりと進め先は付く）
 - `agentcells prompt show <cell> [--issue owner/repo#N | --pr owner/repo#N]` で、AIに渡るプロンプトを組み立てて表示する。どんなシステムプロンプトが入るかを、使う人が確かめられるようにするため
 - 実行のたびに、渡したプロンプトを `logs/` に残す（予定）
 - reviewのcellは、指摘の先頭に重さ（`[must]`、`[should]`、`[imo]`、`[nits]`）を付ける。must か should があれば implement に戻し、implement は must と should を直す。imo と nits は直すかどうかを任せる。指摘の返し方は `review` の設定に合わせる（true なら findings、false なら comment の箇条書き）

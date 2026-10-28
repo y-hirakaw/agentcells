@@ -461,7 +461,10 @@ fn task_section(cell: &Cell, task: &Task) -> String {
         out.push(format!("- 作業場所: {}", worktree.display()));
     }
     if let Some(commands) = &task.commands {
-        out.push(if commands.is_empty() {
+        out.push(if commands.is_empty() && cell.commands.is_some() {
+            "- ビルドやテスト: この cell では、`agentcells cell run` を使いません（cell の設定で決めています）"
+                .to_string()
+        } else if commands.is_empty() {
             "- ビルドやテスト: このproductには、`agentcells cell run` で動かせるものがありません"
                 .to_string()
         } else {
@@ -778,13 +781,7 @@ pub fn show(
             }
         ))
     })?;
-    let extra = match &cell.prompt {
-        Some(path) => Some(
-            std::fs::read_to_string(path)
-                .map_err(|e| Error::new(format!("{} を読めません: {e}", path.display())))?,
-        ),
-        None => None,
-    };
+    let extra = cell.extra_prompt()?;
     let task = match target {
         Some((item, text)) => {
             if !cell.on.contains(&item) {
@@ -821,19 +818,22 @@ pub fn show(
     };
     // Issue/PRを指したなら、そのproductでの進め先（[product.next]）にする。tickと同じく、
     // Issueはproductの issues、PRは repos で選ぶ
-    let in_product = task
-        .as_ref()
-        .and_then(|t| {
-            config.products.iter().find(|p| {
-                p.cells.contains(&cell.name)
-                    && match t.item {
-                        Target::Issue => p.issues == t.repo,
-                        Target::PullRequest => p.repos.contains(&t.repo),
-                    }
-            })
+    let product = task.as_ref().and_then(|t| {
+        config.products.iter().find(|p| {
+            p.cells.contains(&cell.name)
+                && match t.item {
+                    Target::Issue => p.issues == t.repo,
+                    Target::PullRequest => p.repos.contains(&t.repo),
+                }
         })
-        .and_then(|p| config.cell_in(p, &cell.name));
+    });
+    let in_product = product.and_then(|p| config.cell_in(p, &cell.name));
     let cell = in_product.as_ref().unwrap_or(cell);
+    // 動かすときと同じく、このcellが使えるコマンドの名前を「今回の仕事」に入れる
+    let mut task = task;
+    if let (Some(task), Some(product)) = (task.as_mut(), product) {
+        task.commands = Some(product.commands_for(cell).into_keys().collect());
+    }
     let extra_note = match &cell.prompt {
         Some(path) => format!("追加の指示は {}", path.display()),
         None => "追加の指示のファイルはありません".to_string(),
@@ -863,6 +863,8 @@ mod tests {
             timeout_minutes: 30,
             model: None,
             confirm: None,
+            commands: None,
+            from_file: false,
         }
     }
 
@@ -898,6 +900,23 @@ mod tests {
             commands: Some(vec!["lint".to_string(), "test".to_string()]),
             protected: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cells_that_limit_commands_say_so() {
+        let mut task = task(Vec::new(), "bot[bot]");
+        task.commands = Some(Vec::new());
+        let open = user_prompt(&cell("design", &["done"]), None, Some(&task));
+        assert!(open.contains("このproductには"), "{open}");
+        let limited = Cell {
+            commands: Some(Vec::new()),
+            ..cell("design", &["done"])
+        };
+        let prompt = user_prompt(&limited, None, Some(&task));
+        assert!(
+            prompt.contains("この cell では、`agentcells cell run` を使いません"),
+            "{prompt}"
+        );
     }
 
     #[test]

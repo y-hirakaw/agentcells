@@ -487,7 +487,8 @@ impl Runner<'_> {
                 product,
             )?;
         }
-        task.commands = Some(product.commands.keys().cloned().collect());
+        let commands = product.commands_for(cell);
+        task.commands = Some(commands.keys().cloned().collect());
         let placed_blobs = placed
             .iter()
             .map(|p| actions::blob_hash(&place.worktree, p))
@@ -503,7 +504,7 @@ impl Runner<'_> {
         }
         let context = Context {
             worktree: place.worktree.clone(),
-            commands: product.commands.clone(),
+            commands,
             placed: placed.clone(),
             placed_blobs: placed_blobs.clone(),
             identity: self.identity(item_read)?,
@@ -511,6 +512,7 @@ impl Runner<'_> {
             tmp: place.tmp.clone(),
             caches: cache_dirs.clone(),
             base: branch.as_ref().map(|b| b.base.clone()),
+            commands_limited: cell.commands.is_some(),
         };
         let context_path = place.run.join("context.json");
         context.save(&context_path)?;
@@ -534,12 +536,7 @@ impl Runner<'_> {
         let settings_path = place.run.join("settings.json");
         write_json(&settings_path, &settings)?;
 
-        let extra = match &cell.prompt {
-            Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-                Error::new(format!("追加の指示 {} を読めません: {e}", path.display()))
-            })?),
-            None => None,
-        };
+        let extra = cell.extra_prompt()?;
         let asked = crate::discussion::asked_by(&task.discussion.posts, &task.writer, &cell.name);
         let replied_in = transition::replied_in(work.waiting, work.conflict);
         Ok(Prepared::Ready(Box::new(Ready {
@@ -1157,6 +1154,8 @@ mod tests {
             timeout_minutes: 30,
             model: None,
             confirm: None,
+            commands: None,
+            from_file: false,
         };
         let work = Work {
             product: "app".to_string(),
