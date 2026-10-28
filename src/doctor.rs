@@ -347,7 +347,8 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
         );
         return (check, Some(config));
     }
-    let warnings = settings::sandbox_warnings(&config);
+    let mut warnings = settings::sandbox_warnings(&config);
+    warnings.extend(settings::web_search_warnings(&config));
     let check = match &config {
         config if config.products.is_empty() => Check::warn(
             NAME,
@@ -360,7 +361,7 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
         _ if !warnings.is_empty() => Check::warn(
             NAME,
             warnings.join("\n"),
-            "[product.sandbox] で開けた場所は、AIが書き換えたビルドから使えます。要るものだけにしてください",
+            "[product.sandbox] で開けた場所と、cellの web_search で許した検索は、AIから使えます。要るものだけにしてください",
         ),
         config => {
             let in_config = config.cells.iter().filter(|c| !c.from_file).count();

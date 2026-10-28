@@ -99,10 +99,8 @@ cellの定義（拾う条件、プロンプト、止まる条件、往復の上�
 
 「今どうなってるかな」と見に来たら、すぐわかる画面を用意する。`claude -p` の動作を見るコンソールも、ここにまとめる。
 
-見せるもの:
+Issueごとの状態と、実行中の `claude -p` の様子を1つの画面に並べるものは、`agentcells dashboard`（ターミナル）として作った（docs/design.md）。まだのもの:
 
-- Issueごとの状態と、いつからか: `agentcells status` で出せる（docs/design.md）。ダッシュボードでも、これを使う
-- 実行中の `claude -p` の様子（今どのツールを使っているか、経過時間）: `agentcells status`（`--watch`）で出せる（docs/design.md）
 - 最近の実行の結果（どこへ進んだか、人間に回った理由、失敗、タイムアウト）
 
 実行の記録:
@@ -118,7 +116,6 @@ GitHub Projectsのボード:
 
 作り方:
 
-- 最初はターミナルUIで、情報を並べるだけにする
 - 設定（productとcellのつながり）を工場のラインとして描くところは、`agentcells config view` で作った（docs/design.md）
 - その絵に、Issue/PRをラインを流れる製品として載せ、どこで止まっているか、どこに人間が呼ばれているかが一目でわかるようにしたい。inspectorの歩留まりの可視化と合わせて、Web画面を検討する
 

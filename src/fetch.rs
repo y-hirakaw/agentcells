@@ -13,6 +13,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::actions::Context;
 use crate::error::{Error, Result};
@@ -23,9 +24,9 @@ pub const LIMIT: usize = 30_000;
 /// リダイレクトを追う回数の上限。
 const MAX_REDIRECTS: usize = 5;
 
-/// 接続と応答を待つ上限。
-const CONNECT_TIMEOUT_SECS: u32 = 10;
-const MAX_TIME_SECS: u32 = 60;
+/// 接続と応答を待つ上限。全体の上限は、リダイレクトを追う分も含める（Claude CodeのBashは、既定で120秒で打ち切るため）。
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+const MAX_TIME_SECS: u64 = 60;
 
 /// 受け取る量の上限（バイト）。出すのは [`LIMIT`] までだが、`--from` で続きを読めるように、ここまでは受け取る。
 const MAX_FILESIZE: usize = 20_000_000;
@@ -130,11 +131,20 @@ struct Page {
 /// 出すのは `from` バイト目から [`LIMIT`] までで、残りがあれば、続きの読み方を標準エラーに出す。
 /// 2xxなら0、それ以外は1を返す。
 pub fn fetch(context: &Context, url: &str, from: usize) -> Result<i32> {
+    let deadline = Instant::now() + Duration::from_secs(MAX_TIME_SECS);
     follow(
         &context.network,
         url,
         from,
-        |url, from| transfer(url, "=https", from, LIMIT, &[]),
+        |url, from| {
+            let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+            if left == 0 {
+                return Err(Error::new(format!(
+                    "リダイレクトを含めて、{MAX_TIME_SECS}秒以内に読み終わりませんでした"
+                )));
+            }
+            transfer(url, "=https", from, LIMIT, left, &[])
+        },
         &mut std::io::stdout(),
     )
 }
@@ -212,6 +222,12 @@ fn whole_chars(body: &[u8]) -> &[u8] {
 /// 出していない部分があるときの案内。
 fn remaining(url: &str, from: usize, shown: usize, total: usize) -> Option<String> {
     let end = from.saturating_add(shown);
+    if from > 0 && from >= total {
+        // 空のページと見分けられるように
+        return Some(format!(
+            "agentcells: --from {from} は、全体（{total}バイト）より後ろなので、何も出していません"
+        ));
+    }
     if end >= total {
         return None;
     }
@@ -226,10 +242,11 @@ fn transfer(
     protocols: &str,
     from: usize,
     limit: usize,
+    max_time: u64,
     env: &[(&str, &str)],
 ) -> Result<Page> {
-    let connect_timeout = CONNECT_TIMEOUT_SECS.to_string();
-    let max_time = MAX_TIME_SECS.to_string();
+    let connect_timeout = CONNECT_TIMEOUT_SECS.min(max_time).to_string();
+    let max_time_arg = max_time.to_string();
     let max_filesize = MAX_FILESIZE.to_string();
     let write_out = format!("%{{stderr}}\n{STATUS_MARK} %{{http_code}} %{{redirect_url}}\n");
     let mut child = Command::new("curl")
@@ -247,7 +264,7 @@ fn transfer(
             "--connect-timeout",
             &connect_timeout,
             "--max-time",
-            &max_time,
+            &max_time_arg,
             "--max-filesize",
             &max_filesize,
             "--user-agent",
@@ -298,7 +315,9 @@ fn transfer(
     if !status.success() {
         // curlの終了コード28はタイムアウト、63は大きすぎるとき
         let message = match status.code() {
-            Some(28) => format!("{MAX_TIME_SECS}秒以内に応答がありません: {message}"),
+            Some(28) => format!(
+                "{MAX_TIME_SECS}秒（リダイレクトを含めて）以内に読み終わりませんでした: {message}"
+            ),
             Some(63) => format!("{MAX_FILESIZE}バイトを超えるので、読みませんでした"),
             _ => format!("開けません: {message}"),
         };
@@ -461,7 +480,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(opened, 0);
         assert!(err.message.contains("--from"), "{}", err.message);
-        assert_eq!(remaining("https://docs.rs/", usize::MAX, 1, 10), None);
+        assert!(
+            remaining("https://docs.rs/", usize::MAX, 1, 10)
+                .unwrap()
+                .contains("何も出していません")
+        );
     }
 
     #[test]
@@ -472,7 +495,10 @@ mod tests {
             note.contains("agentcells cell fetch --from 10 https://docs.rs/"),
             "{note}"
         );
-        assert_eq!(remaining("https://docs.rs/", 30, 0, 25), None);
+        // 全体より後ろから読もうとしたときは、空のページと見分けられるように知らせる
+        let note = remaining("https://docs.rs/", 30, 0, 25).unwrap();
+        assert!(note.contains("全体（25バイト）より後ろ"), "{note}");
+        assert_eq!(remaining("https://docs.rs/", 0, 0, 0), None);
     }
 
     #[test]
@@ -651,7 +677,7 @@ mod tests {
             )) else {
                 return;
             };
-            let page = transfer(&format!("{base}/a"), "=http", 40, 20, NO_PROXY).unwrap();
+            let page = transfer(&format!("{base}/a"), "=http", 40, 20, 10, NO_PROXY).unwrap();
             server.join().unwrap();
             assert_eq!(page.status, 200);
             assert_eq!(page.total, 100);
@@ -669,7 +695,7 @@ mod tests {
             ) else {
                 return;
             };
-            let page = transfer(&format!("{base}/a"), "=http", 0, LIMIT, NO_PROXY).unwrap();
+            let page = transfer(&format!("{base}/a"), "=http", 0, LIMIT, 10, NO_PROXY).unwrap();
             server.join().unwrap();
             assert_eq!(page.status, 302);
             assert_eq!(page.location, Some(format!("{base}/next?a=1")));

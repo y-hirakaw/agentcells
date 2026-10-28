@@ -60,6 +60,7 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 #   confirm = false                  # true にすると、人間が着手を認めるまで次のcellに進めない（assess は省略すると true）
 #   timeout_minutes = 30             # 1回の実行の上限（省略すると30）
 #   commands = ["test"]              # 使えるコマンド（productの commands の名前から選ぶ。省略するとすべて、[] なら使えない）
+#   web_search = false               # true にすると、WebSearchで調べられる（sandboxの外で動き、network は効かない。WebFetchは使えないまま）
 #   +++
 #
 #   （追加の指示。標準のcell（triage、implement、review、assess）なら、書かなくても標準の役割で動く。
@@ -300,6 +301,10 @@ pub struct Cell {
     /// `agentcells cell run` で使える名前（productの `commands` から選ぶ）。書かなければ、productのものをすべて使える
     #[serde(default)]
     pub commands: Option<Vec<String>>,
+    /// WebSearchを使わせる。WebSearchはsandboxの外で動き、`[product.sandbox]` の `network` が効かないので、
+    /// 調べものをさせたいcellだけに許す。WebFetchは、これを有効にしても使わせない
+    #[serde(default)]
+    pub web_search: bool,
     /// `cells/<名前>.md` の頭に書いたcellか（`[[cell]]` ではなく）
     #[serde(skip)]
     pub from_file: bool,
@@ -1001,6 +1006,22 @@ timeout_minutes = 10
             );
             assert!(problems_of(&text).contains("model"), "{bad}");
         }
+    }
+
+    #[test]
+    fn web_search_is_off_unless_the_cell_turns_it_on() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let config = Config::parse(VALID, dir.path()).unwrap();
+        assert!(config.cells.iter().all(|c| !c.web_search));
+
+        let on = VALID.replace("max_rounds = 2", "max_rounds = 2\nweb_search = true");
+        let config = Config::parse(&on, dir.path()).unwrap();
+        assert!(config.cell("review").unwrap().web_search);
+        assert!(!config.cell("triage").unwrap().web_search);
+
+        let bad = VALID.replace("max_rounds = 2", "max_rounds = 2\nweb_search = \"yes\"");
+        let err = Config::parse(&bad, dir.path()).unwrap_err();
+        assert!(err.message.contains("web_search"), "{}", err.message);
     }
 
     #[test]

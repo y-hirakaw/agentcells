@@ -48,7 +48,7 @@ mod process;
 
 use branch::{BaseCheck, Branch, Pushed, check_base};
 pub use claude::Reader;
-use claude::{CELL_TOOLS, CLAUDE_LOG, ClaudeEnd, ClaudeRun, failure_kind};
+use claude::{CLAUDE_LOG, ClaudeEnd, ClaudeRun, failure_kind};
 use issue::{Issue, present};
 use place::Place;
 pub use place::claude_log;
@@ -533,7 +533,8 @@ impl Runner<'_> {
             tmp: &place.tmp,
             caches: &cache_list,
         };
-        let settings = settings::runtime_settings(self.home, self.config, product, &run_paths)?;
+        let settings =
+            settings::runtime_settings(self.home, self.config, product, cell, &run_paths)?;
         let settings_path = place.run.join("settings.json");
         write_json(&settings_path, &settings)?;
 
@@ -545,6 +546,7 @@ impl Runner<'_> {
             system: prompt::system_prompt(cell, replied_in, asked),
             schema: transition::output_schema(cell, replied_in, asked),
             settings_path,
+            tools: settings::cell_tools(cell),
             context_path,
             labels_before: issue.labels(item_read)?,
             job_dirs: [
@@ -1028,6 +1030,8 @@ struct Ready {
     system: String,
     schema: serde_json::Value,
     settings_path: PathBuf,
+    /// 使えるツール（`--tools`）
+    tools: String,
     context_path: PathBuf,
     labels_before: Vec<String>,
     task: prompt::Task,
@@ -1052,7 +1056,7 @@ impl Ready {
             path_prefix: runner.agentcells.parent(),
             // 試すときの指定（AGENTCELLS_MODEL）を、cellの設定より先にする
             model: runner.model.or(cell.model.as_deref()),
-            tools: Some(CELL_TOOLS),
+            tools: Some(&self.tools),
             timeout: Duration::from_secs(u64::from(cell.timeout_minutes) * 60),
             log_dir: &place.run,
             job_dirs: &self.job_dirs,
@@ -1156,6 +1160,7 @@ mod tests {
             model: None,
             confirm: None,
             commands: None,
+            web_search: false,
             from_file: false,
         };
         let work = Work {
