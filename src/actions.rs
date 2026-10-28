@@ -48,6 +48,9 @@ pub struct Context {
     /// ベースのブランチ（PRのベース。Issueなら既定のブランチ）。`merge` が `origin/<base>` を取り込む
     #[serde(default)]
     pub base: Option<String>,
+    /// `fetch` で開いてよいホスト（productの `[product.sandbox]` の `network`）
+    #[serde(default)]
+    pub network: Vec<String>,
     /// cellの `commands` で、使えるコマンドを絞っているか（使えないときに、どこで絞っているかを伝えるため）
     #[serde(default)]
     pub commands_limited: bool,
@@ -1081,6 +1084,7 @@ mod tests {
             tmp,
             caches: BTreeMap::new(),
             base: Some("main".to_string()),
+            network: Vec::new(),
             commands_limited: false,
         };
         (dir, context)

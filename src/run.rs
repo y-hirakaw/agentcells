@@ -512,6 +512,7 @@ impl Runner<'_> {
             tmp: place.tmp.clone(),
             caches: cache_dirs.clone(),
             base: branch.as_ref().map(|b| b.base.clone()),
+            network: product.sandbox.network.clone(),
             commands_limited: cell.commands.is_some(),
         };
         let context_path = place.run.join("context.json");
