@@ -462,6 +462,38 @@ Issue/PRの状態:
 - 1つのリポジトリを読めなくても、ほかのリポジトリの分は出す。そのときは、0以外で終わる（スクリプトから呼んだときに気づけるように）
 - 読むときは、tickと同じく、リポジトリごとの読み取りのトークンと空の設定のghを使う
 
+### 設定の絵（config view）
+
+`agentcells config view [--out <ファイル>]` は、`config.toml` を読み、productとcellのつながりを2Dゲーム風のポップな工場として描いた、1つのHTMLファイルを書き出す（省略すると `~/.agentcells/config.html`）。設定が複雑になると、productとcellの関係が想定通りかを、TOMLからは読み取りにくいため。読むだけで、GitHubも読まない。
+
+- 書き出した場所と、見つけた注意を表示する。ブラウザで開くのは使う人がする（コマンドからは開かない）
+- 外のJS、CDN、画像やフォントのファイルは使わず、インラインのSVGとCSSだけで描く。ファイル1つで、どこでも開けるように
+- 設定は `Config::load` で読む（設定に問題があれば、ほかのコマンドと同じく、その一覧を出して止まる）
+- productごとに1本のラインを縦に並べる。見出しに、productの名前と `issues`、`repos` を書く
+- cellは機械の箱として描き、名前、`label`、`on`、`model`、`max_rounds`、`timeout_minutes`、`confirm`（`confirms()` で決まる値。assess は書かなければ true）、`review` を載せる。sandbox と commands は載せない
+- 同じcellを複数のproductが使うときは、ラインごとに同じ機械を描く
+- 機械は、tickが動かす順と同じ深さ（「動かすIssue/PRを決める」）で、左から列に並べる。同じ列の中は、productの `cells` の順に積む
+- cellどうしを、`next` に沿ったベルトコンベア（CSSで動く縞の矢印）でつなぐ。`[product.next]` で替えたものを使い、替えたcellには印（元の `next` を添える）を付け、そのベルトの色を変える。となりの列へは横から、2列以上先へは上を、同じ列か前の列へ（差し戻し）は下を回す
+- 着手を確かめるcell（`confirm`）から、`done` 以外への先は、人間に認められたあとにだけ進めるので、別の色にして「承認のあと」と添える
+- 出口として `done`（Issueは閉じる、PRは検品待ち）を描く。`stop` は、ラインのどれかのcellが `next` に書いたときだけ、`done` の右に描く（`done` の下に置くと、`stop` へのベルトが `done` の箱を通って、`done` から出ていくように見えるため）。`needs-human` は、どの機械からも点線で降りられる「人間の窓口」として描く
+- product、cell、ラベル、リポジトリの名前はHTMLに埋め込むので、エスケープする
+- 判定（`flow`）と絵（`view`）は分け、判定をテストする
+
+入口: 人がラベルを付けて始めるcell。productの `cells` のうち、Issueを扱い（`on` に issue）、同じproductのほかのcellの `next`（`[product.next]` で替えたもの）から来ないもの（triage、assess など）。tickの深さの入口（ほかのcellの `next` にないcell）よりせまい。PRだけを扱うcellは、Issueから始められないので入口にしない。
+
+注意として、機械に警告の印を付け、上と各ラインの下に一覧を出す:
+
+- 入口からたどり着けないcell（ほかのcellの `next` からは来るが、入口から `next` をたどっても着かない）
+- `done` にも `stop` にも進めないcell。次の3つを分けて書く。`stop` も、ラインから下ろす出口として数える
+  - 行き止まり: 同じproductの中に進める先のcellがなく、`needs-human` しか選べない
+  - 抜けられない輪（review → implement → review だけ、など）の中にある
+  - 進める先が、行き止まりか抜けられない輪にしか行けないcellだけ（輪に流れ込むだけのcell、行き止まりの手前のcell）
+- ほかのcellの `next` から来ず、入口でもないcell（PRだけを扱い、どこからも来ないもの。人がラベルを付けたときだけ動く）
+- 入口のないproduct（そのときは、たどり着けないとは書かない）
+- 定義されている（`cells/<名前>.md` か `[[cell]]`）のに、どのproductの `cells` にも入っていないcell（「倉庫」に並べる）
+
+これらは設定の誤りではない（人はどのcellのラベルでも付けられる）ので、設定の確かめ（`Config::load`）では断らず、絵の注意として出すだけにする。
+
 ### ダッシュボード（dashboard）
 
 `agentcells dashboard` は、`status` の2つ（動いているcellと、Issue/PRの状態）を1つの画面にまとめ、画面を消して書き直し続ける。読むだけで、何も書き換えない。Ctrl-Cで終わる。

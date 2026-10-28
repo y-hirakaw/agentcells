@@ -8,6 +8,7 @@ use agentcells::config::{Config, Target};
 use agentcells::doctor::{self, Status};
 use agentcells::error::{Error, Result};
 use agentcells::files;
+use agentcells::flow;
 use agentcells::github::{self, Purpose};
 use agentcells::guard;
 use agentcells::home::{Home, RepoName};
@@ -22,6 +23,7 @@ use agentcells::setup;
 use agentcells::status;
 use agentcells::tick;
 use agentcells::tidy;
+use agentcells::view;
 
 #[derive(Parser)]
 #[command(version, about = "Issueを作ると、AIエージェントのcellが仕事を進める")]
@@ -36,6 +38,11 @@ enum Commands {
     Doctor,
     /// 作業データの置き場所を用意する（何度実行してもよい）
     Setup,
+    /// 設定ファイル（config.toml）を扱う
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// gitignoreされたファイルを扱う
     Files {
         #[command(subcommand)]
@@ -138,6 +145,16 @@ enum CellCommands {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommands {
+    /// productとcellのつながりを、工場のラインとして描いたHTMLファイルに書き出す（読むだけ。開くのは自分で）
+    View {
+        /// 書き出す先（省略すると ~/.agentcells/config.html）
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ScheduleCommands {
     /// `agentcells tick` を決まった間隔で動かすように、launchdに登録する（登録してあれば入れ替える）。
     /// 仕事があれば、tickがcellを1件動かす。cellが動いている間は、次のtickは何もしない
@@ -214,6 +231,29 @@ fn run(command: Commands) -> Result<ExitCode> {
             }
             println!();
             Ok(print_doctor(&home))
+        }
+        Commands::Config {
+            command: ConfigCommands::View { out },
+        } => {
+            let config = Config::load(&home.config_path())?;
+            let factory = flow::read(&config);
+            let out = out.unwrap_or_else(|| home.root().join("config.html"));
+            std::fs::write(&out, view::render(&factory)).map_err(|e| {
+                Error::new(format!("{} に書き出せません: {e}", out.display()))
+                    .with_hint("--out で、書き込める場所を指定してください")
+            })?;
+            println!("書き出しました: {}", out.display());
+            let notes = factory.notes();
+            if notes.is_empty() {
+                println!("注意はありません");
+            } else {
+                println!("注意: {}件", notes.len());
+                for note in &notes {
+                    println!("  - {note}");
+                }
+            }
+            println!("ブラウザで開いて見てください");
+            Ok(ExitCode::SUCCESS)
         }
         Commands::Files {
             command: FilesCommands::Apply { repo, worktree },
