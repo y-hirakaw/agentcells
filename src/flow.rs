@@ -13,7 +13,7 @@ use crate::transition::{DONE, STOP};
 #[derive(Debug, Clone)]
 pub struct Factory {
     pub lines: Vec<Line>,
-    /// `[[cell]]` に定義されているのに、どの `product.cells` にも入っていないcell
+    /// 定義されているのに、どの `product.cells` にも入っていないcell
     pub unused: Vec<String>,
 }
 
