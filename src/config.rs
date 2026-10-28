@@ -469,6 +469,15 @@ impl Config {
         self.cells.iter().find(|c| c.name == name)
     }
 
+    /// どのproductの `cells` にも入っていないcell（動かない）。定義した順で返す。
+    /// `next` の先にあるだけでは、使っていると数えない。
+    pub fn unused_cells(&self) -> Vec<&Cell> {
+        self.cells
+            .iter()
+            .filter(|c| !self.products.iter().any(|p| p.cells.contains(&c.name)))
+            .collect()
+    }
+
     /// productで動くcell。productの `next` に書いてあれば、進め先をそれに替える。
     pub fn cell_in(&self, product: &Product, name: &str) -> Option<Cell> {
         let mut cell = self.cell(name)?.clone();
@@ -1394,6 +1403,34 @@ timeout_minutes = 10
             assert!(message.contains("design.md"), "{message}");
             assert!(message.contains(expected), "{expected}: {message}");
         }
+    }
+
+    #[test]
+    fn unused_cells_are_those_in_no_product() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        std::fs::write(
+            dir.path().join("cells/design.md"),
+            "+++\non = \"issue\"\nlabel = \"ac:design\"\n+++\n設計を書く\n",
+        )
+        .unwrap();
+        // design（ファイル）も review（[[cell]]）も、どのproductにも入っていない
+        let text = VALID
+            .replace("cells = [\"triage\", \"review\"]", "cells = [\"triage\"]")
+            .replace("next = [\"review\", \"done\"]", "next = [\"done\"]");
+        let config = Config::parse(&text, dir.path()).unwrap();
+        let names: Vec<&str> = config
+            .unused_cells()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["review", "design"]);
+
+        // 片方のproductでだけ使っていれば、使っている
+        let text = format!(
+            "{text}\n[[product]]\nname = \"web\"\nissues = \"y-hirakaw/web\"\nrepos = [\"y-hirakaw/web\"]\ncells = [\"review\", \"design\"]\n"
+        );
+        let config = Config::parse(&text, dir.path()).unwrap();
+        assert!(config.unused_cells().is_empty());
     }
 
     #[test]
