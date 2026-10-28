@@ -94,7 +94,7 @@ impl Factory {
         }
         for name in &self.unused {
             notes.push(format!(
-                "cell「{name}」は [[cell]] に定義されていますが、どのproductの cells にも入っていません"
+                "cell「{name}」は定義されていますが、どのproductの cells にも入っていません"
             ));
         }
         notes
