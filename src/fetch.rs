@@ -49,7 +49,7 @@ pub fn permitted(url: &str, network: &[String]) -> Result<String> {
         "{host} は、このproductの [product.sandbox] の network にないので、開きませんでした\ndeny network-outbound {host}:443"
     ))
     .with_hint(format!(
-        "{listed}。このページが作業にどうしても要るなら、needs-human にして、config.toml の [product.sandbox] の network に足すよう人間に頼んでください。comment には、ホストの名前は書かずに、何のために読みたかったかを書いてください（コメントは公開されることがあるため。断ったホストは、CLIが手元に出します）。足すかどうかは人間が決めます"
+        "{listed}。このページが作業にどうしても要るなら、needs-human にして、config.toml の [product.sandbox] の network に足すよう人間に頼んでください。comment には、ホストの名前は（断られたものも、開けるものも）書かずに、何のために読みたかったかを書いてください（コメントは公開されることがあり、network には社内の名前が入りうるため。断ったホストは、CLIが手元に出します）。足すかどうかは人間が決めます"
     )))
 }
 
@@ -147,6 +147,11 @@ fn follow(
     mut open: impl FnMut(&str, usize) -> Result<Page>,
     out: &mut impl std::io::Write,
 ) -> Result<i32> {
+    if from > MAX_FILESIZE {
+        return Err(Error::new(format!(
+            "--from {from} は、受け取る量の上限（{MAX_FILESIZE}バイト）を超えています"
+        )));
+    }
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         permitted(&current, network)?;
@@ -158,7 +163,7 @@ fn follow(
             current = next;
             continue;
         }
-        let shown = if from + page.body.len() < page.total {
+        let shown = if from.saturating_add(page.body.len()) < page.total {
             whole_chars(&page.body)
         } else {
             &page.body[..]
@@ -206,7 +211,7 @@ fn whole_chars(body: &[u8]) -> &[u8] {
 
 /// 出していない部分があるときの案内。
 fn remaining(url: &str, from: usize, shown: usize, total: usize) -> Option<String> {
-    let end = from + shown;
+    let end = from.saturating_add(shown);
     if end >= total {
         return None;
     }
@@ -326,7 +331,7 @@ fn window(reader: &mut impl Read, from: usize, limit: usize) -> std::io::Result<
         total += n;
         // この塊のうち、[from, from + limit) に入る部分を残す
         let lo = from.max(start);
-        let hi = (from + limit).min(total);
+        let hi = from.saturating_add(limit).min(total);
         if lo < hi {
             kept.extend_from_slice(&buf[lo - start..hi - start]);
         }
@@ -414,7 +419,10 @@ mod tests {
         let hint = err.hint.unwrap();
         assert!(hint.contains("docs.rs、*.github.com"), "{hint}");
         assert!(hint.contains("needs-human"), "{hint}");
-        assert!(hint.contains("ホストの名前は書かずに"), "{hint}");
+        assert!(
+            hint.contains("ホストの名前は（断られたものも、開けるものも）書かずに"),
+            "{hint}"
+        );
         let hint = permitted("https://docs.rs/", &[])
             .unwrap_err()
             .hint
@@ -433,6 +441,27 @@ mod tests {
         assert_eq!(kept, &data[19_990..]);
         let (kept, _) = window(&mut data.as_slice(), 30_000, 100).unwrap();
         assert!(kept.is_empty());
+        let (kept, _) = window(&mut data.as_slice(), usize::MAX, LIMIT).unwrap();
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn a_start_beyond_what_is_received_is_refused_before_opening() {
+        let mut opened = 0;
+        let err = follow(
+            &network(),
+            "https://docs.rs/",
+            usize::MAX,
+            |_, _| {
+                opened += 1;
+                Ok(page(200, None, b"", 0))
+            },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(opened, 0);
+        assert!(err.message.contains("--from"), "{}", err.message);
+        assert_eq!(remaining("https://docs.rs/", usize::MAX, 1, 10), None);
     }
 
     #[test]
