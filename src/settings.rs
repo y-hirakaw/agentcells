@@ -567,6 +567,7 @@ mod tests {
             commands: Default::default(),
             sandbox,
             next: Default::default(),
+            protected: Vec::new(),
         }
     }
 

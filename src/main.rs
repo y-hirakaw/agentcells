@@ -86,6 +86,12 @@ enum Commands {
         #[arg(long)]
         watch: bool,
     },
+    /// productごとのIssue/PRの状態と、動いているcellの様子を、1つの画面で出し続ける（読むだけ。Ctrl-Cで終わる）
+    Dashboard {
+        /// GitHubを読み直す間隔（秒。10より短くはしない）。cellの様子は2秒ごとに読み直す
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+    },
     /// 定期実行（macOSのlaunchd）を扱う
     Schedule {
         #[command(subcommand)]
@@ -125,6 +131,13 @@ enum CellCommands {
         /// 途中のマージをやめて、取り込む前に戻す
         #[arg(long)]
         abort: bool,
+    },
+    /// Webのページを読む（httpsのGET）。開けるのは、productの [product.sandbox] の network にあるホストだけ
+    Fetch {
+        url: String,
+        /// 何バイト目から出すか（長いページの続きを読むとき）
+        #[arg(long, default_value_t = 0)]
+        from: usize,
     },
     /// Bashを使う前にClaude Codeが動かすhook。`agentcells cell` 以外のコマンドを、代わりに使うものを添えて断る
     #[command(hide = true)]
@@ -349,37 +362,21 @@ fn run(command: Commands) -> Result<ExitCode> {
             for line in agentcells::running::describe(&home, unix_now(), 5) {
                 println!("  {line}");
             }
-            // 止めきれなかったプロセスがあれば、次のtickは動かない
-            if let Some(note) = run::stuck(&home) {
-                println!("  ※{note}");
-            }
-            if let Some(pause) = agentcells::limit::active(&home, unix_now()) {
-                println!(
-                    "  ※{}のため、あと{}は、tickが新しく始めません",
-                    pause.reason,
-                    agentcells::running::elapsed(pause.until.saturating_sub(unix_now()))
-                );
+            for notice in tick_notices(&home, unix_now()) {
+                println!("  ※{notice}");
             }
             println!();
-            let config = Config::load(&home.config_path())?;
-            let credentials_for =
-                |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
+            let reports = read_reports(&home)?;
             let now = unix_now();
-            let actors = guard::Actors {
-                operator: config.operator.clone().unwrap_or_default(),
-                writer: prompt::writer_login(&config, &SystemProbe)?,
-            };
-            if config.products.is_empty() {
+            if reports.is_empty() {
                 println!("productがないので、扱っているIssueはありません");
             }
             let mut failed = false;
-            for (i, product) in config.products.iter().enumerate() {
+            for (i, (name, report)) in reports.iter().enumerate() {
                 if i > 0 {
                     println!();
                 }
-                println!("{}", product.name);
-                let report =
-                    status::product(&config, product, &SystemProbe, &credentials_for, &actors);
+                println!("{name}");
                 for error in &report.errors {
                     println!("  エラー: {error}");
                 }
@@ -400,6 +397,66 @@ fn run(command: Commands) -> Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Commands::Dashboard { interval } => {
+            let interval = interval.max(10);
+            let snapshot = std::sync::Arc::new(std::sync::Mutex::new(
+                agentcells::dashboard::Snapshot::default(),
+            ));
+            // 動いているcellが変わったら、間隔を待たずにGitHubを読み直すよう、読むスレッドを起こす
+            let (wake, woken) = std::sync::mpsc::channel::<()>();
+            // GitHubは時間がかかるので、別のスレッドで読み直す。画面は、その間も書き直す
+            {
+                let snapshot = std::sync::Arc::clone(&snapshot);
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        let read = read_reports(&home);
+                        {
+                            let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                            match read {
+                                Ok(products) => {
+                                    s.products = products;
+                                    s.read_at = Some(unix_now());
+                                    s.error = None;
+                                }
+                                Err(e) => s.error = Some(e.message),
+                            }
+                        }
+                        // 起こされるか、間隔が過ぎるまで待つ
+                        let _ = woken.recv_timeout(std::time::Duration::from_secs(interval));
+                    }
+                });
+            }
+            let mut last_running = None;
+            loop {
+                let now = unix_now();
+                let running = agentcells::running::load(&home);
+                let current = running
+                    .as_ref()
+                    .map(|(r, _)| (r.repo.clone(), r.number, r.started));
+                if last_running.as_ref().is_some_and(|last| *last != current) {
+                    let _ = wake.send(());
+                }
+                last_running = Some(current);
+                let notices = tick_notices(&home, now);
+                let lines = {
+                    let s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                    agentcells::dashboard::render(
+                        &s,
+                        running.as_ref().map(|(r, alive)| (r, *alive)),
+                        &notices,
+                        interval,
+                        now,
+                    )
+                };
+                // 画面を消して、上から書き直す
+                print!("\x1b[2J\x1b[H");
+                for line in lines {
+                    println!("{line}");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
         }
         Commands::Tick {
             dry_run,
@@ -790,6 +847,9 @@ fn run_cell(command: CellCommands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         CellCommands::Run { name } => Ok(code(actions::run(&context, &name)?)),
+        CellCommands::Fetch { url, from } => {
+            Ok(code(agentcells::fetch::fetch(&context, &url, from)?))
+        }
         CellCommands::Merge { abort: true } => {
             actions::merge_abort(&context)?;
             println!("マージをやめて、取り込む前に戻しました");
@@ -838,6 +898,42 @@ fn print_doctor(home: &Home) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// productごとに、扱っているIssue/PRの状態をGitHubから読む（`status` と `dashboard`）。
+fn read_reports(home: &Home) -> Result<Vec<(String, status::Report)>> {
+    let config = Config::load(&home.config_path())?;
+    let credentials_for =
+        |repo: &RepoName| github::credentials(&config, &SystemProbe, repo, Purpose::Read);
+    let actors = guard::Actors {
+        operator: config.operator.clone().unwrap_or_default(),
+        writer: prompt::writer_login(&config, &SystemProbe)?,
+    };
+    Ok(config
+        .products
+        .iter()
+        .map(|product| {
+            let report = status::product(&config, product, &SystemProbe, &credentials_for, &actors);
+            (product.name.clone(), report)
+        })
+        .collect())
+}
+
+/// tickが新しく始めない理由（`status` と `dashboard`）。
+fn tick_notices(home: &Home, now: u64) -> Vec<String> {
+    let mut notices = Vec::new();
+    // 止めきれなかったプロセスがあれば、次のtickは動かない
+    if let Some(note) = run::stuck(home) {
+        notices.push(note);
+    }
+    if let Some(pause) = agentcells::limit::active(home, now) {
+        notices.push(format!(
+            "{}のため、あと{}は、tickが新しく始めません",
+            pause.reason,
+            agentcells::running::elapsed(pause.until.saturating_sub(now))
+        ));
+    }
+    notices
 }
 
 /// 今の時刻（UNIXの秒）。

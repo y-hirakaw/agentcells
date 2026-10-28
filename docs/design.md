@@ -8,20 +8,29 @@ agentcellsで、作ったものと決まったことの仕様。ひと通り整�
 
 ## cellの設定
 
-cellは設定ファイル（`~/.agentcells/config.toml`、TOML）の `[[cell]]` に書く。
+1つのcellを1つのファイル（`~/.agentcells/cells/<名前>.md`）に書く。頭の `+++` の行で囲んだところに設定（TOML）を、そのあとに追加の指示を書く。名前はファイルの名前。
 
-```toml
-[[cell]]
-name = "review"
+```markdown
++++
 on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
-prompt = "cells/review.md"   # 追加の指示のファイル（標準のcellなら省略できる）
 next = ["implement", "done"] # 進めてよい先（cellの名前、done、stop）
+review = true                # PRへのレビューとして、指摘を行ごとに投稿する（on は pull_request だけ）
 max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 model = "sonnet"             # 使うモデル（省略すると、Claude Codeの既定のもの）
 confirm = false              # 人間が着手を認めるまで、次のcellに進めない（assess は省略すると true）
+commands = ["test", "lint"]  # 使えるコマンド（productの commands の名前から選ぶ。省略するとすべて、[] なら使えない）
++++
+
+（追加の指示）
 ```
+
+- cellを足すたびに設定ファイルが長くならないように、また、cellをファイル1つで写したり配ったりできるように、ファイルに分ける。標準のcellを増やすのではなく、使う人が自分のcellを定義する（例は [examples/cells/](../examples/cells/)。設計を書くcell、リリースの準備をするcell）
+- 頭のないmdファイルと、`.` で始まるファイル（エディタの一時ファイルや、macOSが作る `._<名前>.md`）は、cellにしない（頭のないものは、`[[cell]]` の `prompt` から指す追加の指示のため）。1行目のBOMと、`+++` の行の終わりの空白は見ない。標準の役割がないcellで、本文が空なら、エラーにする（役割のないまま動かないように）。頭に `name` と `prompt` は書けない（名前はファイルの名前、指示は本文）。頭の書き間違い（知らない項目、閉じていない）は、ファイルの名前を付けてエラーにする
+- 設定ファイルの `[[cell]]` にも書ける（`name` と、追加の指示のファイル `prompt` を足す）。同じ名前を両方に書くと、重なりとしてエラーにする。`doctor` は、`[[cell]]` で書いたcellがあれば、ファイルに移すと短くできることを知らせる
+- cellはファイル全体で1つずつ定義し、productは `cells` で名前を選ぶ。読む順は、`[[cell]]`、そのあとファイルの名前の順（tickで同じ深さのものを並べる順になる）
+- `commands` は、`agentcells cell run` で使える名前を、productの `commands` から選ぶ。コマンドの中身はproductごとに違うので、中身はproductに書き、cellでは名前を選ぶだけにする。デプロイの準備のように、あるcellにだけ要るコマンドを、ほかのcell（implementなど）に使わせないため。選んだ名前が、そのcellを使うどのproductの `commands` にもなければ、書き間違いとしてエラーにする（使うproductのうち、一部にしかない名前は書ける。ないproductでは使えないだけ）
 
 - `model` は `claude -p --model` に渡す。cellごとに、重さに合ったモデルを選べるようにするため（判断だけのcellは sonnet など）。試すときの環境変数 `AGENTCELLS_MODEL` があれば、そちらを使う
 
@@ -36,8 +45,8 @@ cellとして動くAIに渡すプロンプトは、3つの層を重ねて作る�
 | 今回の仕事 | CLI | Issue/PRの中身、前のcellからの引き継ぎ、直してほしい指摘、そのあとの人間のコメント、何回目か、作業場所、ベースブランチ | 指示の本文 |
 
 - 標準のプロンプトは、このリポジトリの `prompts/` にmdで置き、ビルドのときにバイナリに埋め込む。公開しているので、誰でも中身を読める
-- 標準のcellは triage、implement、review、assess。設定の `prompt` は省略できる。書けば、そのファイルが追加の指示になる
-- 使う人が足したcell（例: design）には標準の役割がないので、`prompt` が要る（共通の決まりと進め先は付く）
+- 標準のcellは triage、implement、review、assess。追加の指示は書かなくてよい。書けば（cellのファイルの本文か、`[[cell]]` の `prompt` のファイル）、追加の指示になる
+- 使う人が足したcell（例: design）には標準の役割がないので、追加の指示が要る（共通の決まりと進め先は付く）
 - `agentcells prompt show <cell> [--issue owner/repo#N | --pr owner/repo#N]` で、AIに渡るプロンプトを組み立てて表示する。どんなシステムプロンプトが入るかを、使う人が確かめられるようにするため
 - 実行のたびに、渡したプロンプトを `logs/` に残す（予定）
 - reviewのcellは、指摘の先頭に重さ（`[must]`、`[should]`、`[imo]`、`[nits]`）を付ける。must か should があれば implement に戻し、implement は must と should を直す。imo と nits は直すかどうかを任せる。指摘の返し方は `review` の設定に合わせる（true なら findings、false なら comment の箇条書き）
@@ -484,6 +493,18 @@ Issue/PRの状態:
 
 これらは設定の誤りではない（人はどのcellのラベルでも付けられる）ので、設定の確かめ（`Config::load`）では断らず、絵の注意として出すだけにする。
 
+### ダッシュボード（dashboard）
+
+`agentcells dashboard` は、`status` の2つ（動いているcellと、Issue/PRの状態）を1つの画面にまとめ、画面を消して書き直し続ける。読むだけで、何も書き換えない。Ctrl-Cで終わる。
+
+- productごとに、見出しの行に状態ごとの件数（作業中、返事待ち、検品待ち、順番待ち、ラベルなし。0のものは出さない）を出し、その下に `status` と同じ1行ずつを並べる
+- cellが動いているIssue/PRの行には `▶` を付け、その下に、そのcellの様子（`status` と同じもの。最近のしたことを10件まで）を広げる。IssueとPRは同じリポジトリで番号を分け合うので、リポジトリと番号で見る。同じIssueが2行に出ても広げるのは1か所で、作業中の行を選ぶ。作業中の行がなければ（GitHubを読み直す前で、まだ順番待ちや返事待ちのまま）、合った最初の行の下に広げる。どの行にも出ていなければ（GitHubをまだ読んでいない、読んだ範囲の外など）、上にまとめて出す
+- 動いているcellの様子は手元のファイルから読むので、2秒ごとに読み直す。GitHubは、読む回数を抑えるため、`--interval` の秒数（既定60秒、10秒より短くはしない）ごとに、別のスレッドで読み直す。ただし、動いているcellが変わったとき（始まった、終わった、別のIssue/PRに移った）は、古い状態が出る時間を短くするため、間隔を待たずに読み直す。最後に読んだのがいつかを出す。読めなかったときはエラーを出し、前に読めたものを出し続ける
+- 行数が端末の高さより多いと、上の行（最後に読んだ時刻、エラー、tickが止まっている理由）が画面の外に出る。端末の高さを確実に知るには、新しいクレートが要るため、今は切り詰めていない
+- tickが新しく始めない理由（止めきれなかったプロセス、使用量の上限などで止まっている間）も、`status` と同じく出す
+- 表示の先はターミナル（TUI）にした。HTMLにすると、手元にサーバーを立てて待ち受けることになり、トークンで読んだ非公開リポジトリの中身を、ほかのプロセスやブラウザから読まれないように守る必要が出る。agentcellsはtickと同じマシンのターミナルで使うので、まずはそこで足りるものにした
+- キー操作での折りたたみ（行を選んで開く）はしていない。端末をrawモードにするには、新しいクレート（crossterm など）が要るため。動いているcellは多くても1つなので、その行だけを広げれば足りる
+
 ## 作業するリポジトリ
 
 Issueがあるリポジトリと、実装を進めるリポジトリは同じとは限らない。
@@ -496,6 +517,7 @@ name = "agentcells"
 issues = "y-hirakaw/agentcells"    # Issueを置くリポジトリ
 repos = ["y-hirakaw/agentcells"]   # 作業するリポジトリ
 cells = ["triage", "implement", "review"]
+protected = ["src/hook.rs", "prompts/"]  # 守るファイル（下の「守るファイル」）
 
 [product.next]                     # このproductでだけ、cellの進め先を替える（書かなければ [[cell]] の next）
 assess = ["stop", "done"]
@@ -508,6 +530,19 @@ assess = ["stop", "done"]
 - 仕事ごとの作業場所は、`git worktree add` ではなく、`repos/` のcloneから `git clone --shared --separate-git-dir=gitdirs/...` で作る（予定）。オブジェクトは共有して読むだけにし、`.git` の実体は仕事ごとに作業場所の外に置く。理由は「AIに許すこと」のsandboxを参照
 - `claude -p` はworktreeの中で起動する。作業するリポジトリのCLAUDE.mdと設定がそのまま効く
 - PRがマージかクローズされたら、worktreeを片付ける
+
+### 守るファイル
+
+cellが自分の守り（hookや権限、プロンプト、CIの設定など）を書き換えるPRを、AIのレビューだけで通さないための印。agentcells自身のように、cellの守りを作っているリポジトリをcellで開発すると、守りを緩める変更が、AIのレビューだけで検品に回りうるため。
+
+- `protected` に、リポジトリからの相対パスで書く。書いたパスそのものと、その下すべてに当たる（`/` で終えるかどうかによらない。ディレクトリをsubmoduleやファイルに置き換えたときも当たるように）。大文字と小文字は区別しない（macOSでは、`.Claude/` を足すと `.claude/` として読まれうるため）
+- `.`、`..`、`\`、空の部分、ワイルドカード（`*`、`?`、`[`）は書けない（gitのパスと形が違うと、何にも当たらないまま守ったつもりになるため）
+- レビューのcell（`review = true`）がPRで動くときに、CLIが、bareのキャッシュで、ベースとworktreeに取り出したコミット（AIが見るもの）の差分（`--no-renames`。名前を変えて外すのも、変えたうちに入れる）を読み、守るファイルを変えているかを調べる。読めなければ、実行を止める（見落としたまま進まないように）
+- 変えていれば、レビューのcellの「今回の仕事」に、そのファイルと「守りを緩めていないか、すり抜ける道を作っていないかを、特に確かめて」を書く
+- レビューのcellが `done`（検品に回す）にしたときは、CLIがレビューの本文に、守るファイルを変えていることと、マージの前に人が差分を読むことを書き足す（AIの本文の外なので、AIは消せない）
+- 人間に回すのではなく、検品に回したうえで知らせる。人間に回すと、返事のたびにレビューのcellがまた動き、また人間に回る輪になるため。PRはもともと、人がマージするまで入らない。自動マージ（dispatcher、予定）ができたら、守るファイルを変えたPRは自動でマージしない
+- レビューのcellを通らずに `done` になるproductでは、書いても何も起きない
+- AIのレビューを補う印で、守りの境界ではない。パスで当てるので、守っていないファイルに、守りを迂回するコードを新しく足す道は残る。どのファイルが守りかはリポジトリによるので、例のパスは網羅ではない（agentcellsなら、ほかに sandboxの設定、コミットとpushの確かめ、cellに使わせる道具、CI、CLAUDE.md なども守りにかかわる）
 
 ## 作業データの置き場所
 
@@ -552,6 +587,7 @@ cellとして動くエージェントのsettings.jsonやhooksは、グローバ�
 | ベースの取り込み | `agentcells cell merge`。取り込めるのは、今の仕事のファイルにあるベースのブランチ（`origin/<ベース>`）だけ。ぶつかったら、そのファイルを出して1で終わる。`--abort` で取り込む前に戻す |
 | gitを読む | `agentcells cell git <status/diff/log/show/blame>`。`--output`、`--ext-diff`、`--no-index` は断る。`grep`・`ls-files` を断るときは、Grep・Glob のツールを案内する（`git grep` には外のコマンドを動かす `-O` があるので許さない） |
 | ビルドとテスト | `agentcells cell run <名前>`。実行できるのは、`config.toml` の `[product.commands]` に書いたコマンドだけ |
+| Webのページを読む | `agentcells cell fetch <URL>`。下の「Webのページを読む」 |
 
 - Bashは `Bash(agentcells cell:*)` だけを許す。`ls` や `git diff` でも、オプションでファイルに書けるものがあるため
 - 渡すツールは、Bash、Read、Edit、Write、Grep、Glob だけにする（`--tools`）。Claude Code 2.1.310〜は、標準では Grep と Glob を出さず、Bashの `grep` や `find` で探させる。それはhookが断るので、0.24.1までは、cellに探す道がなかった（AIは `agentcells cell git show ... | grep` で回り道をしていた）。名前を挙げると、Grep と Glob が出る。挙げないもの（サブエージェント、WebSearch、定期実行、ほかのセッションへの送信など）は出さない
@@ -578,7 +614,7 @@ sandbox（Bashで動くもの。`agentcells cell run` のビルドやテスト�
   - 「読ませない場所」を並べる形では、並べ忘れた場所（`~/.gradle/gradle.properties` など）の秘密が読めてしまう。読ませる場所を並べる形にし、足りなければビルドが失敗して人間に回るので、何を足せばよいかがわかる。開けた場所の秘密は読まれうるので、何を開けるかは使う人が決める
 - `~/.agentcells`（Appの秘密鍵、`files/`、`config.toml`、ほかの仕事の作業場所）、ghの設定、秘密がよく置かれる場所（`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.docker`、`~/.kube`、Keychainなど）は、`read` で広い場所（`~` や `~/.config`）を開けても読ませない。ツールの場所にある秘密（`~/.cargo/credentials.toml`、`~/.android/adbkey`、`~/.gradle/gradle.properties`、`~/.m2/settings.xml`、`~/.gem/credentials`、`~/.config/hub`）も同じ。sandboxは、より細かく書いた決まりを優先するため。これらの中を `read` に書くと、`doctor` と実行の前に断る（細かく書くと、開ける側が優先されてしまうため）
 - 置いた秘密のファイルは、読ませない。`[product.sandbox]` の `read_placed` に書いたもの（リポジトリからの相対パス）だけ、ビルドやテストに読ませる。ReadのdenyはClaude Codeがsandboxにも足すので、`read_placed` のファイルはAIのReadからも読める。ビルドに読ませれば、AIが書き換えたビルドを通して中身を取り出せるのと同じなので、分けない
-- 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない
+- 外への通信は、`[product.sandbox]` の `network` に書いた先（ドメイン。`*.example.com` も書ける）だけ。ほかの先は、聞かずに止める（`network.strictAllowlist`）。読めた秘密を、コミットを通さずに外へ送らせないため。sandboxを通らないWebFetchも使わせない（Webのページは、同じ `network` のホストだけを `agentcells cell fetch` で読む）
 - 止めた通信の先は、Claude Codeがコマンドの結果に `deny network-outbound <ホスト>:<ポート>` として書き足し、AIに見える。AIは、止まった先と、足すとよい設定を書いて人間に回す（プロンプトで指示する）
   - CLIもclaudeの出力から止められた先を拾い、足すとよい `network` の行を、手元（tickの出力）にだけ出す。人間に回すときは、公開のコメントに、止めたことだけを書く。claudeの出力にはビルドやテストが印字したものも入るので、AIが書き換えたビルドが、秘密を埋めた名前を `deny network-outbound ...` として印字すれば、そのまま公開されてしまう（実際に通信しなくてよく、小文字の英数字にすればbetterleaksにも当たらない）。攻撃がなくても、社内のプロキシやミラーの名前が出る。同じ理由で、AIにも、先の名前はコメントに書かず、何のための通信かを書くよう頼む。拾うのは、ホスト名として正しい形のもの（ラベルが英数字と `-`、2つ以上）だけを5件まで
 - sandboxの中では `~/.gitconfig` が読めず、gitが止まるので、使う人とシステムのgitの設定を読ませない環境変数（`GIT_CONFIG_GLOBAL=/dev/null` など）を設定の `env` で渡す
@@ -624,6 +660,20 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - `--setting-sources ""` で `--settings` にhooksを書くと、そのhookだけが動いた。リポジトリの `.claude/settings.json` のhooksも、`.claude/skills/` のskillや `.claude/agents/` のサブエージェントに書いたhooksも動かなかった（skillもサブエージェントも読み込まれなかった）。実行の途中で `.claude/settings.json` と `.claude/settings.local.json` を置いても、そのhooksは動かなかった。sandboxの `denyWrite` にworktreeの `.claude` を書くと、まだ `.claude` がなくても、sandboxの中のスクリプトから `.claude/settings.json` を書けなかった（macOS。Linuxのbubblewrapでは、ない場所の扱いを確かめ直す）。PreToolUseのhookが `permissionDecision: "deny"` で返した理由は、ツールの結果としてAIにそのまま届いた（2026-10-26）
 - sandboxが有効だと、`autoAllowBashIfSandboxed` の既定（有効）で、許していないBashのコマンド（`python3`、`touch` など）もsandboxの中で聞かずに動いた。`false` にすると「許しが要ります」で断られ、`ls` のような読むだけのコマンドと、許したコマンドだけが動いた（2026-10-26）
 - 2.1.310と2.1.311の `claude -p` は、`--tools` を渡さないと Grep と Glob を出さなかった（呼ぶと「Bashで `grep` を使え」と返る）。`--tools "Bash,Read,Edit,Write,Grep,Glob"` で出た。決まった形の結果を返すツール（StructuredOutput）は、`--tools` に挙げなくても `--json-schema` で出た。Readをdenyしたファイルは、Grep の結果にも Glob の結果にも出なかった（2026-10-27、haiku）
+
+#### Webのページを読む
+
+WebFetchはsandboxを通らず、読めた秘密を外へ送る道になるので使わせない（権限の設定のdenyはそのまま残す）。代わりに `agentcells cell fetch <URL>` で、productの `[product.sandbox]` の `network` に書いたホストだけを開く。
+
+- 開くのは `https://` のURLだけで、GETだけ。ポートは443（書かないとき）だけ。ホストの前のユーザー名（`user@`）、ホストの名前として読めないもの（`%` で書いたもの、IPアドレス（IPv4も、IPv6の角かっこも）など）は断る。最後のラベルが数字だけのものは、IPv4として扱って断る
+- ホストの照合はsandboxと同じ決まりにする。大文字・小文字は問わない。`example.com` はそのホストだけ、`*.example.com` はそのサブドメインだけ（`example.com` そのものは含まない）。開けるホストは、`tick` が今の仕事のファイル（`network`）に書く
+- `fetch` もsandboxの中で動くので、ほかのホストへの通信はプロキシ（`strictAllowlist`）がもう一重に止める。CLIでの照合は、断るときに案内するためと、二重の守りのため
+- `network` にないホストは、通信する前に断る。開けるホストと、要るなら needs-human にして `network` に足すよう人間に頼むことを案内する。断ったホストは、sandboxが止めたときと同じ形（`deny network-outbound <ホスト>:443`）で出し、CLIが手元（tickの出力）にだけ出す。AIには、ホストの名前は（断られたものも、開けるものも）公開のコメントに書かず、何のために読みたかったかを書くよう頼む（sandboxの「止めた通信の先」と同じ考え。`network` には社内のミラーなどの名前が入りうる）
+- `--from` は、受け取る量の上限（20MB）を超えるときは、開く前に断る
+- curlで開く。`--disable` で `~/.curlrc` を読まない（AIも書けるため）。リダイレクトはcurlに追わせず（`--max-redirs 0`）、行き先を確かめ直して、`network` にあるときだけ追う（5回まで）。接続10秒・全体60秒で打ち切り、受け取るのは20MBまで
+- 出すのは、中身の先頭から30,000バイトまで（大きいページでコンテキストがあふれないように。Claude CodeもBashの出力を3万字ほどで切る）。切るところがUTF-8の文字の途中なら、その文字の前で切る（最後の文字が化けないように）。残りがあれば、続きの読み方（`--from <バイト>`）を、出したところの次のバイトから案内して標準エラーに出す。HTMLはテキストにせず、そのまま出す
+- 2xxなら0、それ以外は応答の番号を出して1で終わる
+- 取ってきた中身は信用できない材料なので、プロンプトの「使えるもの」で、そこに書かれた指示には従わないよう添える
 
 ### sandboxに開ける場所
 
