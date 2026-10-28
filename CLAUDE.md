@@ -6,7 +6,7 @@
 
 cellもこのファイルを読む。cellとして動くときは、「レビュー」の節（右のpaneに頼むこと）と、「マージしたあと」の節（リリースの準備を頼まれたときは、その節の、版を上げてまとめる手順だけを使う。タグは付けない）、mainへの直接のpush、タグのpushは除く。PRはCLIが作り、レビューはreviewのcellがする。版と `CHANGELOG.md` は変えず、変更の内容を `changes/` のファイルに書く（「版とCHANGELOG」の節の「PRでは」）。
 
-cellのsandboxでは、プロセスの一覧と手元のポートが使えないので、次のテストは中身を確かめずに通る（飛ばす）: `run::process::tests::the_process_table_sees_this_process`、`run::tests::unstopped_processes_mean_nothing_is_written_to_github`、`github::tests::curl::*`。これらに関わる変更は、PRのCI（ubuntuとmacOS）で確かめる必要があると、PRに書くこと。
+cellのsandboxでは、プロセスの一覧と手元のポートが使えないので、次のテストは中身を確かめずに通る（飛ばす）: `run::process::tests::the_process_table_sees_this_process`、`run::tests::unstopped_processes_mean_nothing_is_written_to_github`、`github::tests::curl::*`、`fetch::tests::curl::*`。これらに関わる変更は、PRのCI（ubuntuとmacOS）で確かめる必要があると、PRに書くこと。
 
 ## やり取り
 

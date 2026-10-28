@@ -119,6 +119,13 @@ enum CellCommands {
         #[arg(long)]
         abort: bool,
     },
+    /// Webのページを読む（httpsのGET）。開けるのは、productの [product.sandbox] の network にあるホストだけ
+    Fetch {
+        url: String,
+        /// 何バイト目から出すか（長いページの続きを読むとき）
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+    },
     /// Bashを使う前にClaude Codeが動かすhook。`agentcells cell` 以外のコマンドを、代わりに使うものを添えて断る
     #[command(hide = true)]
     Hook,
@@ -750,6 +757,9 @@ fn run_cell(command: CellCommands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         CellCommands::Run { name } => Ok(code(actions::run(&context, &name)?)),
+        CellCommands::Fetch { url, from } => {
+            Ok(code(agentcells::fetch::fetch(&context, &url, from)?))
+        }
         CellCommands::Merge { abort: true } => {
             actions::merge_abort(&context)?;
             println!("マージをやめて、取り込む前に戻しました");
