@@ -609,6 +609,7 @@ mod tests {
             commands: Default::default(),
             sandbox,
             next: Default::default(),
+            protected: Vec::new(),
         }
     }
 
@@ -624,7 +625,9 @@ mod tests {
             timeout_minutes: 30,
             model: None,
             confirm: None,
+            commands: None,
             web_search,
+            from_file: false,
         }
     }
 

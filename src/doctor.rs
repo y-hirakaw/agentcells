@@ -354,7 +354,7 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
             NAME,
             "productがまだありません",
             format!(
-                "{} に [[product]] と [[cell]] を書いてください（雛形のコメントに例があります）",
+                "{} に [[product]] を、cells/<名前>.md にcellを書いてください（雛形のコメントに例があります）",
                 path.display()
             ),
         ),
@@ -363,14 +363,20 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
             warnings.join("\n"),
             "[product.sandbox] で開けた場所と、[[cell]] の web_search で許した検索は、AIから使えます。要るものだけにしてください",
         ),
-        config => Check::ok(
-            NAME,
-            format!(
+        config => {
+            let in_config = config.cells.iter().filter(|c| !c.from_file).count();
+            let mut detail = format!(
                 "product {}件、cell {}件",
                 config.products.len(),
                 config.cells.len()
-            ),
-        ),
+            );
+            if in_config > 0 {
+                detail.push_str(&format!(
+                    "（[[cell]] の{in_config}件は、cells/<名前>.md の頭に書くと、設定ファイルを短くできます）"
+                ));
+            }
+            Check::ok(NAME, detail)
+        }
     };
     (check, Some(config))
 }

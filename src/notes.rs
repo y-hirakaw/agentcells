@@ -238,10 +238,11 @@ fn config_summary(config: &Config) -> String {
     }
     for cell in &config.cells {
         out.push(format!(
-            "[cell {}] on={:?} next={:?} model={:?} max_rounds={} timeout_minutes={} 追加の指示={}",
+            "[cell {}] on={:?} next={:?} commands={:?} model={:?} max_rounds={} timeout_minutes={} 追加の指示={}",
             cell.name,
             cell.on.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             cell.next,
+            cell.commands,
             cell.model,
             cell.max_rounds,
             cell.timeout_minutes,

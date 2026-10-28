@@ -8,22 +8,30 @@ agentcellsで、作ったものと決まったことの仕様。ひと通り整�
 
 ## cellの設定
 
-cellは設定ファイル（`~/.agentcells/config.toml`、TOML）の `[[cell]]` に書く。
+1つのcellを1つのファイル（`~/.agentcells/cells/<名前>.md`）に書く。頭の `+++` の行で囲んだところに設定（TOML）を、そのあとに追加の指示を書く。名前はファイルの名前。
 
-```toml
-[[cell]]
-name = "review"
+```markdown
++++
 on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
-prompt = "cells/review.md"   # 追加の指示のファイル（標準のcellなら省略できる）
 next = ["implement", "done"] # 進めてよい先（cellの名前、done、stop）
+review = true                # PRへのレビューとして、指摘を行ごとに投稿する（on は pull_request だけ）
 max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
 timeout_minutes = 30         # 1回の実行の上限（省略すると30）
 model = "sonnet"             # 使うモデル（省略すると、Claude Codeの既定のもの）
 confirm = false              # 人間が着手を認めるまで、次のcellに進めない（assess は省略すると true）
+commands = ["test", "lint"]  # 使えるコマンド（productの commands の名前から選ぶ。省略するとすべて、[] なら使えない）
 web_search = false           # WebSearchで調べられるようにする（省略すると false）
++++
+
+（追加の指示）
 ```
 
+- cellを足すたびに設定ファイルが長くならないように、また、cellをファイル1つで写したり配ったりできるように、ファイルに分ける。標準のcellを増やすのではなく、使う人が自分のcellを定義する（例は [examples/cells/](../examples/cells/)。設計を書くcell、リリースの準備をするcell）
+- 頭のないmdファイルと、`.` で始まるファイル（エディタの一時ファイルや、macOSが作る `._<名前>.md`）は、cellにしない（頭のないものは、`[[cell]]` の `prompt` から指す追加の指示のため）。1行目のBOMと、`+++` の行の終わりの空白は見ない。標準の役割がないcellで、本文が空なら、エラーにする（役割のないまま動かないように）。頭に `name` と `prompt` は書けない（名前はファイルの名前、指示は本文）。頭の書き間違い（知らない項目、閉じていない）は、ファイルの名前を付けてエラーにする
+- 設定ファイルの `[[cell]]` にも書ける（`name` と、追加の指示のファイル `prompt` を足す）。同じ名前を両方に書くと、重なりとしてエラーにする。`doctor` は、`[[cell]]` で書いたcellがあれば、ファイルに移すと短くできることを知らせる
+- cellはファイル全体で1つずつ定義し、productは `cells` で名前を選ぶ。読む順は、`[[cell]]`、そのあとファイルの名前の順（tickで同じ深さのものを並べる順になる）
+- `commands` は、`agentcells cell run` で使える名前を、productの `commands` から選ぶ。コマンドの中身はproductごとに違うので、中身はproductに書き、cellでは名前を選ぶだけにする。デプロイの準備のように、あるcellにだけ要るコマンドを、ほかのcell（implementなど）に使わせないため。選んだ名前が、そのcellを使うどのproductの `commands` にもなければ、書き間違いとしてエラーにする（使うproductのうち、一部にしかない名前は書ける。ないproductでは使えないだけ）
 - `web_search = true` のcellだけ、WebSearchを使える。調べた結果をIssueやPRに書かせたいcellのためで、どのcellにも許すと外へ送れる道が広がるので、cellごとに決める。標準のcellでも、使う人が足したcellでも書ける。WebFetchは、書いても使えない（「AIに許すこと」）
 - `model` は `claude -p --model` に渡す。cellごとに、重さに合ったモデルを選べるようにするため（判断だけのcellは sonnet など）。試すときの環境変数 `AGENTCELLS_MODEL` があれば、そちらを使う
 
@@ -38,8 +46,8 @@ cellとして動くAIに渡すプロンプトは、3つの層を重ねて作る�
 | 今回の仕事 | CLI | Issue/PRの中身、前のcellからの引き継ぎ、直してほしい指摘、そのあとの人間のコメント、何回目か、作業場所、ベースブランチ | 指示の本文 |
 
 - 標準のプロンプトは、このリポジトリの `prompts/` にmdで置き、ビルドのときにバイナリに埋め込む。公開しているので、誰でも中身を読める
-- 標準のcellは triage、implement、review、assess。設定の `prompt` は省略できる。書けば、そのファイルが追加の指示になる
-- 使う人が足したcell（例: design）には標準の役割がないので、`prompt` が要る（共通の決まりと進め先は付く）
+- 標準のcellは triage、implement、review、assess。追加の指示は書かなくてよい。書けば（cellのファイルの本文か、`[[cell]]` の `prompt` のファイル）、追加の指示になる
+- 使う人が足したcell（例: design）には標準の役割がないので、追加の指示が要る（共通の決まりと進め先は付く）
 - `agentcells prompt show <cell> [--issue owner/repo#N | --pr owner/repo#N]` で、AIに渡るプロンプトを組み立てて表示する。どんなシステムプロンプトが入るかを、使う人が確かめられるようにするため
 - 実行のたびに、渡したプロンプトを `logs/` に残す（予定）
 - reviewのcellは、指摘の先頭に重さ（`[must]`、`[should]`、`[imo]`、`[nits]`）を付ける。must か should があれば implement に戻し、implement は must と should を直す。imo と nits は直すかどうかを任せる。指摘の返し方は `review` の設定に合わせる（true なら findings、false なら comment の箇条書き）
@@ -466,6 +474,7 @@ name = "agentcells"
 issues = "y-hirakaw/agentcells"    # Issueを置くリポジトリ
 repos = ["y-hirakaw/agentcells"]   # 作業するリポジトリ
 cells = ["triage", "implement", "review"]
+protected = ["src/hook.rs", "prompts/"]  # 守るファイル（下の「守るファイル」）
 
 [product.next]                     # このproductでだけ、cellの進め先を替える（書かなければ [[cell]] の next）
 assess = ["stop", "done"]
@@ -478,6 +487,19 @@ assess = ["stop", "done"]
 - 仕事ごとの作業場所は、`git worktree add` ではなく、`repos/` のcloneから `git clone --shared --separate-git-dir=gitdirs/...` で作る（予定）。オブジェクトは共有して読むだけにし、`.git` の実体は仕事ごとに作業場所の外に置く。理由は「AIに許すこと」のsandboxを参照
 - `claude -p` はworktreeの中で起動する。作業するリポジトリのCLAUDE.mdと設定がそのまま効く
 - PRがマージかクローズされたら、worktreeを片付ける
+
+### 守るファイル
+
+cellが自分の守り（hookや権限、プロンプト、CIの設定など）を書き換えるPRを、AIのレビューだけで通さないための印。agentcells自身のように、cellの守りを作っているリポジトリをcellで開発すると、守りを緩める変更が、AIのレビューだけで検品に回りうるため。
+
+- `protected` に、リポジトリからの相対パスで書く。書いたパスそのものと、その下すべてに当たる（`/` で終えるかどうかによらない。ディレクトリをsubmoduleやファイルに置き換えたときも当たるように）。大文字と小文字は区別しない（macOSでは、`.Claude/` を足すと `.claude/` として読まれうるため）
+- `.`、`..`、`\`、空の部分、ワイルドカード（`*`、`?`、`[`）は書けない（gitのパスと形が違うと、何にも当たらないまま守ったつもりになるため）
+- レビューのcell（`review = true`）がPRで動くときに、CLIが、bareのキャッシュで、ベースとworktreeに取り出したコミット（AIが見るもの）の差分（`--no-renames`。名前を変えて外すのも、変えたうちに入れる）を読み、守るファイルを変えているかを調べる。読めなければ、実行を止める（見落としたまま進まないように）
+- 変えていれば、レビューのcellの「今回の仕事」に、そのファイルと「守りを緩めていないか、すり抜ける道を作っていないかを、特に確かめて」を書く
+- レビューのcellが `done`（検品に回す）にしたときは、CLIがレビューの本文に、守るファイルを変えていることと、マージの前に人が差分を読むことを書き足す（AIの本文の外なので、AIは消せない）
+- 人間に回すのではなく、検品に回したうえで知らせる。人間に回すと、返事のたびにレビューのcellがまた動き、また人間に回る輪になるため。PRはもともと、人がマージするまで入らない。自動マージ（dispatcher、予定）ができたら、守るファイルを変えたPRは自動でマージしない
+- レビューのcellを通らずに `done` になるproductでは、書いても何も起きない
+- AIのレビューを補う印で、守りの境界ではない。パスで当てるので、守っていないファイルに、守りを迂回するコードを新しく足す道は残る。どのファイルが守りかはリポジトリによるので、例のパスは網羅ではない（agentcellsなら、ほかに sandboxの設定、コミットとpushの確かめ、cellに使わせる道具、CI、CLAUDE.md なども守りにかかわる）
 
 ## 作業データの置き場所
 
