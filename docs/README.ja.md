@@ -62,7 +62,7 @@ agentcells doctor
 | `agentcells status [--watch]` | 動いているcell（経過時間、AIが使っているツール）と、扱っているIssueごとに、今どこまで進んでいるか（作業中、返事待ち、検品待ち、順番待ち）と、いつからかを出す。PRができたIssueは、PRの状態を出す（読むだけ）。`--watch` なら、動いているcellの様子だけを2秒ごとに出し直す |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |
 
-設定ファイル `~/.agentcells/config.toml` には、cellを使うあなたのGitHubのログイン（`operator`）と、product（どのリポジトリのIssueを、どのリポジトリで作業するか）とcell（どのラベルを拾い、どのプロンプトで動くか）を書きます。書き方は [docs/design.md](design.md) と、雛形のコメントを見てください。動くのは、あなたがAssigneesに自分を入れ、cellのラベルを付けたIssue/PRだけです（ほかの人がラベルやAssigneesを変えても、勝手に始まりません）。AIが質問して止まったもの（`ac:needs-human`）や、検品を待つPR（`ac:in-review`）には、人に返事をするのと同じようにコメントすれば、続きが動きます（ほかの人のコメントでは動きません。あなたのコメントは、どれも返事として扱います）。標準のcell（triage、implement、review、assess）は、プロンプトを書かなくても [prompts/](../prompts/) の標準のプロンプトで動きます。`prompt` にファイルを書くと、追加の指示として足されます。
+設定ファイル `~/.agentcells/config.toml` には、cellを使うあなたのGitHubのログイン（`operator`）と、product（どのリポジトリのIssueを、どのリポジトリで作業するか）を書きます。cell（どのラベルを拾い、どのプロンプトで動くか）は、1つずつ `~/.agentcells/cells/<名前>.md` に書きます（頭に設定、そのあとに指示。例は [examples/cells/](../examples/cells/)）。書き方は [docs/design.md](design.md) と、雛形のコメントを見てください。動くのは、あなたがAssigneesに自分を入れ、cellのラベルを付けたIssue/PRだけです（ほかの人がラベルやAssigneesを変えても、勝手に始まりません）。AIが質問して止まったもの（`ac:needs-human`）や、検品を待つPR（`ac:in-review`）には、人に返事をするのと同じようにコメントすれば、続きが動きます（ほかの人のコメントでは動きません。あなたのコメントは、どれも返事として扱います）。標準のcell（triage、implement、review、assess）は、プロンプトを書かなくても [prompts/](../prompts/) の標準のプロンプトで動きます。cellのファイルの本文に書いたことは、追加の指示として足されます。標準にないcell（設計を書くcellなど）も、ファイルを足せば作れます。
 
 ### GitHub App（推奨）
 

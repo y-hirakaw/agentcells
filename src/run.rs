@@ -474,7 +474,21 @@ impl Runner<'_> {
             git_out(self.probe, &all).ok()
         };
         task.guides = Some(prompt::read_guides(&git, &base));
-        task.commands = Some(product.commands.keys().cloned().collect());
+        // 使うのはレビューのcellだけ。読めなければ止める（守るファイルを見落としたまま進まないように）
+        if cell.review && work.item == Target::PullRequest && !product.protected.is_empty() {
+            let Some(branch) = &branch else {
+                return Err(Error::new("PRのブランチを読めません"));
+            };
+            task.protected = protected_changes(
+                self.probe,
+                &place.cache,
+                &format!("refs/heads/{}", branch.base),
+                &branch.start,
+                product,
+            )?;
+        }
+        let commands = product.commands_for(cell);
+        task.commands = Some(commands.keys().cloned().collect());
         let placed_blobs = placed
             .iter()
             .map(|p| actions::blob_hash(&place.worktree, p))
@@ -490,7 +504,7 @@ impl Runner<'_> {
         }
         let context = Context {
             worktree: place.worktree.clone(),
-            commands: product.commands.clone(),
+            commands,
             placed: placed.clone(),
             placed_blobs: placed_blobs.clone(),
             identity: self.identity(item_read)?,
@@ -499,6 +513,7 @@ impl Runner<'_> {
             caches: cache_dirs.clone(),
             base: branch.as_ref().map(|b| b.base.clone()),
             network: product.sandbox.network.clone(),
+            commands_limited: cell.commands.is_some(),
         };
         let context_path = place.run.join("context.json");
         context.save(&context_path)?;
@@ -522,12 +537,7 @@ impl Runner<'_> {
         let settings_path = place.run.join("settings.json");
         write_json(&settings_path, &settings)?;
 
-        let extra = match &cell.prompt {
-            Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-                Error::new(format!("追加の指示 {} を読めません: {e}", path.display()))
-            })?),
-            None => None,
-        };
+        let extra = cell.extra_prompt()?;
         let asked = crate::discussion::asked_by(&task.discussion.posts, &task.writer, &cell.name);
         let replied_in = transition::replied_in(work.waiting, work.conflict);
         Ok(Prepared::Ready(Box::new(Ready {
@@ -748,6 +758,15 @@ impl Runner<'_> {
             }
             text.push_str(&format!("人間に回しました: {reason}"));
         }
+        // 守るファイルを変えたPRを検品に回すときは、AIのレビューだけで済ませないよう、CLIが書き足す
+        if cell.review
+            && reason.is_none()
+            && plan.destination == Destination::Done
+            && let Some(note) = protected_note(&task.protected)
+        {
+            text.push_str("\n\n");
+            text.push_str(&note);
+        }
 
         // 着手を確かめるcellが、自分で人間に確かめたなら、そう印を付ける（このあとの返事でだけ先へ進める）
         let asking = cell.confirms()
@@ -944,6 +963,51 @@ impl Runner<'_> {
     }
 }
 
+/// PRが変えた（足した、消した、名前を変えた）ファイルのうち、守るもの。差分は、CLIだけが書くbareのキャッシュで、
+/// ベースと、worktreeに取り出したコミット（`head`。AIが見るもの）の間で読む。
+fn protected_changes(
+    probe: &dyn Probe,
+    cache: &Path,
+    base: &str,
+    head: &str,
+    product: &Product,
+) -> Result<Vec<String>> {
+    let range = format!("{base}...{head}");
+    // 名前を変えたときに、元の名前も出す（守るファイルを動かして外すのも、変えたうちに入れる）
+    let out = git_out(
+        probe,
+        &[
+            "--git-dir",
+            &path_str(cache)?,
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            &range,
+        ],
+    )?;
+    Ok(out
+        .split('\0')
+        .filter(|path| !path.is_empty() && product.protects(path))
+        .map(str::to_string)
+        .collect())
+}
+
+/// 守るファイルを変えたPRを検品に回すときに、CLIが書き足す文。変えていなければ `None`。
+fn protected_note(files: &[String]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = files
+        .iter()
+        .map(|f| format!("`{}`", crate::display::printable(f).replace('`', "'")))
+        .collect();
+    Some(format!(
+        "このPRは、守るファイル（agentcellsの設定の protected）を変えています: {}。AIのレビューだけで済ませず、マージの前に人が差分を読んでください",
+        listed.join("、")
+    ))
+}
+
 /// 作業するリポジトリ（今は product の repos の最初）。
 fn place_repo(product: &Product) -> Result<RepoName> {
     product
@@ -1091,6 +1155,8 @@ mod tests {
             timeout_minutes: 30,
             model: None,
             confirm: None,
+            commands: None,
+            from_file: false,
         };
         let work = Work {
             product: "app".to_string(),
@@ -1173,5 +1239,71 @@ mod tests {
                 .any(|c| c.contains("--add-label ac:needs-human")),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn protected_files_a_pr_changes_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let cache = dir.path().join("cache.git");
+        let run = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::create_dir_all(work.join("prompts")).unwrap();
+        for f in [
+            "src/hook.rs",
+            "src/main.rs",
+            "prompts/common.md",
+            "prompts.md",
+        ] {
+            std::fs::write(work.join(f), "a\n").unwrap();
+        }
+        run(dir.path(), &["init", "-q", "-b", "main", "work"]);
+        run(&work, &["add", "."]);
+        run(&work, &["commit", "-qm", "base"]);
+        run(&work, &["checkout", "-qb", "ac/1"]);
+        // 名前を変えて守りから外す、ディレクトリの下を変える、守らないものを変える
+        run(&work, &["mv", "src/hook.rs", "src/hook_old.rs"]);
+        std::fs::write(work.join("prompts/common.md"), "b\n").unwrap();
+        std::fs::write(work.join("prompts.md"), "b\n").unwrap();
+        std::fs::write(work.join("src/main.rs"), "b\n").unwrap();
+        run(&work, &["commit", "-qam", "change"]);
+        run(dir.path(), &["clone", "-q", "--bare", "work", "cache.git"]);
+
+        let mut product: Product = toml::from_str(
+            "name = \"app\"\nissues = \"octo/app\"\nrepos = [\"octo/app\"]\ncells = []\nprotected = [\"src/hook.rs\", \"prompts/\"]",
+        )
+        .unwrap();
+        let probe = crate::probe::SystemProbe;
+        let changes = |product: &Product| {
+            protected_changes(
+                &probe,
+                &cache,
+                "refs/heads/main",
+                "refs/heads/ac/1",
+                product,
+            )
+            .unwrap()
+        };
+        assert_eq!(changes(&product), vec!["prompts/common.md", "src/hook.rs"]);
+        // 大文字と小文字は区別しない（macOSでは同じファイルになる）。/ がなくてもディレクトリに当たる
+        product.protected = vec!["SRC/Main.rs/".to_string(), "Prompts".to_string()];
+        assert_eq!(changes(&product), vec!["prompts/common.md", "src/main.rs"]);
+    }
+
+    #[test]
+    fn the_note_lists_protected_files() {
+        assert_eq!(protected_note(&[]), None);
+        let note = protected_note(&["src/hook.rs".to_string(), "a\u{1b}b".to_string()]).unwrap();
+        assert!(note.contains("`src/hook.rs`、`a"), "{note}");
+        assert!(note.contains("人が差分を読んで"), "{note}");
+        assert!(!note.contains('\u{1b}'), "{note}");
     }
 }

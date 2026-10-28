@@ -90,6 +90,8 @@ pub struct Task {
     pub guides: Option<Guides>,
     /// `agentcells cell run` で使える名前（productの `commands`）。動かすときにCLIが入れる
     pub commands: Option<Vec<String>>,
+    /// PRが変えた、守るファイル（productの `protected`）。動かすときにCLIがベースとの差分から入れる
+    pub protected: Vec<String>,
 }
 
 /// 開発のルールのファイルと、読んだブランチ。
@@ -459,7 +461,10 @@ fn task_section(cell: &Cell, task: &Task) -> String {
         out.push(format!("- 作業場所: {}", worktree.display()));
     }
     if let Some(commands) = &task.commands {
-        out.push(if commands.is_empty() {
+        out.push(if commands.is_empty() && cell.commands.is_some() {
+            "- ビルドやテスト: この cell では、`agentcells cell run` を使いません（cell の設定で決めています）"
+                .to_string()
+        } else if commands.is_empty() {
             "- ビルドやテスト: このproductには、`agentcells cell run` で動かせるものがありません"
                 .to_string()
         } else {
@@ -476,6 +481,17 @@ fn task_section(cell: &Cell, task: &Task) -> String {
     if let Some(base) = &d.base {
         out.push(format!(
             "- ベースブランチ: {base}（差分は `agentcells cell git diff origin/{base}...HEAD` で見られます）"
+        ));
+    }
+    if cell.review && !task.protected.is_empty() {
+        let files: Vec<String> = task
+            .protected
+            .iter()
+            .map(|f| format!("`{}`", crate::display::printable(f).replace('`', "'")))
+            .collect();
+        out.push(format!(
+            "- **このPRは、守るファイルを変えています:** {}。AIの守り（断ること、絞ること、人に確かめること）にかかわるファイルです。守りを緩めていないか、すり抜ける道を作っていないかを、特に確かめてください",
+            files.join("、")
         ));
     }
     if let Some(conflict) = &task.conflict {
@@ -718,6 +734,7 @@ pub fn fetch_task(
         conflict: None,
         guides: None,
         commands: None,
+        protected: Vec::new(),
     })
 }
 
@@ -764,13 +781,7 @@ pub fn show(
             }
         ))
     })?;
-    let extra = match &cell.prompt {
-        Some(path) => Some(
-            std::fs::read_to_string(path)
-                .map_err(|e| Error::new(format!("{} を読めません: {e}", path.display())))?,
-        ),
-        None => None,
-    };
+    let extra = cell.extra_prompt()?;
     let task = match target {
         Some((item, text)) => {
             if !cell.on.contains(&item) {
@@ -807,19 +818,22 @@ pub fn show(
     };
     // Issue/PRを指したなら、そのproductでの進め先（[product.next]）にする。tickと同じく、
     // Issueはproductの issues、PRは repos で選ぶ
-    let in_product = task
-        .as_ref()
-        .and_then(|t| {
-            config.products.iter().find(|p| {
-                p.cells.contains(&cell.name)
-                    && match t.item {
-                        Target::Issue => p.issues == t.repo,
-                        Target::PullRequest => p.repos.contains(&t.repo),
-                    }
-            })
+    let product = task.as_ref().and_then(|t| {
+        config.products.iter().find(|p| {
+            p.cells.contains(&cell.name)
+                && match t.item {
+                    Target::Issue => p.issues == t.repo,
+                    Target::PullRequest => p.repos.contains(&t.repo),
+                }
         })
-        .and_then(|p| config.cell_in(p, &cell.name));
+    });
+    let in_product = product.and_then(|p| config.cell_in(p, &cell.name));
     let cell = in_product.as_ref().unwrap_or(cell);
+    // 動かすときと同じく、このcellが使えるコマンドの名前を「今回の仕事」に入れる
+    let mut task = task;
+    if let (Some(task), Some(product)) = (task.as_mut(), product) {
+        task.commands = Some(product.commands_for(cell).into_keys().collect());
+    }
     let extra_note = match &cell.prompt {
         Some(path) => format!("追加の指示は {}", path.display()),
         None => "追加の指示のファイルはありません".to_string(),
@@ -849,6 +863,8 @@ mod tests {
             timeout_minutes: 30,
             model: None,
             confirm: None,
+            commands: None,
+            from_file: false,
         }
     }
 
@@ -882,7 +898,44 @@ mod tests {
             conflict: None,
             guides: None,
             commands: Some(vec!["lint".to_string(), "test".to_string()]),
+            protected: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cells_that_limit_commands_say_so() {
+        let mut task = task(Vec::new(), "bot[bot]");
+        task.commands = Some(Vec::new());
+        let open = user_prompt(&cell("design", &["done"]), None, Some(&task));
+        assert!(open.contains("このproductには"), "{open}");
+        let limited = Cell {
+            commands: Some(Vec::new()),
+            ..cell("design", &["done"])
+        };
+        let prompt = user_prompt(&limited, None, Some(&task));
+        assert!(
+            prompt.contains("この cell では、`agentcells cell run` を使いません"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn review_cells_are_told_about_protected_files() {
+        let mut task = task(Vec::new(), "bot[bot]");
+        task.protected = vec!["src/hook.rs".to_string()];
+        let review = Cell {
+            review: true,
+            ..cell("review", &["implement", "done"])
+        };
+        let prompt = user_prompt(&review, None, Some(&task));
+        assert!(
+            prompt.contains("守るファイルを変えています:** `src/hook.rs`"),
+            "{prompt}"
+        );
+        let implement = user_prompt(&cell("implement", &["review"]), None, Some(&task));
+        assert!(!implement.contains("守るファイル"), "{implement}");
+        task.protected.clear();
+        assert!(!user_prompt(&review, None, Some(&task)).contains("守るファイル"));
     }
 
     #[test]

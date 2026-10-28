@@ -51,6 +51,9 @@ pub struct Context {
     /// `fetch` で開いてよいホスト（productの `[product.sandbox]` の `network`）
     #[serde(default)]
     pub network: Vec<String>,
+    /// cellの `commands` で、使えるコマンドを絞っているか（使えないときに、どこで絞っているかを伝えるため）
+    #[serde(default)]
+    pub commands_limited: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,7 +818,13 @@ pub fn blob_hash(worktree: &Path, file: &Path) -> Result<String> {
 pub fn run(context: &Context, name: &str) -> Result<i32> {
     let command = context.commands.get(name).ok_or_else(|| {
         let names: Vec<&str> = context.commands.keys().map(String::as_str).collect();
-        Error::new(format!("コマンド「{name}」はありません")).with_hint(if names.is_empty() {
+        Error::new(format!("コマンド「{name}」はありません")).with_hint(if context.commands_limited {
+            if names.is_empty() {
+                "このcellでは、コマンドを使えません（cellの設定で決めています）".to_string()
+            } else {
+                format!("このcellで使えるのは {} です（cellの設定で決めています）", names.join(", "))
+            }
+        } else if names.is_empty() {
             "このproductには、実行できるコマンドがありません。必要なら、人間に設定を頼んでください（needs-human）"
                 .to_string()
         } else {
@@ -1076,6 +1085,7 @@ mod tests {
             caches: BTreeMap::new(),
             base: Some("main".to_string()),
             network: Vec::new(),
+            commands_limited: false,
         };
         (dir, context)
     }
