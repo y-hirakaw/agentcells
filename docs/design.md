@@ -633,6 +633,7 @@ Claude Code 2.1.310 の `claude -p` で確かめたこと（2026-10-24）:
 - `--setting-sources ""` で `--settings` にhooksを書くと、そのhookだけが動いた。リポジトリの `.claude/settings.json` のhooksも、`.claude/skills/` のskillや `.claude/agents/` のサブエージェントに書いたhooksも動かなかった（skillもサブエージェントも読み込まれなかった）。実行の途中で `.claude/settings.json` と `.claude/settings.local.json` を置いても、そのhooksは動かなかった。sandboxの `denyWrite` にworktreeの `.claude` を書くと、まだ `.claude` がなくても、sandboxの中のスクリプトから `.claude/settings.json` を書けなかった（macOS。Linuxのbubblewrapでは、ない場所の扱いを確かめ直す）。PreToolUseのhookが `permissionDecision: "deny"` で返した理由は、ツールの結果としてAIにそのまま届いた（2026-10-26）
 - sandboxが有効だと、`autoAllowBashIfSandboxed` の既定（有効）で、許していないBashのコマンド（`python3`、`touch` など）もsandboxの中で聞かずに動いた。`false` にすると「許しが要ります」で断られ、`ls` のような読むだけのコマンドと、許したコマンドだけが動いた（2026-10-26）
 - 2.1.310と2.1.311の `claude -p` は、`--tools` を渡さないと Grep と Glob を出さなかった（呼ぶと「Bashで `grep` を使え」と返る）。`--tools "Bash,Read,Edit,Write,Grep,Glob"` で出た。決まった形の結果を返すツール（StructuredOutput）は、`--tools` に挙げなくても `--json-schema` で出た。Readをdenyしたファイルは、Grep の結果にも Glob の結果にも出なかった（2026-10-27、haiku）
+- 2.1.311の `claude -p` は、`--setting-sources ""` で、`--tools` に WebSearch を挙げ、許す決まりに `WebSearch` を書くと、WebSearchで検索できた。`--tools` に挙げず、断る決まりに書くと、AIにはWebSearchが見えなかった（「用意されていない」と答えた）（2026-10-28、haiku）
 
 #### Webのページを読む
 
