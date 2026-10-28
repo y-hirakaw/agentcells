@@ -60,7 +60,7 @@ agentcells doctor
 | `agentcells schedule install [--every <分>]` / `remove` | `tick` を決まった間隔（既定は10分）で動かすように、launchd（macOS）に登録する／外す。cellが動いている間は、次のtickは何もしない。ログは `~/.agentcells/logs/tick.log` |
 | `agentcells inspect [--dry-run]` | tickの記録（`~/.agentcells/logs/events.jsonl`）を決まった規則で調べ、ラインの不具合（同じcellが続けて動いた、AIの実行が失敗した、など）を見つけて、AIがagentcellsのソースから原因と直し方の案を書く。`[inspector] issues` に書いたリポジトリにIssueにする（書かなければ手元に残すだけ）。`[inspector]` を書けば、tickも1日に1回、最後にこれを動かす。`--dry-run` は、AIに渡す伏せ字の記録だけを出す。cellの実行ごとの要約（使ったツール、エラー、許されなかった操作）も読み、設定やテスト、プロンプトなど、ラインを遅くしていることを手元にメモする。`--notes` で見られる |
 | `agentcells status [--watch]` | 動いているcell（経過時間、AIが使っているツール）と、扱っているIssueごとに、今どこまで進んでいるか（作業中、返事待ち、検品待ち、順番待ち）と、いつからかを出す。PRができたIssueは、PRの状態を出す（読むだけ）。`--watch` なら、動いているcellの様子だけを2秒ごとに出し直す |
-| `agentcells config view [--out <ファイル>]` | productとcellのつながりを、2Dゲーム風のポップな工場（cellが機械、`next` がベルトコンベア）として、1つのHTMLファイルに描く（既定は `~/.agentcells/config.html`）。入口からたどり着けないcellや、`done` に行けない輪などの注意も重ねる。ブラウザで開くのは自分でする |
+| `agentcells config view [--out <ファイル>]` | productとcellのつながりを、2Dゲーム風の工場（cellが機械、`next` がベルトコンベア）として、1つのHTMLファイルに描く（既定は `~/.agentcells/config.html`）。入口からたどり着けないcellや、`done` に行けない輪などの注意も重ねる。ブラウザで開くのは自分でする |
 | `agentcells dashboard [--interval <秒>]` | productごとのIssue/PRの状態と件数と、cellが動いているIssue/PRの下にそのcellの様子を、1つの画面で出し続ける（読むだけ。Ctrl-Cで終わる）。GitHubは `--interval` の秒数（既定60秒）ごと、動いているcellは2秒ごとに読み直す |
 | `agentcells prompt show <cell> [--issue owner/repo#N \| --pr owner/repo#N]` | cellとして動くAIに渡すプロンプト（標準、追加の指示、今回の仕事）を組み立てて表示する |
 
