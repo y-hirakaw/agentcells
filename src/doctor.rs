@@ -361,7 +361,7 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
         _ if !warnings.is_empty() => Check::warn(
             NAME,
             warnings.join("\n"),
-            "[product.sandbox] で開けた場所と、[[cell]] の web_search で許した検索は、AIから使えます。要るものだけにしてください",
+            "[product.sandbox] で開けた場所と、cellの web_search で許した検索は、AIから使えます。要るものだけにしてください",
         ),
         config => {
             let in_config = config.cells.iter().filter(|c| !c.from_file).count();
