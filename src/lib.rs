@@ -2,6 +2,7 @@ pub mod actions;
 pub mod blocked;
 pub mod caches;
 pub mod config;
+pub mod dashboard;
 pub mod discussion;
 pub mod display;
 pub mod doctor;
