@@ -92,6 +92,9 @@ pub fn run(
         && config_ok
         && !config.products.is_empty()
     {
+        if let Some(check) = check_cells(config) {
+            checks.push(check);
+        }
         checks.push(check_labels(config, probe));
         checks.push(check_workflows(config, probe));
     }
@@ -379,6 +382,31 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
         }
     };
     (check, Some(config))
+}
+
+/// どのproductの `cells` にも入っていないcell（置いたのに足し忘れたもの）を知らせる。なければ何も出さない。
+fn check_cells(config: &Config) -> Option<Check> {
+    let unused = config.unused_cells();
+    if unused.is_empty() {
+        return None;
+    }
+    let list = unused
+        .iter()
+        .map(|c| {
+            let place = if c.from_file {
+                format!("{}/{}.md", crate::config::CELLS_DIR, c.name)
+            } else {
+                "config.toml の [[cell]]".to_string()
+            };
+            format!("  - {}（{place}）", c.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(Check::warn(
+        "cells",
+        format!("どのproductの cells にも入っていないcellがあります（動きません）:\n{list}"),
+        "動かすなら、config.toml の [[product]] の cells に名前を足してください。使わないなら、そのファイル（か [[cell]]）を消すと、この知らせは出なくなります",
+    ))
 }
 
 /// cellが使うラベルが、リポジトリにそろっているか。足りなければ、作り方を出す（作りはしない）。
@@ -1012,6 +1040,48 @@ private_key = "github-app.pem"
         let check = find(&run(&home, Some(&path), None, &healthy()), "config").clone();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("広すぎます"), "{}", check.detail);
+    }
+
+    #[test]
+    fn cells_in_no_product_warn() {
+        let (_dir, home, path) = setup_home();
+        // すべて使っていれば、何も出さない
+        let checks = run(&home, Some(&path), None, &healthy());
+        assert!(checks.iter().all(|c| c.name != "cells"));
+
+        // 使っていない cells/<名前>.md
+        std::fs::create_dir_all(home.root().join("cells")).unwrap();
+        std::fs::write(
+            home.root().join("cells/design.md"),
+            "+++\non = \"issue\"\nlabel = \"ac:design\"\n+++\n設計を書く\n",
+        )
+        .unwrap();
+        let checks = run(&home, Some(&path), None, &healthy());
+        let check = find(&checks, "cells").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("design（cells/design.md）"),
+            "{}",
+            check.detail
+        );
+        assert!(check.fix.unwrap().contains("cells に名前を足して"));
+        assert!(!has_failure(&checks));
+
+        // 使っていない [[cell]] も同じ
+        std::fs::remove_file(home.root().join("cells/design.md")).unwrap();
+        let text = format!(
+            "{CONFIG}\n[[cell]]\nname = \"foo\"\non = \"issue\"\nlabel = \"ac:foo\"\nprompt = \"triage.md\"\n"
+        );
+        std::fs::write(home.config_path(), format!("{text}{GITHUB_APP}")).unwrap();
+        let checks = run(&home, Some(&path), None, &healthy());
+        let check = find(&checks, "cells").clone();
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("foo（config.toml の [[cell]]）"),
+            "{}",
+            check.detail
+        );
+        assert!(!has_failure(&checks));
     }
 
     #[test]
