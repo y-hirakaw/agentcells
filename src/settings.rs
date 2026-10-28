@@ -368,12 +368,18 @@ pub fn sandbox_warnings(config: &Config) -> Vec<String> {
     warnings
 }
 
-/// WebSearchを許したcellの知らせ。`doctor` が出す。
+/// WebSearchを許したcellの知らせ。`doctor` が出す。どのproductにも入っていないcellは動かないので、ここでは出さない
+/// （`doctor` が、動かないことを別に知らせる）。
 pub fn web_search_warnings(config: &Config) -> Vec<String> {
+    let unused: Vec<&str> = config
+        .unused_cells()
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     config
         .cells
         .iter()
-        .filter(|c| c.web_search)
+        .filter(|c| c.web_search && !unused.contains(&c.name.as_str()))
         .map(|c| {
             format!(
                 "cell「{}」には WebSearch を許しています。WebSearchはsandboxの外で動き、[product.sandbox] の network は効きません。検索の言葉に、読めたもの（コードや秘密）を入れて外へ送れます",
@@ -986,7 +992,8 @@ mod tests {
         assert_eq!(cell_tools(&cell(false)), CELL_TOOLS);
 
         // doctor は、許したcellを知らせる
-        let config = Config {
+        let mut config = Config {
+            products: vec![product],
             cells: vec![cell(true)],
             ..Config::default()
         };
@@ -995,6 +1002,9 @@ mod tests {
         assert!(warnings[0].contains("cell「triage」"), "{warnings:?}");
         assert!(warnings[0].contains("network は効きません"), "{warnings:?}");
         assert!(web_search_warnings(&Config::default()).is_empty());
+        // どのproductにも入っていないcellは動かないので、知らせない
+        config.products.clear();
+        assert!(web_search_warnings(&config).is_empty());
     }
 
     #[test]

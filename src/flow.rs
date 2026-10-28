@@ -137,9 +137,8 @@ pub fn read(config: &Config) -> Factory {
         .map(|p| read_line(config, p))
         .collect();
     let unused = config
-        .cells
+        .unused_cells()
         .iter()
-        .filter(|c| !config.products.iter().any(|p| p.cells.contains(&c.name)))
         .map(|c| c.name.clone())
         .collect();
     Factory { lines, unused }
