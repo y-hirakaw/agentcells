@@ -32,11 +32,6 @@ pub(super) fn failure_kind(result: &serde_json::Value) -> String {
     }
 }
 
-/// cellに渡すツール。名前を挙げないと、Claude Code（2.1.310〜）は Grep と Glob を出さず、Bashの `grep` を使わせる
-/// （それはhookが断るので、探す道がなくなる）。挙げなかったもの（サブエージェント、WebSearch、定期実行など）は出さない。
-/// Grep と Glob は、Readの決まり（worktreeの中だけ、置いた秘密のファイルは除く）に従う（2.1.311で確かめた）
-pub(super) const CELL_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob";
-
 /// `claude -p` の1回の実行。
 pub(super) struct ClaudeRun<'a> {
     pub(super) program: &'a Path,
@@ -358,7 +353,7 @@ mod tests {
             context: Path::new("/c.json"),
             path_prefix: Some(Path::new("/opt/agentcells/bin")),
             model: Some("haiku"),
-            tools: Some(CELL_TOOLS),
+            tools: Some(crate::settings::CELL_TOOLS),
             timeout,
             log_dir: dir,
             job_dirs: &[],
@@ -393,7 +388,7 @@ mod tests {
         assert!(pair("--setting-sources", ""), "{args:?}");
         assert!(pair("--settings", "/s.json"), "{args:?}");
         assert!(pair("--model", "haiku"), "{args:?}");
-        assert!(pair("--tools", CELL_TOOLS), "{args:?}");
+        assert!(pair("--tools", crate::settings::CELL_TOOLS), "{args:?}");
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(read("path.txt").starts_with("/opt/agentcells/bin:"));
         assert_eq!(read("context.txt").trim(), "/c.json");

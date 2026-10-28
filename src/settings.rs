@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::config::{Config, Product};
+use crate::config::{Cell, Config, Product};
 use crate::error::{Error, Result};
 use crate::github::ISOLATED_GIT_ENV;
 use crate::home::Home;
@@ -41,6 +41,25 @@ pub const DENY_GH: &[&str] = &[
 /// 書けるものがある（`git diff --output` など）ので許さない。Claude Codeは、許したコマンドに
 /// `>`、`;`、`&&`、`$(...)` で別の操作を付け足すことを止める（2.1.310で確かめた）。
 pub const ALLOW_BASH: &str = "Bash(agentcells cell:*)";
+
+/// cellに渡すツール（`--tools`）。名前を挙げないと、Claude Code（2.1.310〜）は Grep と Glob を出さず、Bashの `grep` を使わせる
+/// （それはhookが断るので、探す道がなくなる）。挙げなかったもの（サブエージェント、WebSearch、定期実行など）は出さない
+/// （`web_search = true` のcellには、`cell_tools` が WebSearch を足す）。
+/// Grep と Glob は、Readの決まり（worktreeの中だけ、置いた秘密のファイルは除く）に従う（2.1.311で確かめた）
+pub const CELL_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob";
+
+/// WebSearch。sandboxの外で動き、`[product.sandbox]` の `network` が効かないので、`web_search = true` のcellだけに出す。
+/// 検索の言葉に読めたものを入れれば外へ送れるが、送れるのは検索のサービスにだけで、URLを開くWebFetchより狭い
+pub const WEB_SEARCH: &str = "WebSearch";
+
+/// そのcellに渡すツール（`--tools`）。WebSearchは、設定で許したcellだけに足す。WebFetchはどのcellにも出さない。
+pub fn cell_tools(cell: &Cell) -> String {
+    if cell.web_search {
+        format!("{CELL_TOOLS},{WEB_SEARCH}")
+    } else {
+        CELL_TOOLS.to_string()
+    }
+}
 
 /// 使う人のホームの下で、秘密がよく置かれる場所。ホーム全体を読ませないうえで、
 /// productの `sandbox.read` に、これらを含む場所（`~/.config` など）が書かれても読ませない。
@@ -100,6 +119,7 @@ pub struct RunPaths<'a> {
 /// - 読む（Read）のは、worktreeの中だけ
 /// - ファイルの作成と更新（Edit、Write）は、worktreeの中だけ。`.git` と置いた秘密のファイルは除く
 /// - Bashは `agentcells cell` だけ。WebFetchは使わせない
+/// - WebSearchは、`web_search = true` のcellだけに許す（ほかのcellでは断る）
 /// - ほかのBashのコマンドは、hook（`agentcells cell hook`）が、代わりに使うものを添えて先に断る
 ///
 /// sandbox（Bashで動くもの。`agentcells cell run` のビルドやテストも含む）:
@@ -117,6 +137,7 @@ pub fn runtime_settings(
     home: &Home,
     config: &Config,
     product: &Product,
+    cell: &Cell,
     run: &RunPaths,
 ) -> Result<serde_json::Value> {
     let problems = sandbox_problems(home, config);
@@ -132,8 +153,14 @@ pub fn runtime_settings(
     }
 
     let mut deny: Vec<String> = DENY_GH.iter().map(|s| s.to_string()).collect();
-    // 外へ送れる道になるので、sandboxを通らないWebFetchは使わせない
+    // 外へ送れる道になるので、sandboxを通らないWebFetchは使わせない（web_search のcellでも）
     deny.push("WebFetch".to_string());
+    // WebSearchもsandboxを通らないので、設定で許したcellだけに許す。ほかのcellでは、--tools に出さないうえで断る
+    if cell.web_search {
+        allow.push(WEB_SEARCH.to_string());
+    } else {
+        deny.push(WEB_SEARCH.to_string());
+    }
     // .git（linked worktreeではリポジトリを指すファイル）を書き換えさせない
     rule(&mut deny, "Edit", &worktree.join(".git"), "")?;
     rule(&mut deny, "Edit", &worktree.join(".git"), "/**")?;
@@ -339,6 +366,21 @@ pub fn sandbox_warnings(config: &Config) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// WebSearchを許したcellの知らせ。`doctor` が出す。
+pub fn web_search_warnings(config: &Config) -> Vec<String> {
+    config
+        .cells
+        .iter()
+        .filter(|c| c.web_search)
+        .map(|c| {
+            format!(
+                "cell「{}」には WebSearch を許しています。WebSearchはsandboxの外で動き、[product.sandbox] の network は効きません。検索の言葉に、読めたもの（コードや秘密）を入れて外へ送れます",
+                c.name
+            )
+        })
+        .collect()
 }
 
 /// シェルに渡すために、単引用符で囲む。
@@ -571,7 +613,34 @@ mod tests {
         }
     }
 
+    fn cell(web_search: bool) -> Cell {
+        Cell {
+            name: "triage".to_string(),
+            on: vec![crate::config::Target::Issue],
+            label: "ac:triage".to_string(),
+            prompt: None,
+            next: vec![],
+            review: false,
+            max_rounds: 3,
+            timeout_minutes: 30,
+            model: None,
+            confirm: None,
+            commands: None,
+            web_search,
+            from_file: false,
+        }
+    }
+
     fn settings_with(config: &Config, product: &Product, placed: &[PathBuf]) -> serde_json::Value {
+        settings_for(config, product, &cell(false), placed)
+    }
+
+    fn settings_for(
+        config: &Config,
+        product: &Product,
+        cell: &Cell,
+        placed: &[PathBuf],
+    ) -> serde_json::Value {
         let programs = [PathBuf::from("/home/me/.agentcells/bin/agentcells")];
         let run = RunPaths {
             worktree: Path::new("/w/octo/app/12"),
@@ -584,7 +653,7 @@ mod tests {
             tmp: Path::new("/home/me/.agentcells/tmp/12"),
             caches: &[],
         };
-        runtime_settings(&home(), config, product, &run).unwrap()
+        runtime_settings(&home(), config, product, cell, &run).unwrap()
     }
 
     fn settings_of(config: &Config, placed: &[PathBuf]) -> serde_json::Value {
@@ -744,8 +813,14 @@ mod tests {
             tmp: Path::new("/t"),
             caches: &[],
         };
-        let settings =
-            runtime_settings(&home, &config, &product(Sandbox::default()), &run).unwrap();
+        let settings = runtime_settings(
+            &home,
+            &config,
+            &product(Sandbox::default()),
+            &cell(false),
+            &run,
+        )
+        .unwrap();
         let deny_read = strings(&settings["sandbox"]["filesystem"]["denyRead"]);
 
         let resolved = real.canonicalize().unwrap();
@@ -805,6 +880,7 @@ mod tests {
                 &home(),
                 &Config::default(),
                 &product(Sandbox::default()),
+                &cell(false),
                 &run
             )
             .is_err()
@@ -878,6 +954,50 @@ mod tests {
     }
 
     #[test]
+    fn web_search_is_allowed_only_for_cells_that_turn_it_on() {
+        let product = product(Sandbox::default());
+        let rules = |web_search: bool, kind: &str| {
+            strings(
+                &settings_for(&Config::default(), &product, &cell(web_search), &[])["permissions"]
+                    [kind],
+            )
+        };
+        let has = |rules: &[String], rule: &str| rules.iter().any(|r| r == rule);
+
+        // 許したcell: WebSearchだけを足す。WebFetchは断ったまま
+        let allow = rules(true, "allow");
+        let deny = rules(true, "deny");
+        assert!(has(&allow, "WebSearch"), "{allow:?}");
+        assert!(
+            !allow.iter().any(|r| r.starts_with("WebFetch")),
+            "{allow:?}"
+        );
+        assert!(has(&deny, "WebFetch"), "{deny:?}");
+        assert!(!has(&deny, "WebSearch"), "{deny:?}");
+        assert_eq!(cell_tools(&cell(true)), format!("{CELL_TOOLS},WebSearch"));
+        assert!(!cell_tools(&cell(true)).contains("WebFetch"));
+
+        // 許していないcell: どちらも断り、ツールにも出さない
+        let allow = rules(false, "allow");
+        let deny = rules(false, "deny");
+        assert!(!allow.iter().any(|r| r.starts_with("Web")), "{allow:?}");
+        assert!(has(&deny, "WebSearch"), "{deny:?}");
+        assert!(has(&deny, "WebFetch"), "{deny:?}");
+        assert_eq!(cell_tools(&cell(false)), CELL_TOOLS);
+
+        // doctor は、許したcellを知らせる
+        let config = Config {
+            cells: vec![cell(true)],
+            ..Config::default()
+        };
+        let warnings = web_search_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("cell「triage」"), "{warnings:?}");
+        assert!(warnings[0].contains("network は効きません"), "{warnings:?}");
+        assert!(web_search_warnings(&Config::default()).is_empty());
+    }
+
+    #[test]
     fn read_placed_files_are_open_to_builds_and_the_read_tool_but_not_to_edits() {
         // macOSでは大文字・小文字を問わずに比べる
         let written = if cfg!(target_os = "macos") {
@@ -939,7 +1059,7 @@ mod tests {
             tmp: Path::new("/t"),
             caches: &[],
         };
-        assert!(runtime_settings(&home(), &bad, &bad.products[0], &run).is_err());
+        assert!(runtime_settings(&home(), &bad, &bad.products[0], &cell(false), &run).is_err());
     }
 
     #[test]
@@ -1004,6 +1124,7 @@ mod tests {
             &home(),
             &Config::default(),
             &product(Sandbox::default()),
+            &cell(false),
             &run,
         )
         .unwrap();
