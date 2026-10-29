@@ -1,6 +1,7 @@
 +++
 on = "issue"
 label = "ac:design"
+description = "要件から設計を書き、人間に認めてもらう"
 next = ["implement", "done"]  # 認められたら implement へ。設計が要らなければ done（Issueを閉じる）
 confirm = true         # 人間が設計を認めるまで、implement に進めない（このcellはファイルを変えない）
 commands = []          # ビルドやテストは使わない

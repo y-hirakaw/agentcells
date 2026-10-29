@@ -14,6 +14,7 @@ agentcellsで、作ったものと決まったことの仕様。ひと通り整�
 +++
 on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
+description = "PRをレビューする"  # 何をするcellか（config view の機械の電光掲示板に流す。省略できる）
 next = ["implement", "done"] # 進めてよい先（cellの名前、done、stop）
 review = true                # PRへのレビューとして、指摘を行ごとに投稿する（on は pull_request だけ）
 max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
@@ -474,6 +475,7 @@ Issue/PRの状態:
 - cellは機械の箱として描き、名前、`label`、`on`、`model`、`max_rounds`、`timeout_minutes`、`confirm`（`confirms()` で決まる値。assess は書かなければ true）、`review` を載せる。sandbox と commands は載せない
 - 同じcellを複数のproductが使うときは、ラインごとに同じ機械を描く
 - 機械は、鋼板の箱に、cellの色に光る名札と、設定を映す画面を付ける。屋根に煙突と信号灯（ふつうは緑、注意があれば黄）を付ける
+- 画面の下に電光掲示板を付け、cellの `description` を、cellの色の点の字で右から左へ流す（CSSのアニメーション。開いたときから字が見えるように、左の端から流し始める。動きを減らす設定のブラウザと印刷では、流さずに左に寄せて止める）。`description` は省略でき、書いていなければ板は灯らない。字の幅はJSなしでは測れないので、等幅の字として見積もり（ASCIIと記号と半角カナは字の大きさの0.6倍、かなや漢字は0.9倍）（`textLength` でその幅にそろえる）、流す距離と時間をHTMLに書く。改行や続いた空白は、1つの空白にまとめる
 - 機械は、tickが動かす順と同じ深さ（「動かすIssue/PRを決める」）で、左から列に並べる。同じ列の中は、productの `cells` の順に積む
 - cellどうしを、`next` に沿ったベルトコンベア（CSSで動くローラーと、向きを示す山形の印）でつなぐ。`[product.next]` で替えたものを使い、替えたcellには印（元の `next` を添える）を付け、そのベルトの印の色を変える
 - ベルトは直角に曲がり（角は丸める）、機械や出口の箱を通らない。通るのは、列の間のすき間と、機械の上と下の通路だけ

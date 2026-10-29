@@ -53,6 +53,7 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 #   +++
 #   on = "issue"                     # issue か pull_request（両方なら ["issue", "pull_request"]）
 #   label = "ac:triage"              # 拾うラベル（ac: で始める）
+#   description = "Issueを仕分ける"   # 何をするcellか（config view の機械の電光掲示板に流す。省略できる）
 #   next = ["implement", "done"]     # 進めてよい先（cellの名前、done、stop）。needs-human はいつでも選べる
 #   review = false                   # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
 #   max_rounds = 3                   # 往復の上限（1〜3。省略すると3）
@@ -277,6 +278,9 @@ pub struct Cell {
     pub on: Vec<Target>,
     /// 拾うラベル
     pub label: String,
+    /// 何をするcellか。`config view` で、機械の電光掲示板に流す（動きには使わない）
+    #[serde(default)]
+    pub description: Option<String>,
     /// 標準のプロンプトに足す、追加の指示のファイル。読み込んだあとは絶対パスになっている。
     /// 標準のcell（triage、implement、review、assess）なら省略できる
     #[serde(default)]

@@ -1152,6 +1152,7 @@ mod tests {
             name: "triage".to_string(),
             on: vec![Target::Issue],
             label: "ac:triage".to_string(),
+            description: None,
             prompt: None,
             next: vec![],
             review: false,

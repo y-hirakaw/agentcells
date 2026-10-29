@@ -12,7 +12,7 @@ use crate::flow::{Factory, Line, Station};
 use crate::transition::{DONE, STOP};
 
 const MACHINE_W: i64 = 232;
-const MACHINE_H: i64 = 210;
+const MACHINE_H: i64 = 236;
 /// 機械や出口の、手前の面の厚さ（立体に見せる）
 const DEPTH: i64 = 8;
 const EXIT_W: i64 = 170;
@@ -36,6 +36,9 @@ const RADIUS: i64 = 14;
 const BRIDGE: i64 = 14;
 /// 機械の上にはみ出す煙突と信号灯の高さ（上の通路は、これより上を通す）
 const ROOF: i64 = 46;
+/// 電光掲示板の字の大きさと、流れる速さ（1秒に進む幅）
+const TICKER_FONT: i64 = 14;
+const TICKER_SPEED: f64 = 45.0;
 
 /// 機械の名札の灯の色（ラインの中の順に回す）。
 const COLORS: &[&str] = &[
@@ -844,6 +847,50 @@ fn hazard(html: &mut String, x: i64, y: i64, w: i64) {
     );
 }
 
+/// cellの説明を右から左へ流す電光掲示板。説明がなければ、灯っていない板だけを描く。
+/// 字は、点の並びの穴（`#led`）から透けて見せる。字の幅は、`textLength` で見積もった幅にそろえ、
+/// 流す距離と合わせる（JSを使わないので、描いた幅を測れないため）
+fn render_ticker(html: &mut String, description: Option<&str>, x: i64, y: i64, w: i64) {
+    let _ = write!(
+        html,
+        "<rect class=\"ticker-frame\" x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"24\" rx=\"6\"/><svg class=\"ticker\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"18\"><rect class=\"off\" width=\"100%\" height=\"100%\"/>",
+        x + 3,
+        y + 3,
+        w - 6
+    );
+    let text = description
+        .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    if !text.is_empty() {
+        let inner = w - 6;
+        let len = text_width(&text);
+        let distance = inner + len;
+        let _ = write!(
+            html,
+            "<title>{}</title><g class=\"glow\"><g mask=\"url(#led)\"><text x=\"{inner}\" y=\"14\" textLength=\"{len}\" style=\"--d:-{distance}px;--s:-{}px;animation-duration:{:.1}s;animation-delay:-{:.1}s\">{}</text></g></g>",
+            escape(&text),
+            inner - 6,
+            distance as f64 / TICKER_SPEED,
+            (inner - 6) as f64 / TICKER_SPEED,
+            escape(&text)
+        );
+    }
+    html.push_str("</svg>");
+}
+
+/// 電光掲示板の字の幅の見積もり。等幅の字で、ハングルより前の字（ASCIIなど）と、記号（矢印やダッシュ）、
+/// 半角カナは、字の大きさの0.6倍。ほかの字（かなや漢字）は0.9倍（等幅のフォントにない字は、ほかのフォントで
+/// 描かれ、1倍より少し狭いため）。
+fn text_width(text: &str) -> i64 {
+    let narrow = |c: char| {
+        c < '\u{1100}'
+            || ('\u{2000}'..='\u{2bff}').contains(&c)
+            || ('\u{ff61}'..='\u{ff9f}').contains(&c)
+    };
+    let tenths: i64 = text.chars().map(|c| if narrow(c) { 6 } else { 9 }).sum();
+    tenths * TICKER_FONT / 10
+}
+
 fn render_machine(html: &mut String, s: &Station, p: Place, color: &str) {
     let cell = &s.cell;
     let on = cell
@@ -954,6 +1001,7 @@ fn render_machine(html: &mut String, s: &Station, p: Place, color: &str) {
             escape(value)
         );
     }
+    render_ticker(html, cell.description.as_deref(), x + 13, y + 184, w - 26);
     hazard(html, x + 16, y + h - 19, w - 32);
     if s.entry {
         let _ = write!(
@@ -1099,6 +1147,9 @@ const DEFS: &str = r##"<defs>
 <pattern id="awning" width="28" height="12" patternUnits="userSpaceOnUse"><rect width="28" height="12" fill="#f4f6fa"/><rect width="14" height="12" fill="#ff6fae"/></pattern>
 <linearGradient id="opening" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0d2a1d"/><stop offset="1" stop-color="#16523a"/></linearGradient>
 <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b8e3ff"/><stop offset=".55" stop-color="#6aa6d8"/><stop offset="1" stop-color="#4a86bd"/></linearGradient>
+<pattern id="led-dots" width="2" height="2" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".8" fill="#fff"/></pattern>
+<mask id="led" maskUnits="userSpaceOnUse" x="0" y="0" width="100%" height="100%"><rect width="100%" height="100%" fill="url(#led-dots)"/></mask>
+<pattern id="led-off" width="2" height="2" patternUnits="userSpaceOnUse"><rect width="2" height="2" fill="#06080b"/><circle cx="1" cy="1" r=".8" fill="#1a1f29"/></pattern>
 <radialGradient id="call" cx=".4" cy=".35" r=".7"><stop offset="0" stop-color="#ffa6cf"/><stop offset=".6" stop-color="#ff6fae"/><stop offset="1" stop-color="#d9478a"/></radialGradient>
 </defs>
 "##;
@@ -1191,6 +1242,12 @@ svg text { font-family: inherit; }
 .machine .key { font: 11px var(--mono); fill: #7d8aa3; }
 .machine .value { font: 700 11px var(--mono); fill: #e8edf5; }
 .machine .value.yes { fill: #c9b0ff; }
+.ticker-frame { fill: #05070a; stroke: var(--ink); stroke-width: 2; }
+.ticker .off { fill: url(#led-off); }
+.ticker .glow { filter: drop-shadow(0 0 2px var(--c)); }
+.ticker text { font: 700 14px var(--mono); fill: var(--c); animation: ticker linear infinite; }
+@keyframes ticker { to { transform: translateX(var(--d)); } }
+@media print, (prefers-reduced-motion: reduce) { .ticker text { animation: none; transform: translateX(var(--s)); } }
 .hazard { fill: url(#hazard); stroke: var(--ink); stroke-width: 2; }
 .alert polygon { fill: #ffb020; stroke: var(--ink); stroke-width: 2; stroke-linejoin: round; }
 .alert text { font-size: 14px; font-weight: 900; text-anchor: middle; fill: var(--ink); }
@@ -1230,6 +1287,7 @@ const LEGEND: &str = r#"<section class="legend"><h2>見かた</h2><ul>
 <li><span class="chip" style="--a:#b18cff">›››</span>紫の印（出ていくところに鍵）: 着手を確かめるcell（<code>confirm</code>）が、人間に認められたあとにだけ進める先</li>
 <li><b>橋</b>: 交わるだけのベルトは、橋で上を越す（合流とは見分ける）</li>
 <li><span class="dot" style="--a:#39e58c"></span><b>信号灯</b>: 緑はふつう。黄と <b>⚠</b> は、想定通りに流れないかもしれないcell。上の「注意」に理由がある</li>
+<li><b>電光掲示板</b>: cellの <code>description</code>（何をするcellか）を流す。書いていなければ灯らない</li>
 <li><b>入口</b>: Issueを扱い、ほかのcellの <code>next</code> から来ないcell。人がラベルを付けて始める</li>
 <li><span class="dot" style="--a:#ff6fae"></span><b>needs-human</b>（人間の窓口）: どの機械からでも、人間に回せる（線は省いている）</li>
 </ul></section>
@@ -1263,6 +1321,7 @@ cells = ["assess"]
 name = "triage"
 on = "issue"
 label = "ac:triage"
+description = "Issueを  仕分ける\n<急ぎ>"
 next = ["implement", "done"]
 model = "sonnet"
 
@@ -1326,6 +1385,27 @@ next = ["stop", "done"]
         assert!(html.contains("ac:review&lt;b&gt;"));
         assert!(!html.contains("ac:review<b>"));
         assert_eq!(escape("a&\"'<>"), "a&amp;&quot;&#39;&lt;&gt;");
+    }
+
+    #[test]
+    fn descriptions_run_on_the_ticker() {
+        let html = html();
+        // 説明は1行にまとめ、エスケープして流す。書いていないcellの板は灯らない
+        assert!(html.contains("Issueを 仕分ける &lt;急ぎ&gt;</text>"));
+        assert_eq!(html.matches("<svg class=\"ticker\"").count(), 4);
+        assert_eq!(html.matches("mask=\"url(#led)\"").count(), 1);
+        // 流す距離は、板の幅と字の幅
+        let inner = MACHINE_W - 26 - 6;
+        let len = text_width("Issueを 仕分ける <急ぎ>");
+        assert_eq!(
+            len,
+            (5 * 6 + 9 + 6 + 4 * 9 + 6 + 6 + 2 * 9 + 6) * TICKER_FONT / 10
+        );
+        assert_eq!(text_width("a→ｱ"), 3 * 6 * TICKER_FONT / 10);
+        assert!(html.contains(&format!(
+            "textLength=\"{len}\" style=\"--d:-{}px;",
+            inner + len
+        )));
     }
 
     /// 機械や出口の箱の中（ふちは除く）を、線分が通るか。

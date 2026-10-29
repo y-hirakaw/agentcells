@@ -869,6 +869,7 @@ mod tests {
             name: name.to_string(),
             on: vec![Target::Issue],
             label: format!("ac:{name}"),
+            description: None,
             prompt: None,
             next: next.iter().map(|s| s.to_string()).collect(),
             review: false,

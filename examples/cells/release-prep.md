@@ -1,6 +1,7 @@
 +++
 on = "issue"
 label = "ac:release-prep"
+description = "リリースの準備（版、変更の履歴）をPRにする"
 next = ["review"]      # 準備のPRをレビューするcell
 # commands = ["test"]  # 使うなら、productの commands にある名前を書く
 +++
