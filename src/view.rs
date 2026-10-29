@@ -11,30 +11,35 @@ use crate::config::Target;
 use crate::flow::{Factory, Line, Station};
 use crate::transition::{DONE, STOP};
 
-const MACHINE_W: i64 = 220;
-const MACHINE_H: i64 = 196;
+const MACHINE_W: i64 = 232;
+const MACHINE_H: i64 = 210;
 /// 機械や出口の、手前の面の厚さ（立体に見せる）
-const DEPTH: i64 = 10;
+const DEPTH: i64 = 8;
 const EXIT_W: i64 = 170;
-const EXIT_H: i64 = 100;
+const EXIT_H: i64 = 120;
 /// 列の間のすき間の、いちばん狭い幅。ベルトは、ここと、機械の上下の通路だけを通る。
 /// 通るベルトが多いすき間は、そのぶん広げる（左の端にも、1列目へ入るベルトのためのすき間を取る）
 const GAP: i64 = 130;
-/// すき間の両端に残す幅（ベルトの太さの半分と、機械の印のはみ出し）
+/// すき間の両端に残す幅（ベルトの太さの半分と、機械の口のはみ出し）
 const GAP_MARGIN: i64 = 36;
-const ROW_H: i64 = MACHINE_H + 70;
-/// 上や下を回るベルトの、1本ごとの間（ベルトの太さより広くして、並んでも重ならないようにする）
-const LANE: i64 = 24;
+const ROW_H: i64 = MACHINE_H + 84;
+/// 上や下を回るベルトの、1本ごとの間（ベルトの太さ28より広くして、並んでも重ならないようにする）
+const LANE: i64 = 30;
 /// すき間を縦に通るベルトの、1本ごとの間
-const CHANNEL: i64 = 24;
+const CHANNEL: i64 = 30;
 /// 機械の横の面につながるベルトの、1本ごとの間（口が多いときは、面に収まるように詰める）
-const PORT: i64 = 24;
+const PORT: i64 = 30;
 /// ベルトの角の丸み
 const RADIUS: i64 = 14;
+/// 交わるだけのベルトに架ける橋の、長さの半分（下をくぐるベルトの太さの半分。となりの道へ曲がる角の、
+/// 1本手前の道との交わりにも、角の丸みにかからずに架けられるように）
+const BRIDGE: i64 = 14;
+/// 機械の上にはみ出す煙突と信号灯の高さ（上の通路は、これより上を通す）
+const ROOF: i64 = 46;
 
-/// 機械の色の帯（ラインの中の順に回す）。
+/// 機械の名札の灯の色（ラインの中の順に回す）。
 const COLORS: &[&str] = &[
-    "#ffb547", "#5fd3d8", "#ff7aa8", "#9be36b", "#c3a6ff", "#ffe066", "#7cb8ff",
+    "#ff9f1c", "#2ec4d6", "#ff5d8f", "#9be15d", "#b18cff", "#ffe066", "#7cb8ff",
 ];
 
 /// HTMLの中に置けるように、文字をエスケープする。
@@ -62,10 +67,10 @@ pub fn render(factory: &Factory) -> String {
     html.push_str("<title>agentcells の工場</title>\n<style>\n");
     html.push_str(STYLE);
     html.push_str("</style>\n</head>\n<body>\n");
-    html.push_str("<header><h1>agentcells の工場</h1>");
+    html.push_str("<header><h1>agentcells <span>の工場</span></h1>");
     let _ = writeln!(
         html,
-        "<p class=\"summary\">ライン {}本 ・ 機械 {}台 ・ 注意 {}件</p></header>",
+        "<p class=\"summary\"><span>ライン<b>{}</b>本</span><span>機械<b>{}</b>台</span><span>注意<b>{}</b>件</span></p></header>",
         factory.lines.len(),
         factory
             .lines
@@ -299,7 +304,7 @@ fn layout(line: &Line) -> Layout {
         }
     }
 
-    let top = 80 + over_lanes.len() as i64 * LANE;
+    let top = 100 + over_lanes.len() as i64 * LANE;
     let mut places: BTreeMap<String, Place> = BTreeMap::new();
     for (depth, stations) in &columns {
         for (row, station) in stations.iter().enumerate() {
@@ -328,7 +333,7 @@ fn layout(line: &Line) -> Layout {
         places.insert(STOP.to_string(), exit_place(stop_col));
     }
     let machines_bottom = top + (rows - 1) * ROW_H + MACHINE_H + DEPTH;
-    let over_y = |lane: i64| top - 50 - lane * LANE;
+    let over_y = |lane: i64| top - ROOF - 24 - lane * LANE;
     // 下の通路は、通る列（先の手前の列から、いちばん遠い元の列まで）の機械のすぐ下を通す（大回りしないように）
     let under_y = |to: &str| -> i64 {
         let (lo, hi) = edges
@@ -339,12 +344,21 @@ fn layout(line: &Line) -> Layout {
             });
         let bottom = places
             .values()
-            // 先の手前のすき間まで横に進むので、その左の列の機械からも離す
-            .filter(|p| (lo - 1..=hi).contains(&p.col))
+            .filter(|p| (lo..=hi).contains(&p.col))
             .map(|p| p.y + p.h + DEPTH)
             .max()
             .unwrap_or(machines_bottom);
-        bottom + 36 + under_lanes[to] * LANE
+        let mut y = bottom + 36 + under_lanes[to] * LANE;
+        // 先の手前のすき間まで横に進むので、その左の列の機械の横を通るときは、その機械から出るベルトと並ばないように、
+        // その機械の下まで下げる（横を通らなければ、下げない）
+        let mut beside: Vec<&Place> = places.values().filter(|p| p.col == lo - 1).collect();
+        beside.sort_by_key(|p| p.y);
+        for p in beside {
+            if y + 14 > p.y && y - 14 < p.y + p.h + DEPTH {
+                y = p.y + p.h + DEPTH + 36 + under_lanes[to] * LANE;
+            }
+        }
+        y
     };
     let lowest = under_lanes
         .keys()
@@ -353,8 +367,8 @@ fn layout(line: &Line) -> Layout {
     let booth = Place {
         x: gap_w(-1),
         y: lowest + 20,
-        w: 330,
-        h: 56,
+        w: 420,
+        h: 76,
         col: 0,
     };
     let height = booth.y + booth.h + DEPTH + 30;
@@ -542,24 +556,130 @@ fn render_line(html: &mut String, line: &Line) {
     );
     html.push_str(DEFS);
 
-    for belt in &layout.belts {
-        render_belt(html, belt);
-    }
-    // 承認のあとにだけ進むベルトには、出ていくところの線の上に鍵の印を付ける。合流すると色で見分けられないため。
-    // ほかのベルトの下に隠れないよう、全部のベルトのあとに描く
-    for belt in &layout.belts {
-        if let Some(note) = belt.note {
-            let (x, y) = (belt.points[0].0 + 16, belt.points[0].1);
+    // 床の印。機械の区画の点線と、出口の前の縞
+    for (name, p) in &layout.places {
+        if name == DONE || name == STOP {
             let _ = write!(
                 html,
-                "<g class=\"lock\"><title>{note}</title><circle cx=\"{x}\" cy=\"{y}\" r=\"11\"/><path class=\"shackle\" d=\"M{},{} v-3 a3,3 0 0 1 6,0 v3\"/><rect x=\"{}\" y=\"{}\" width=\"10\" height=\"8\" rx=\"2\"/></g>",
-                x - 3,
-                y - 1,
-                x - 5,
-                y - 1
+                "<rect class=\"zone {}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"16\"/>",
+                if name == DONE { "done" } else { "stop" },
+                p.x - 14,
+                p.y - 30,
+                p.w + 28,
+                p.h + DEPTH + 44
+            );
+        } else {
+            let _ = write!(
+                html,
+                "<rect class=\"bay\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"20\"/>",
+                p.x - 14,
+                p.y - 14,
+                p.w + 28,
+                p.h + DEPTH + 28
             );
         }
     }
+    html.push('\n');
+
+    // ベルトは、層ごとに全部を描く（縁、手すり、ゴム、ローラーの順）。合流したところが、つなぎ目なく1本に見えるように
+    let paths: Vec<String> = layout.belts.iter().map(|b| rounded(&b.points)).collect();
+    html.push_str("<g class=\"belts\">");
+    for layer in LAYERS {
+        let _ = write!(html, "<g class=\"{layer}\">");
+        for d in &paths {
+            let _ = write!(html, "<path d=\"{d}\"/>");
+        }
+        html.push_str("</g>");
+    }
+    html.push_str("</g>\n");
+    // 交わるだけのベルトは、横のベルトが橋で上を越す（合流と見分けられるように）
+    let bridges = crossings(&layout.belts);
+    for (x, y) in &bridges {
+        let d = format!("M{},{y} H{}", x - BRIDGE, x + BRIDGE);
+        let _ = write!(
+            html,
+            "<g class=\"belts bridge\"><path class=\"shadow\" d=\"{d}\" transform=\"translate(0,5)\"/>"
+        );
+        for layer in LAYERS {
+            let _ = write!(html, "<path class=\"{layer}\" d=\"{d}\"/>");
+        }
+        html.push_str("</g>\n");
+    }
+    // 機械の口。右の面には、出ていくベルトの口をまとめた1枚を、ベルトが入るところには口を付ける
+    let mut outs: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
+    for belt in &layout.belts {
+        let y = belt.points[0].1;
+        let span = outs.entry(belt.from.as_str()).or_insert((y, y));
+        *span = (span.0.min(y), span.1.max(y));
+    }
+    for (name, (lo, hi)) in &outs {
+        let p = layout.places[*name];
+        let _ = write!(
+            html,
+            "<rect class=\"flange\" x=\"{}\" y=\"{}\" width=\"12\" height=\"{}\" rx=\"4\"/>",
+            p.right() - 3,
+            lo - 16,
+            hi - lo + 32
+        );
+    }
+    let mut ins: Vec<(i64, i64)> = Vec::new();
+    for belt in &layout.belts {
+        let end = belt.points[belt.points.len() - 1];
+        // 左の面なら、口は面の外へ、右の面なら、面の外から内へ（ベルトの端は、面から8の外にある）
+        let x = if end.0 < layout.places[&belt.to].x {
+            end.0 - 1
+        } else {
+            end.0 - 11
+        };
+        if !ins.contains(&(x, end.1)) {
+            ins.push((x, end.1));
+        }
+    }
+    for (x, y) in &ins {
+        let _ = write!(
+            html,
+            "<rect class=\"intake\" x=\"{x}\" y=\"{}\" width=\"12\" height=\"36\" rx=\"4\"/>",
+            y - 18
+        );
+    }
+    // 承認のあとにだけ進むベルトには、出ていくところの線の上に鍵の印を付ける。合流すると色で見分けられないため
+    let locks: Vec<(i64, i64)> = layout
+        .belts
+        .iter()
+        .filter(|b| b.note.is_some())
+        .map(|b| (b.points[0].0 + 16, b.points[0].1))
+        .collect();
+    let avoid: Vec<(i64, i64)> = bridges.iter().chain(&locks).copied().collect();
+    let marks = chevrons(&layout.belts, &avoid);
+    for (i, belt) in layout.belts.iter().enumerate() {
+        let _ = write!(
+            html,
+            "<g class=\"{}\" data-from=\"{}\" data-to=\"{}\">",
+            belt.class,
+            escape(&belt.from),
+            escape(&belt.to)
+        );
+        render_chevrons(html, &marks, Some(i));
+        html.push_str("</g>\n");
+    }
+    // 種類の違うベルトが合流したところの印は、ふつうの色にする
+    html.push_str("<g class=\"belt\">");
+    render_chevrons(html, &marks, None);
+    html.push_str("</g>\n");
+    for (belt, (x, y)) in layout.belts.iter().filter(|b| b.note.is_some()).zip(&locks) {
+        let _ = write!(
+            html,
+            "<g class=\"lock\"><title>{}</title><circle cx=\"{x}\" cy=\"{y}\" r=\"11\"/><path class=\"shackle\" d=\"M{},{} v-3 a3,3 0 0 1 6,0 v3\"/><rect x=\"{}\" y=\"{}\" width=\"10\" height=\"8\" rx=\"2\"/></g>",
+            belt.note.unwrap_or_default(),
+            x - 3,
+            y - 1,
+            x - 5,
+            y - 1
+        );
+    }
+
+    html.push('\n');
+
     for (i, s) in line.stations.iter().enumerate() {
         render_machine(
             html,
@@ -571,7 +691,6 @@ fn render_line(html: &mut String, line: &Line) {
     render_dock(
         html,
         layout.places[DONE],
-        "dock done",
         DONE,
         "出荷",
         "Issueは閉じる・PRは検品待ち",
@@ -580,20 +699,12 @@ fn render_line(html: &mut String, line: &Line) {
         render_dock(
             html,
             layout.places[STOP],
-            "dock stop",
             STOP,
             "ラインから下ろす",
             "閉じずに人間が進める",
         );
     }
-    render_dock(
-        html,
-        layout.booth,
-        "dock human",
-        "needs-human",
-        "人間の窓口",
-        "どの機械からでも回せる",
-    );
+    render_booth(html, layout.booth);
     html.push_str("</svg></div>\n");
 
     let notes = line.notes();
@@ -607,6 +718,9 @@ fn render_line(html: &mut String, line: &Line) {
     html.push_str("</section>\n");
 }
 
+/// ベルトの層（下から）。縁、手すりの光る縁、手すり、ゴム、ローラー。
+const LAYERS: [&str; 5] = ["edge", "hi", "rail", "base", "rollers"];
+
 /// 機械からつながるベルトの先（cellか done か stop。needs-human は窓口として別に描く）。
 fn targets<'a>(line: &Line, station: &'a Station) -> Vec<&'a str> {
     station
@@ -618,60 +732,96 @@ fn targets<'a>(line: &Line, station: &'a Station) -> Vec<&'a str> {
         .collect()
 }
 
-fn render_belt(html: &mut String, belt: &Belt) {
-    let d = rounded(&belt.points);
-    let _ = write!(
-        html,
-        "<g class=\"{}\" data-from=\"{}\" data-to=\"{}\"><path class=\"edge\" d=\"{d}\"/><path class=\"base\" d=\"{d}\"/><path class=\"rollers\" d=\"{d}\"/>",
-        belt.class,
-        escape(&belt.from),
-        escape(&belt.to)
-    );
-    // 向きを示す山形の印を、まっすぐなところに並べる
-    for pair in belt.points.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        let len = (b.0 - a.0).abs() + (b.1 - a.1).abs();
-        if len < 60 {
-            continue;
-        }
-        let angle = match ((b.0 - a.0).signum(), (b.1 - a.1).signum()) {
-            (1, _) => 0,
-            (-1, _) => 180,
-            (_, 1) => 90,
-            _ => 270,
-        };
-        let count = (len / 120).max(1);
-        for k in 0..count {
-            let t = (2 * k + 1) * 1000 / (2 * count);
-            let x = a.0 + (b.0 - a.0) * t / 1000;
-            let y = a.1 + (b.1 - a.1) * t / 1000;
-            let _ = write!(
-                html,
-                "<path class=\"chevron\" d=\"M-4,-6 L3,0 L-4,6\" transform=\"translate({x},{y}) rotate({angle})\"/>"
-            );
+/// 交わるだけのベルトが交わる点（合流ではないもの）。どちらの線でも端でない点だけを見る（線の端で接するのは、
+/// 合流か角のため）。橋は横の線に架けるので、横の線の角の丸みにかかるほど端に近いものは除く。
+fn crossings(belts: &[Belt]) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (i, a) in belts.iter().enumerate() {
+        for (j, b) in belts.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for h in a.points.windows(2).filter(|s| s[0].1 == s[1].1) {
+                for v in b.points.windows(2).filter(|s| s[0].0 == s[1].0) {
+                    let (x, y) = (v[0].0, h[0].1);
+                    let (x0, x1) = (h[0].0.min(h[1].0), h[0].0.max(h[1].0));
+                    let (y0, y1) = (v[0].1.min(v[1].1), v[0].1.max(v[1].1));
+                    if x0 + BRIDGE + RADIUS <= x
+                        && x + BRIDGE + RADIUS <= x1
+                        && y0 < y
+                        && y < y1
+                        && !out.contains(&(x, y))
+                    {
+                        out.push((x, y));
+                    }
+                }
+            }
         }
     }
-    let end = belt.points[belt.points.len() - 1];
-    let before = belt.points[belt.points.len() - 2];
-    let angle = match ((end.0 - before.0).signum(), (end.1 - before.1).signum()) {
-        (1, _) => 0,
-        (-1, _) => 180,
-        (_, 1) => 90,
-        _ => 270,
-    };
-    let _ = write!(
-        html,
-        "<path class=\"head\" d=\"M-6,-9 L6,0 L-6,9 z\" transform=\"translate({},{}) rotate({angle})\"/>",
-        end.0, end.1
-    );
-    html.push_str("</g>\n");
+    out
 }
 
-/// 箱を立体に見せる（手前の面と、上の面）。
-fn block(html: &mut String, p: Place, class: &str) {
+/// 向きを示す山形の印（ベルトの番号、場所、向き）。合流したベルトの印がずれて重ならないように、
+/// 図の上の決まった間隔の点に置き、同じ点には1つだけにする。種類（印の色）の違うベルトが同じ点を通るときは、
+/// ベルトの番号を `None` にする（ふつうの色で描く）。角の丸みと、`avoid`（橋と鍵）の近くには置かない。
+fn chevrons(belts: &[Belt], avoid: &[(i64, i64)]) -> Vec<(Option<usize>, i64, i64, i64)> {
+    const STEP: i64 = 70;
+    let mut out: Vec<(Option<usize>, i64, i64, i64)> = Vec::new();
+    let mut taken: BTreeMap<(i64, i64), usize> = BTreeMap::new();
+    for (i, belt) in belts.iter().enumerate() {
+        for pair in belt.points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let horizontal = a.1 == b.1;
+            let (from, to) = if horizontal { (a.0, b.0) } else { (a.1, b.1) };
+            let angle = match (horizontal, to > from) {
+                (true, true) => 0,
+                (true, false) => 180,
+                (false, true) => 90,
+                (false, false) => 270,
+            };
+            let (lo, hi) = (from.min(to) + 20, from.max(to) - 20);
+            let mut t = (lo + STEP - 1).div_euclid(STEP) * STEP;
+            while t <= hi {
+                let (x, y) = if horizontal { (t, a.1) } else { (a.0, t) };
+                let near = avoid.iter().any(|p| (p.0 - x).abs() + (p.1 - y).abs() < 26);
+                if !near {
+                    match taken.get(&(x, y)) {
+                        Some(&k) => {
+                            if out[k].0.is_some_and(|j| belts[j].class != belt.class) {
+                                out[k].0 = None;
+                            }
+                        }
+                        None => {
+                            taken.insert((x, y), out.len());
+                            out.push((Some(i), x, y, angle));
+                        }
+                    }
+                }
+                t += STEP;
+            }
+        }
+    }
+    out
+}
+
+fn render_chevrons(
+    html: &mut String,
+    marks: &[(Option<usize>, i64, i64, i64)],
+    belt: Option<usize>,
+) {
+    for (_, x, y, angle) in marks.iter().filter(|m| m.0 == belt) {
+        let _ = write!(
+            html,
+            "<path class=\"chevron\" d=\"M-3,-4 L3,0 L-3,4\" transform=\"translate({x},{y}) rotate({angle})\"/>"
+        );
+    }
+}
+
+/// 箱を立体に見せる（手前の面と、鋼板の上の面と、上の縁の光）。
+fn block(html: &mut String, p: Place, rx: i64) {
     let _ = write!(
         html,
-        "<rect class=\"side\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"14\"/><rect class=\"{class}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"14\"/>",
+        "<rect class=\"side\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{rx}\"/><rect class=\"top\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{rx}\"/><path class=\"shine\" d=\"M{},{} H{}\"/>",
         p.x,
         p.y + DEPTH,
         p.w,
@@ -679,7 +829,18 @@ fn block(html: &mut String, p: Place, class: &str) {
         p.x,
         p.y,
         p.w,
-        p.h
+        p.h,
+        p.x + rx,
+        p.y + 4,
+        p.right() - rx
+    );
+}
+
+/// 黄色と黒の縞の帯。
+fn hazard(html: &mut String, x: i64, y: i64, w: i64) {
+    let _ = write!(
+        html,
+        "<rect class=\"hazard\" x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"9\" rx=\"3\"/>"
     );
 }
 
@@ -707,81 +868,112 @@ fn render_machine(html: &mut String, s: &Station, p: Place, color: &str) {
         ("review", cell.review.to_string()),
     ];
     let warn = !s.notices.is_empty();
+    let (x, y, w, h) = (p.x, p.y, p.w, p.h);
     let _ = write!(
         html,
         "<g class=\"machine{}\" style=\"--c:{color}\">",
         if warn { " warn" } else { "" }
     );
-    // 排気口と煙
-    let vx = p.x + p.w - 50;
+    // 屋根の煙突と煙。信号灯は、ふつうは緑、注意があれば黄をともす
+    let cx = x + w - 74;
     let _ = write!(
         html,
-        "<rect class=\"vent\" x=\"{vx}\" y=\"{}\" width=\"26\" height=\"26\" rx=\"5\"/><circle class=\"smoke\" cx=\"{}\" cy=\"{}\" r=\"8\"/><circle class=\"smoke s2\" cx=\"{}\" cy=\"{}\" r=\"6\"/>",
-        p.y - 20,
-        vx + 13,
-        p.y - 28,
-        vx + 18,
-        p.y - 38
+        "<circle class=\"smoke\" cx=\"{}\" cy=\"{}\" r=\"7\"/><circle class=\"smoke s2\" cx=\"{}\" cy=\"{}\" r=\"5\"/><rect class=\"chimney\" x=\"{cx}\" y=\"{}\" width=\"22\" height=\"32\"/><rect class=\"cap\" x=\"{}\" y=\"{}\" width=\"30\" height=\"9\" rx=\"3\"/>",
+        cx + 12,
+        y - 40,
+        cx + 5,
+        y - 48,
+        y - 26,
+        cx - 4,
+        y - 32
     );
-    block(html, p, "top");
-    // 手前の面のオレンジの帯
+    let lx = x + w - 45;
     let _ = write!(
         html,
-        "<rect class=\"stripe\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"5\" rx=\"2\"/>",
-        p.x + 18,
-        p.y + p.h + 2,
-        p.w - 36
+        "<rect class=\"stack\" x=\"{lx}\" y=\"{}\" width=\"22\" height=\"44\" rx=\"6\"/>",
+        y - ROOF
     );
-    // cellの色の帯と、歯車と名前
-    let _ = write!(
-        html,
-        "<rect class=\"band\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"32\" rx=\"9\"/><circle class=\"gear\" cx=\"{}\" cy=\"{}\" r=\"9\"/><text class=\"name\" x=\"{}\" y=\"{}\">{}</text>",
-        p.x + 9,
-        p.y + 9,
-        p.w - 18,
-        p.x + 28,
-        p.y + 25,
-        p.x + 46,
-        p.y + 31,
-        escape(&cell.name)
-    );
-    let _ = write!(
-        html,
-        "<rect class=\"panel\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"8\"/>",
-        p.x + 12,
-        p.y + 50,
-        p.w - 24,
-        p.h - 62
-    );
-    for (i, (key, value)) in rows.iter().enumerate() {
-        let y = p.y + 68 + i as i64 * 18;
+    for (k, (lamp, lit)) in [("red", false), ("amber", warn), ("green", !warn)]
+        .iter()
+        .enumerate()
+    {
         let _ = write!(
             html,
-            "<text class=\"key\" x=\"{}\" y=\"{y}\">{key}</text><text class=\"value\" x=\"{}\" y=\"{y}\">{}</text>",
-            p.x + 22,
-            p.x + 108,
+            "<rect class=\"lamp {lamp}{}\" x=\"{}\" y=\"{}\" width=\"16\" height=\"10\" rx=\"3\"/>",
+            if *lit { " on" } else { "" },
+            lx + 3,
+            y - ROOF + 3 + k as i64 * 12
+        );
+    }
+    block(html, p, 14);
+    for (rx, ry) in [
+        (x + 7, y + 7),
+        (x + w - 7, y + 7),
+        (x + 7, y + h - 7),
+        (x + w - 7, y + h - 7),
+    ] {
+        let _ = write!(
+            html,
+            "<circle class=\"rivet\" cx=\"{rx}\" cy=\"{ry}\" r=\"3\"/>"
+        );
+    }
+    // 名札（cellの色の灯と、歯車と名前）
+    let _ = write!(
+        html,
+        "<rect class=\"plate\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"34\" rx=\"8\"/><rect class=\"led\" x=\"{}\" y=\"{}\" width=\"6\" height=\"20\" rx=\"3\"/><circle class=\"gear\" cx=\"{}\" cy=\"{}\" r=\"7\"/><text class=\"name\" x=\"{}\" y=\"{}\">{}</text>",
+        x + 13,
+        y + 11,
+        w - 26,
+        x + 22,
+        y + 18,
+        x + 42,
+        y + 28,
+        x + 56,
+        y + 34,
+        escape(&cell.name)
+    );
+    // 設定を映す画面
+    let _ = write!(
+        html,
+        "<rect class=\"screen\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"124\" rx=\"8\"/><rect class=\"scan\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"120\" rx=\"7\"/>",
+        x + 13,
+        y + 52,
+        w - 26,
+        x + 15,
+        y + 54,
+        w - 30
+    );
+    for (i, (key, value)) in rows.iter().enumerate() {
+        let ry = y + 70 + i as i64 * 15;
+        let _ = write!(
+            html,
+            "<text class=\"key\" x=\"{}\" y=\"{ry}\">{key}</text><text class=\"value{}\" x=\"{}\" y=\"{ry}\">{}</text>",
+            x + 23,
+            if value == "true" { " yes" } else { "" },
+            x + 101,
             escape(value)
         );
     }
+    hazard(html, x + 16, y + h - 19, w - 32);
     if s.entry {
         let _ = write!(
             html,
-            "<g class=\"badge entry\"><rect x=\"{}\" y=\"{}\" width=\"58\" height=\"22\" rx=\"11\"/><text x=\"{}\" y=\"{}\">入口</text></g>",
-            p.x - 8,
-            p.y - 16,
-            p.x + 21,
-            p.y
+            "<g class=\"badge entry\"><rect x=\"{}\" y=\"{}\" width=\"42\" height=\"19\" rx=\"5\"/><text x=\"{}\" y=\"{}\">入口</text></g>",
+            x + 8,
+            y - 28,
+            x + 29,
+            y - 14
         );
     }
     if let Some(original) = &s.replaced {
+        let bx = x + if s.entry { 56 } else { 8 };
         let _ = write!(
             html,
-            "<g class=\"badge replaced\"><title>[product.next] でこのラインだけ進め先を替えています（元の next: [{}]）</title><rect x=\"{}\" y=\"{}\" width=\"118\" height=\"22\" rx=\"11\"/><text x=\"{}\" y=\"{}\">next を替えた</text></g>",
+            "<g class=\"badge replaced\"><title>[product.next] でこのラインだけ進め先を替えています（元の next: [{}]）</title><rect x=\"{bx}\" y=\"{}\" width=\"92\" height=\"19\" rx=\"5\"/><text x=\"{}\" y=\"{}\">next を替えた</text></g>",
             escape(&original.join(", ")),
-            p.x + 56,
-            p.y - 16,
-            p.x + 115,
-            p.y
+            y - 28,
+            bx + 46,
+            y - 14
         );
     }
     if warn {
@@ -791,141 +983,255 @@ fn render_machine(html: &mut String, s: &Station, p: Place, color: &str) {
             .map(|n| n.describe())
             .collect::<Vec<_>>()
             .join("\n");
-        let (wx, wy) = (p.x + p.w - 4, p.y + 6);
+        let wx = x + w - 32;
         let _ = write!(
             html,
-            "<g class=\"alert\"><title>{}</title><polygon points=\"{},{} {},{} {},{}\"/><text x=\"{wx}\" y=\"{}\">!</text></g>",
+            "<g class=\"alert\"><title>{}</title><polygon points=\"{wx},{} {},{} {},{}\"/><text x=\"{wx}\" y=\"{}\">!</text></g>",
             escape(&text),
-            wx,
-            wy - 22,
-            wx + 22,
-            wy + 16,
-            wx - 22,
-            wy + 16,
-            wy + 11
+            y + 16,
+            wx + 12,
+            y + 38,
+            wx - 12,
+            y + 38,
+            y + 36
         );
     }
     html.push_str("</g>\n");
 }
 
-/// 出口（done、stop）と人間の窓口。下の端に、黄色と黒の縞を付ける。
-fn render_dock(html: &mut String, p: Place, class: &str, name: &str, title: &str, sub: &str) {
-    let cx = p.x + p.w / 2;
-    let _ = write!(html, "<g class=\"{class}\">");
-    block(html, p, "top");
-    if p.h >= EXIT_H {
+/// 出口（done は開いたシャッター、stop は閉じたシャッター）。屋根に回転灯を付ける。
+fn render_dock(html: &mut String, p: Place, name: &str, title: &str, sub: &str) {
+    let (x, y, w, h) = (p.x, p.y, p.w, p.h);
+    let cx = x + w / 2;
+    let _ = write!(
+        html,
+        "<g class=\"dock {name}\"><rect class=\"beacon-base\" x=\"{}\" y=\"{}\" width=\"28\" height=\"9\" rx=\"3\"/><path class=\"beacon\" d=\"M{},{} v-6 a9,9 0 0 1 18,0 v6 z\"/>",
+        cx - 14,
+        y - 7,
+        cx - 9,
+        y - 5
+    );
+    block(html, p, 12);
+    let _ = write!(
+        html,
+        "<text class=\"dock-name\" x=\"{}\" y=\"{}\">{name}</text><text class=\"dock-title\" x=\"{}\" y=\"{}\">{title}</text><rect class=\"opening\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"6\"/>",
+        x + 12,
+        y + 26,
+        x + w - 12,
+        y + 25,
+        x + 10,
+        y + 36,
+        w - 20,
+        h - 62
+    );
+    if name == DONE {
+        // 巻き上げたシャッターの下から、荷が出ていく
         let _ = write!(
             html,
-            "<rect class=\"hazard\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"10\" rx=\"3\"/><text class=\"dock-name\" x=\"{cx}\" y=\"{}\">{name}</text><text class=\"dock-title\" x=\"{cx}\" y=\"{}\">{title}</text><text class=\"dock-sub\" x=\"{cx}\" y=\"{}\">{sub}</text>",
-            p.x + 10,
-            p.y + p.h - 18,
-            p.w - 20,
-            p.y + 30,
-            p.y + 50,
-            p.y + 68
+            "<rect class=\"shutter\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"12\"/><text class=\"dock-sub\" x=\"{cx}\" y=\"{}\">{sub}</text>",
+            x + 11,
+            y + 37,
+            w - 22,
+            y + h - 34
         );
     } else {
         let _ = write!(
             html,
-            "<text class=\"dock-name left\" x=\"{}\" y=\"{}\">{name}</text><text class=\"dock-title left\" x=\"{}\" y=\"{}\">{title}・{sub}</text>",
-            p.x + 16,
-            p.y + 24,
-            p.x + 16,
-            p.y + 44
+            "<rect class=\"shutter\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"5\"/><rect class=\"sub-plate\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"18\" rx=\"4\"/><text class=\"dock-sub\" x=\"{cx}\" y=\"{}\">{sub}</text>",
+            x + 11,
+            y + 37,
+            w - 22,
+            h - 64,
+            cx - 58,
+            y + 57,
+            116,
+            y + 70
         );
     }
+    hazard(html, x + 10, y + h - 20, w - 20);
     html.push_str("</g>\n");
 }
 
-/// 縞の模様。
-const DEFS: &str = "<defs><pattern id=\"hazard\" width=\"14\" height=\"14\" patternUnits=\"userSpaceOnUse\" patternTransform=\"rotate(45)\"><rect width=\"14\" height=\"14\" fill=\"#ffc94a\"/><rect width=\"7\" height=\"14\" fill=\"#1b1d33\"/></pattern></defs>\n";
+/// 人間の窓口（needs-human）。窓から人が見える詰め所と、呼び出しのボタン。
+fn render_booth(html: &mut String, p: Place) {
+    let (x, y, w) = (p.x, p.y, p.w);
+    let _ = write!(
+        html,
+        "<g class=\"dock human\"><rect class=\"awning\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"12\" rx=\"5\"/>",
+        x + 12,
+        y - 8,
+        w - 24
+    );
+    block(html, p, 12);
+    let (bx, by) = (x + w - 34, y + 38);
+    let _ = writeln!(
+        html,
+        "<rect class=\"window\" x=\"{}\" y=\"{}\" width=\"64\" height=\"50\" rx=\"8\"/><circle class=\"person\" cx=\"{}\" cy=\"{}\" r=\"8\"/><path class=\"person\" d=\"M{},{} c3,-9 9,-13 16,-13 s13,4 16,13\"/>\
+<text class=\"dock-name\" x=\"{}\" y=\"{}\">needs-human</text><text class=\"dock-title\" x=\"{}\" y=\"{}\">人間の窓口・どの機械からでも回せる</text>\
+<circle class=\"call\" cx=\"{bx}\" cy=\"{by}\" r=\"19\"/><path class=\"bell\" d=\"M{},{} v-5 a6,6 0 0 1 12,0 v5 l2,2 h-16 z M{},{} h4\"/></g>",
+        x + 10,
+        y + 13,
+        x + 42,
+        y + 32,
+        x + 26,
+        y + 60,
+        x + 88,
+        y + 34,
+        x + 88,
+        y + 55,
+        bx - 6,
+        by + 2,
+        bx - 2,
+        by + 7
+    );
+}
+
+/// 鋼板や縞などの模様。
+const DEFS: &str = r##"<defs>
+<linearGradient id="steel" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5d687c"/><stop offset=".45" stop-color="#4a5466"/><stop offset="1" stop-color="#3c4453"/></linearGradient>
+<radialGradient id="rivet" cx=".35" cy=".3" r=".7"><stop offset="0" stop-color="#c3cad6"/><stop offset="1" stop-color="#596274"/></radialGradient>
+<pattern id="hazard" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="12" height="12" fill="#ffc21a"/><rect width="6" height="12" fill="#16181d"/></pattern>
+<pattern id="scan" width="4" height="3" patternUnits="userSpaceOnUse"><rect width="4" height="1" fill="#fff" fill-opacity=".035"/></pattern>
+<pattern id="slats" width="8" height="6" patternUnits="userSpaceOnUse"><rect width="8" height="6" fill="#454d5c"/><rect width="8" height="3" fill="#6b7588"/></pattern>
+<pattern id="vents" width="22" height="7" patternUnits="userSpaceOnUse"><rect width="22" height="7" fill="#5a6477"/><rect y="5" width="22" height="2" fill="#363d4b"/></pattern>
+<pattern id="zone-done" width="20" height="20" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="10" height="20" fill="#39e58c" fill-opacity=".1"/></pattern>
+<pattern id="zone-stop" width="20" height="20" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="10" height="20" fill="#ff4d4d" fill-opacity=".09"/></pattern>
+<pattern id="awning" width="28" height="12" patternUnits="userSpaceOnUse"><rect width="28" height="12" fill="#f4f6fa"/><rect width="14" height="12" fill="#ff6fae"/></pattern>
+<linearGradient id="opening" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0d2a1d"/><stop offset="1" stop-color="#16523a"/></linearGradient>
+<linearGradient id="glass" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b8e3ff"/><stop offset=".55" stop-color="#6aa6d8"/><stop offset="1" stop-color="#4a86bd"/></linearGradient>
+<radialGradient id="call" cx=".4" cy=".35" r=".7"><stop offset="0" stop-color="#ffa6cf"/><stop offset=".6" stop-color="#ff6fae"/><stop offset="1" stop-color="#d9478a"/></radialGradient>
+</defs>
+"##;
 
 const STYLE: &str = r#"
-:root { --ink: #1b1d33; --floor: #2a2d4a; --accent: #f39c38; }
+:root { --ink: #0e1117; --yellow: #ffc21a;
+  --display: "Avenir Next", "Segoe UI", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 24px 32px 48px; font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; color: var(--ink);
-  background: #eceef6; background-image: radial-gradient(#d9dcee 2px, transparent 2px); background-size: 22px 22px; }
-header { display: flex; align-items: baseline; gap: 20px; flex-wrap: wrap; }
-h1 { margin: 0 0 12px; font-size: 32px; letter-spacing: 1px; color: var(--floor); text-shadow: 3px 3px 0 var(--accent); }
-.summary { margin: 0; font-weight: bold; color: #4a4f7a; }
-h2 { margin: 0 0 6px; font-size: 22px; }
-code { background: #f3f4fb; border: 2px solid #c9cce6; border-radius: 6px; padding: 0 6px; }
-.board { background: #fff; border: 4px solid var(--accent); border-radius: 18px; padding: 14px 20px; margin: 12px 0 24px; box-shadow: 6px 6px 0 var(--accent); }
-.board.ok { border-color: #3fae7a; box-shadow: 6px 6px 0 #3fae7a; }
-.board ul, .notes { margin: 6px 0 0; padding-left: 20px; }
-.line { background: #fff; border: 4px solid var(--floor); border-radius: 22px; padding: 16px 20px; margin: 0 0 28px; box-shadow: 8px 8px 0 var(--floor); }
-.sign { display: inline-block; background: var(--accent); color: var(--ink); border-radius: 8px; padding: 0 8px; font-size: 14px; vertical-align: middle; }
-.repos { margin: 0 0 10px; }
-.floor { overflow-x: auto; border-radius: 16px; background: var(--floor);
-  background-image: linear-gradient(#33375a 2px, transparent 2px), linear-gradient(90deg, #33375a 2px, transparent 2px); background-size: 40px 40px; }
-.notes li { color: #b45309; font-weight: bold; }
+body { margin: 0; padding: 26px 30px 48px; font-family: "Hiragino Sans", "Noto Sans JP", system-ui, -apple-system, sans-serif; color: #e8edf5; background: #11141a; }
+header { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; margin-bottom: 14px; }
+h1 { margin: 0; font-size: 32px; font-weight: 900; letter-spacing: .02em; color: #f4f6fa; }
+h1 span { color: var(--yellow); }
+.summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 0; font-size: 12px; font-weight: bold; color: #9aa6ba; }
+.summary span { background: #1d222c; border: 2px solid var(--ink); border-radius: 8px; padding: 3px 12px; box-shadow: inset 0 2px 0 rgba(255,255,255,.06); }
+.summary b { font: 700 18px var(--display); color: var(--yellow); margin: 0 4px; }
+h2 { margin: 0 0 6px; font-size: 20px; }
+code { font-family: var(--mono); font-size: 13px; background: #1d222c; border: 1px solid #2d3442; border-radius: 4px; padding: 1px 6px; color: #cfd8e6; }
+.board { background: #171b23; border: 2px solid var(--ink); border-radius: 10px; padding: 10px 18px; margin: 0 0 18px; box-shadow: inset 0 2px 0 rgba(255,255,255,.05); }
+.board h2 { margin: 0; font-size: 15px; display: flex; align-items: center; gap: 12px; }
+.board h2::before { content: ""; width: 12px; height: 12px; border-radius: 50%; background: #ffb020; box-shadow: 0 0 10px #ffb020; }
+.board.ok h2::before { background: #39e58c; box-shadow: 0 0 10px #39e58c; }
+.board ul, .notes { margin: 6px 0 0; padding-left: 22px; }
+.board li, .notes li { color: #ffc75a; font-weight: bold; }
+.line { background: #161a21; border: 2px solid var(--ink); border-radius: 16px; padding: 16px 20px; margin: 0 0 28px; }
+.line h2 { font: 700 22px var(--display); color: #f4f6fa; }
+.sign { display: inline-block; background: var(--yellow); color: #14161b; border: 2px solid var(--ink); border-radius: 5px; padding: 0 8px; font-size: 12px; letter-spacing: .08em; vertical-align: middle; }
+.repos { margin: 0 0 12px; font-size: 13px; color: #9aa6ba; }
+.floor { overflow-x: auto; border: 10px solid var(--yellow); border-image: repeating-linear-gradient(45deg, #ffc21a 0 12px, #15171c 12px 24px) 10; box-shadow: 0 0 0 3px var(--ink);
+  background-color: #1b1f27; background-image: linear-gradient(rgba(255,255,255,.035) 2px, transparent 2px), linear-gradient(90deg, rgba(255,255,255,.035) 2px, transparent 2px), radial-gradient(rgba(255,255,255,.05) 1px, transparent 1.6px);
+  background-size: 80px 80px, 80px 80px, 10px 10px; }
+.floor svg { display: block; }
 .empty { font-size: 18px; }
-.warehouse { background: #fff; border: 4px dashed #6b6fb5; border-radius: 18px; padding: 14px 20px; margin: 0 0 24px; }
+.warehouse { background: #161a21; border: 2px dashed #4b5466; border-radius: 16px; padding: 14px 20px; margin: 0 0 24px; }
 .crates { display: flex; gap: 12px; flex-wrap: wrap; }
-.crate { background: #c98a3c; color: #fff; font-weight: bold; padding: 10px 16px; border-radius: 6px; border: 3px solid #7a4f1c; }
-.legend { background: #fff; border: 4px solid #6b6fb5; border-radius: 18px; padding: 12px 20px; }
-.legend li { margin: 4px 0; }
-.chip { display: inline-block; background: #2e3150; color: var(--a); font-weight: 900; letter-spacing: -2px; border-radius: 6px; padding: 0 8px 0 6px; margin-right: 6px; border: 2px solid var(--ink); }
+.crate { background: repeating-linear-gradient(90deg, #b9813a 0 18px, #a8722f 18px 20px); color: #fff; font-weight: bold; padding: 10px 16px; border-radius: 4px; border: 3px solid #4a2f10; text-shadow: 0 1px 0 #4a2f10; }
+.legend { background: #161a21; border: 2px solid var(--ink); border-radius: 16px; padding: 12px 20px; }
+.legend li { margin: 6px 0; font-size: 14px; color: #c8d1df; }
+.legend b { color: #f3f6fb; }
+.chip { display: inline-block; background: #1d222b; color: var(--a); font-weight: 900; letter-spacing: -2px; border-radius: 4px; padding: 0 8px 0 6px; margin-right: 8px; border: 3px solid #566174; outline: 2px solid var(--ink); }
+.dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--ink); background: var(--a); box-shadow: 0 0 8px var(--a); margin-right: 8px; vertical-align: -1px; }
 
 svg text { font-family: inherit; }
-.belt { --a: #ffc94a; }
-.belt.replaced { --a: #ff8f3f; }
-.belt.gated { --a: #b9a2ff; }
-.belt path.edge, .belt path.base, .belt path.rollers { fill: none; stroke-linecap: butt; stroke-linejoin: round; }
-.belt .edge { stroke: var(--ink); stroke-width: 20; }
-.belt .base { stroke: #3a3e66; stroke-width: 14; }
-.belt .rollers { stroke: #50568a; stroke-width: 12; stroke-dasharray: 3 7; animation: run 0.7s linear infinite; }
-.belt.gated .rollers { animation-duration: 2s; }
+.bay { fill: none; stroke: rgba(255,194,26,.3); stroke-width: 2; stroke-dasharray: 8 6; }
+.zone.done { fill: url(#zone-done); }
+.zone.stop { fill: url(#zone-stop); }
+.belts path { fill: none; stroke-linecap: butt; stroke-linejoin: round; }
+.belts .edge { stroke: var(--ink); stroke-width: 28; }
+.belts .hi { stroke: #8590a3; stroke-width: 22; }
+.belts .rail { stroke: #566174; stroke-width: 18; }
+.belts .base { stroke: #1d222b; stroke-width: 12; }
+.belts .rollers { stroke: #2f3643; stroke-width: 12; stroke-dasharray: 2 5; animation: run .6s linear infinite; }
+.bridge .shadow { stroke: #000; stroke-opacity: .5; stroke-width: 32; }
+.bridge .edge { stroke-width: 30; }
+.bridge .hi { stroke: #9aa5b8; }
+@keyframes run { to { stroke-dashoffset: -7; } }
+.belt { --a: #ffc21a; }
+.belt.replaced { --a: #ff7a1a; }
+.belt.gated { --a: #b18cff; }
 .belt .chevron { fill: none; stroke: var(--a); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-.belt .head { fill: var(--a); stroke: var(--ink); stroke-width: 2; stroke-linejoin: round; }
-.lock circle { fill: #b9a2ff; stroke: var(--ink); stroke-width: 2; }
+.lock circle { fill: #b18cff; stroke: var(--ink); stroke-width: 3; }
 .lock rect { fill: var(--ink); }
 .lock .shackle { fill: none; stroke: var(--ink); stroke-width: 2; }
-@keyframes run { to { stroke-dashoffset: -10; } }
+.flange { fill: #2a303b; stroke: var(--ink); stroke-width: 3; }
+.intake { fill: #1a1f28; stroke: var(--ink); stroke-width: 3; }
 
-.side { fill: #34376a; stroke: var(--ink); stroke-width: 3; }
-.machine .top { fill: #5c60ad; stroke: var(--ink); stroke-width: 3; }
-.machine .stripe { fill: var(--accent); }
-.machine .band { fill: var(--c); stroke: var(--ink); stroke-width: 2; }
-.machine .panel { fill: #1e2038; stroke: var(--ink); stroke-width: 2; }
-.machine .vent { fill: #4b4f8a; stroke: var(--ink); stroke-width: 3; }
-.machine .smoke { fill: #e7e9f7; stroke: #b9bde0; stroke-width: 2; animation: puff 2.4s ease-out infinite; }
-.machine .smoke.s2 { animation-delay: 1.2s; }
-@keyframes puff { from { opacity: 0.9; transform: translateY(0); } to { opacity: 0; transform: translateY(-22px); } }
-.machine .gear { fill: #fff; stroke: var(--ink); stroke-width: 4; stroke-dasharray: 4 3; transform-box: fill-box; transform-origin: center; animation: spin 4s linear infinite; }
+.machine, .dock { filter: drop-shadow(0 12px 10px rgba(0,0,0,.45)); }
+.side { fill: #262c37; stroke: var(--ink); stroke-width: 3; }
+.top { fill: url(#steel); stroke: var(--ink); stroke-width: 3; }
+.shine { fill: none; stroke: rgba(255,255,255,.22); stroke-width: 3; stroke-linecap: round; }
+.rivet { fill: url(#rivet); }
+.chimney { fill: url(#vents); stroke: var(--ink); stroke-width: 3; }
+.cap { fill: #2a303b; stroke: var(--ink); stroke-width: 3; }
+.smoke { fill: rgba(205,213,226,.25); animation: puff 2.4s ease-out infinite; }
+.smoke.s2 { animation-delay: 1.2s; }
+@keyframes puff { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(-18px); } }
+.stack { fill: var(--ink); }
+.lamp.red { fill: #4a1c22; }
+.lamp.amber { fill: #4a3a14; }
+.lamp.green { fill: #173b28; }
+.lamp.amber.on { fill: #ffb020; filter: drop-shadow(0 0 5px #ffb020); }
+.lamp.green.on { fill: #39e58c; filter: drop-shadow(0 0 5px #39e58c); }
+.plate { fill: #161a22; stroke: var(--ink); stroke-width: 2; }
+.led { fill: var(--c); filter: drop-shadow(0 0 4px var(--c)); }
+.gear { fill: none; stroke: var(--c); stroke-width: 4; stroke-dasharray: 3.5 2; transform-box: fill-box; transform-origin: center; animation: spin 4s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.machine .name { font-size: 17px; font-weight: 800; fill: var(--ink); }
-.machine .key { font-size: 12px; fill: #9ea3d8; }
-.machine .value { font-size: 12px; font-weight: bold; fill: #f1f2ff; }
-.machine.warn .top { stroke: #ff5c5c; stroke-width: 4; stroke-dasharray: 10 5; }
-.alert polygon { fill: #ffc94a; stroke: var(--ink); stroke-width: 3; stroke-linejoin: round; }
-.alert text { font-size: 20px; font-weight: 900; text-anchor: middle; fill: var(--ink); }
+.machine .name { font: 700 18px var(--display); fill: #f3f6fb; }
+.screen { fill: #0a0e14; stroke: var(--ink); stroke-width: 2; }
+.scan { fill: url(#scan); }
+.machine .key { font: 11px var(--mono); fill: #7d8aa3; }
+.machine .value { font: 700 11px var(--mono); fill: #e8edf5; }
+.machine .value.yes { fill: #c9b0ff; }
+.hazard { fill: url(#hazard); stroke: var(--ink); stroke-width: 2; }
+.alert polygon { fill: #ffb020; stroke: var(--ink); stroke-width: 2; stroke-linejoin: round; }
+.alert text { font-size: 14px; font-weight: 900; text-anchor: middle; fill: var(--ink); }
 .alert { animation: blink 1.2s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0.45; } }
 .badge rect { stroke: var(--ink); stroke-width: 2; }
-.badge text { font-size: 12px; font-weight: bold; text-anchor: middle; fill: var(--ink); }
-.badge.entry rect { fill: #7be0a6; }
-.badge.replaced rect { fill: #ff8f3f; }
+.badge text { font-size: 11px; font-weight: 800; text-anchor: middle; fill: #14161b; }
+.badge.entry rect { fill: var(--yellow); }
+.badge.replaced rect { fill: #ff7a1a; }
 
-.dock .top { stroke: var(--ink); stroke-width: 3; }
-.dock.done .top { fill: #3f9e74; }
-.dock.stop .top { fill: #6b7090; }
-.dock.human .top { fill: #d9628f; }
-.dock .hazard { fill: url(#hazard); stroke: var(--ink); stroke-width: 2; }
-.dock text { text-anchor: middle; fill: #fff; }
-.dock text.left { text-anchor: start; }
-.dock-name { font-size: 18px; font-weight: 800; }
-.dock-title { font-size: 13px; font-weight: bold; }
-.dock-sub { font-size: 11px; }
+.beacon-base { fill: #2a303b; stroke: var(--ink); stroke-width: 2; }
+.beacon { stroke: var(--ink); stroke-width: 2; }
+.dock.done .beacon { fill: #39e58c; filter: drop-shadow(0 0 6px #39e58c); }
+.dock.stop .beacon { fill: #ff4d4d; filter: drop-shadow(0 0 6px #ff4d4d); }
+.opening { stroke: var(--ink); stroke-width: 2; }
+.dock.done .opening { fill: url(#opening); }
+.shutter { fill: url(#slats); }
+.sub-plate { fill: rgba(14,17,23,.86); }
+.dock text { fill: #f3f6fb; }
+.dock-name { font: 700 18px var(--display); }
+.dock-title { font-size: 12px; font-weight: 800; text-anchor: end; }
+.dock.done .dock-title { fill: #9ff0c6; }
+.dock.stop .dock-title { fill: #ffb3b3; }
+.dock-sub { font-size: 10px; font-weight: bold; text-anchor: middle; }
+.dock.done .dock-sub { fill: #c4f7dc; }
+.dock.human .dock-title { text-anchor: start; fill: #d3dbe7; }
+.awning { fill: url(#awning); stroke: var(--ink); stroke-width: 3; }
+.window { fill: url(#glass); stroke: var(--ink); stroke-width: 3; }
+.person { fill: none; stroke: var(--ink); stroke-width: 2.6; stroke-linecap: round; }
+.call { fill: url(#call); stroke: var(--ink); stroke-width: 3; filter: drop-shadow(0 0 7px rgba(255,111,174,.6)); }
+.bell { fill: none; stroke: var(--ink); stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
 "#;
 
 const LEGEND: &str = r#"<section class="legend"><h2>見かた</h2><ul>
-<li><span class="chip" style="--a:#ffc94a">›››</span>ベルトコンベア: cellの <code>next</code>。山形の印と矢印の向きに進む</li>
-<li><span class="chip" style="--a:#ff8f3f">›››</span>オレンジの印: <code>[product.next]</code> で、このラインだけ進め先を替えたもの</li>
-<li><span class="chip" style="--a:#b9a2ff">›››</span>紫の印（出ていくところに鍵）: 着手を確かめるcell（<code>confirm</code>）が、人間に認められたあとにだけ進める先</li>
-<li><b>needs-human</b>（ピンクの窓口）: どの機械からでも、人間に回せる（線は省いている）</li>
+<li><span class="chip" style="--a:#ffc21a">›››</span>ベルトコンベア: cellの <code>next</code>。山形の印と、ローラーの流れる向きに進む。同じ先へ行くベルトは、途中で1本に合流する</li>
+<li><span class="chip" style="--a:#ff7a1a">›››</span>オレンジの印: <code>[product.next]</code> で、このラインだけ進め先を替えたもの</li>
+<li><span class="chip" style="--a:#b18cff">›››</span>紫の印（出ていくところに鍵）: 着手を確かめるcell（<code>confirm</code>）が、人間に認められたあとにだけ進める先</li>
+<li><b>橋</b>: 交わるだけのベルトは、橋で上を越す（合流とは見分ける）</li>
+<li><span class="dot" style="--a:#39e58c"></span><b>信号灯</b>: 緑はふつう。黄と <b>⚠</b> は、想定通りに流れないかもしれないcell。上の「注意」に理由がある</li>
 <li><b>入口</b>: Issueを扱い、ほかのcellの <code>next</code> から来ないcell。人がラベルを付けて始める</li>
-<li><b>⚠</b>: 想定通りに流れないかもしれないcell。上の「注意」に理由がある</li>
+<li><span class="dot" style="--a:#ff6fae"></span><b>needs-human</b>（人間の窓口）: どの機械からでも、人間に回せる（線は省いている）</li>
 </ul></section>
 "#;
 
@@ -1112,10 +1418,10 @@ next = ["stop", "done"]
         }
     }
 
-    /// 道の決まりを確かめる。斜めがない、箱（機械の上にはみ出す印も含めて）を通らない（ベルトの太さも入れる）、
-    /// 入る面の向きに入る、別の先へ行くベルトどうしが並んで重ならない。
+    /// 道の決まりを確かめる。斜めがない、箱（機械の上にはみ出す煙突と信号灯、横の口も含めて）を通らない
+    /// （ベルトの太さも入れる）、入る面の向きに入る、別の先へ行くベルトどうしが並んで重ならない。
     fn check_routes(layout: &Layout) -> Result<(), String> {
-        const HALF: i64 = 9;
+        const HALF: i64 = 14;
         for belt in &layout.belts {
             let name = format!("{} → {}", belt.from, belt.to);
             let points = &belt.points;
@@ -1141,7 +1447,17 @@ next = ["stop", "done"]
                     }
                     let (x0, x1) = (a.0.min(b.0) - HALF, a.0.max(b.0) + HALF);
                     let (y0, y1) = (a.1.min(b.1) - HALF, a.1.max(b.1) + HALF);
-                    if x0 < p.x + p.w && x1 > p.x - 8 && y0 < p.y + p.h + DEPTH && y1 > p.y - 22 {
+                    // 上にはみ出すのは、機械は煙突と信号灯、出口は回転灯、窓口はひさし
+                    let roof = match box_name {
+                        DONE | STOP => 18,
+                        "needs-human" => 8,
+                        _ => ROOF,
+                    };
+                    if x0 < p.x + p.w + 9
+                        && x1 > p.x - 9
+                        && y0 < p.y + p.h + DEPTH
+                        && y1 > p.y - roof
+                    {
                         return Err(format!("{name}: {box_name} を通る {a:?} {b:?}"));
                     }
                 }
@@ -1177,7 +1493,8 @@ next = ["stop", "done"]
         Ok(())
     }
 
-    /// 平行な2本の線が、見分けられないほど近くに並ぶか（ベルトの中の帯の太さ14より近い）。
+    /// 平行な2本の線が、見分けられないほど近くに並ぶか（ベルトの手すりの太さ18より近い。縁と手すりが重なって、
+    /// 1本の太いベルトに見える）。
     fn side_by_side(a: &[(i64, i64)], b: &[(i64, i64)]) -> Option<String> {
         let horizontal = |s: &[(i64, i64)]| s[0].1 == s[1].1;
         if horizontal(a) != horizontal(b) {
@@ -1189,7 +1506,7 @@ next = ["stop", "done"]
         let (a0, a1) = (along(a[0]).min(along(a[1])), along(a[0]).max(along(a[1])));
         let (b0, b1) = (along(b[0]).min(along(b[1])), along(b[0]).max(along(b[1])));
         let overlap = a1.min(b1) - a0.max(b0);
-        ((across(a[0]) - across(b[0])).abs() < 14 && overlap > 14).then(|| format!("{a:?} {b:?}"))
+        ((across(a[0]) - across(b[0])).abs() < 18 && overlap > 14).then(|| format!("{a:?} {b:?}"))
     }
 
     /// でたらめな設定（cellが2〜7個、next が1〜4個、done と stop も混ぜる）。
@@ -1253,6 +1570,42 @@ next = ["stop", "done"]
     }
 
     #[test]
+    fn every_crossing_gets_a_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("design.md"), "設計を書く").unwrap();
+        let texts = (0..1500)
+            .map(random_config)
+            .chain([CONFIG.to_string(), crowded()]);
+        for text in texts {
+            let Ok(config) = Config::parse(&text, dir.path()) else {
+                continue;
+            };
+            for line in &flow::read(&config).lines {
+                let layout = layout(line);
+                let bridges = crossings(&layout.belts);
+                // どちらの線でも端でないところで、横と縦の線が交わる点
+                for a in &layout.belts {
+                    for b in &layout.belts {
+                        for h in a.points.windows(2).filter(|s| s[0].1 == s[1].1) {
+                            for v in b.points.windows(2).filter(|s| s[0].0 == s[1].0) {
+                                let (x, y) = (v[0].0, h[0].1);
+                                let inside = h[0].0.min(h[1].0) < x
+                                    && x < h[0].0.max(h[1].0)
+                                    && v[0].1.min(v[1].1) < y
+                                    && y < v[0].1.max(v[1].1);
+                                assert!(
+                                    !inside || bridges.contains(&(x, y)),
+                                    "({x}, {y}) に橋がない\n{text}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn crossed_entries_do_not_share_a_line() {
         // 入口が2つあり、たすきがけに進む（triage → design、assess → implement）
         let text = CONFIG
@@ -1288,6 +1641,74 @@ next = ["stop", "done"]
             simplify(vec![(0, 0), (5, 0), (5, 0), (9, 0), (9, 3)]),
             [(0, 0), (9, 0), (9, 3)]
         );
+    }
+
+    fn belt(points: &[(i64, i64)], to: &str) -> Belt {
+        Belt {
+            from: "a".to_string(),
+            to: to.to_string(),
+            class: "belt",
+            note: None,
+            points: points.to_vec(),
+        }
+    }
+
+    #[test]
+    fn belts_that_only_cross_get_a_bridge_and_merging_ones_do_not() {
+        let across = belt(&[(0, 100), (300, 100)], "x");
+        let up = belt(&[(150, 200), (150, 0), (400, 0)], "y");
+        assert_eq!(crossings(&[across, up]), [(150, 100)]);
+        // 横の線に入って合流するもの（角が線の上）と、線の端に近すぎるものには架けない
+        let main = belt(&[(0, 100), (300, 100)], "x");
+        let join = belt(&[(150, 200), (150, 100), (300, 100)], "x");
+        let near_end = belt(&[(20, 200), (20, 0)], "y");
+        assert!(crossings(&[main, join, near_end]).is_empty());
+    }
+
+    #[test]
+    fn chevrons_of_merged_belts_sit_on_the_same_points() {
+        let a = belt(&[(0, 100), (400, 100)], "x");
+        let b = belt(&[(100, 300), (100, 100), (400, 100)], "x");
+        let marks = chevrons(&[a, b], &[(280, 100)]);
+        let on_line: Vec<i64> = marks.iter().filter(|m| m.2 == 100).map(|m| m.1).collect();
+        // 同じ線の上では1つずつ、決まった間隔で、避ける点の近くは除く
+        assert_eq!(on_line, [70, 140, 210, 350]);
+        assert!(
+            marks
+                .iter()
+                .any(|m| m.0 == Some(1) && m.1 == 100 && m.3 == 270)
+        );
+        // 種類の違うベルトが合流したところは、ふつうの色（None）にする
+        let a = belt(&[(0, 100), (400, 100)], "x");
+        let mut b = belt(&[(100, 300), (100, 100), (400, 100)], "x");
+        b.class = "belt replaced";
+        let marks = chevrons(&[a, b], &[]);
+        assert!(
+            marks
+                .iter()
+                .filter(|m| m.2 == 100 && m.1 > 100)
+                .all(|m| m.0.is_none())
+        );
+        assert!(
+            marks
+                .iter()
+                .filter(|m| m.2 == 100 && m.1 < 100)
+                .all(|m| m.0 == Some(0))
+        );
+    }
+
+    #[test]
+    fn crowded_lines_draw_bridges_and_flanges() {
+        let config = {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("design.md"), "設計を書く").unwrap();
+            Config::parse(&crowded(), dir.path()).unwrap()
+        };
+        let html = render(&flow::read(&config));
+        assert!(html.contains("class=\"belts bridge\""));
+        assert!(html.contains("class=\"flange\""));
+        assert!(html.contains("class=\"intake\""));
+        assert!(html.contains("class=\"badge entry\""));
     }
 
     #[test]
