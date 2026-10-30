@@ -282,7 +282,9 @@ impl Runner<'_> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        let running = |phase: Option<&str>| crate::running::Running {
+        // 用意している間は、claudeの出力の場所を空にする（前の実行の claude.jsonl が残っていて、
+        // 今の様子として見えないように。用意の中で消す）
+        let running = |phase: Option<&str>, log: PathBuf| crate::running::Running {
             cell: cell.name.clone(),
             kind: match work.item {
                 Target::Issue => "Issue",
@@ -293,14 +295,14 @@ impl Runner<'_> {
             number: work.number,
             title: work.title.clone(),
             started,
-            log: place.run.join(CLAUDE_LOG),
+            log,
             tick: current_process(),
             phase: phase.map(str::to_string),
         };
-        crate::running::start(self.home, &running(Some("用意しています")));
+        crate::running::start(self.home, &running(Some("用意しています"), PathBuf::new()));
         // 抜けるときに（見送りや失敗でも）消す。push や投稿の間も、動いているものとして見せる
         let _running = crate::running::Guard(self.home);
-        let running = running(None);
+        let running = running(None, place.run.join(CLAUDE_LOG));
         // claudeを動かす前に作ったトークンは、動かす前にすべて取り消す。
         // 読むリポジトリ（仕事のリポジトリ、作業するリポジトリ、Issueのリポジトリ）ごとに1つ作る
         let mut reads: Vec<(RepoName, Credentials)> = Vec::new();

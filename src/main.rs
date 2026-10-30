@@ -441,7 +441,7 @@ fn run(command: Commands) -> Result<ExitCode> {
                 let home = home.clone();
                 std::thread::spawn(move || {
                     loop {
-                        let read_started = unix_now();
+                        let read_started = unix_now_ms();
                         let read = read_reports(&home);
                         let runs = agentcells::recent::read(&home);
                         {
@@ -473,7 +473,7 @@ fn run(command: Commands) -> Result<ExitCode> {
                     snapshot
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .running_changed = Some(now);
+                        .running_changed = Some(unix_now_ms());
                     let _ = wake.send(());
                 }
                 last_running = Some(current);
@@ -972,6 +972,14 @@ fn tick_notices(home: &Home, now: u64) -> Vec<String> {
         ));
     }
     notices
+}
+
+/// 今の時刻（UNIXのミリ秒）。
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 /// 今の時刻（UNIXの秒）。

@@ -15,10 +15,11 @@ pub struct Snapshot {
     pub products: Vec<(String, Report)>,
     /// 最後に読めた時刻（UNIXの秒）。まだ読めていなければ `None`
     pub read_at: Option<u64>,
-    /// 最後に読めたものを、読み始めた時刻（UNIXの秒）
+    /// 最後に読めたものを、読み始めた時刻（UNIXのミリ秒）
     pub read_started: Option<u64>,
-    /// 動いているcellが最後に変わった時刻（UNIXの秒）。これより前に読み始めたGitHubの状態は、終わったcellの
-    /// `ac:working` が残って見えることがあるので、止まったままかどうかを決めない
+    /// 動いているcellが変わったことに気づいた時刻（UNIXのミリ秒）。これより前に読み始めたGitHubの状態は、
+    /// 終わったcellの `ac:working` が残って見えることがあるので、止まったままかどうかを決めない
+    /// （変わると読み直しを起こすので、すぐ後に読み始めたものは、ミリ秒で比べれば後になる）
     pub running_changed: Option<u64>,
     /// 最後に読もうとして、設定などが読めなかったときのエラー
     pub error: Option<String>,
@@ -57,7 +58,7 @@ pub fn render(
     }
 
     let detail = running.map(|(r, alive)| (r, running::describe_running(r, alive, now, RECENT)));
-    // GitHubを読み始めたあとに動いているcellが変わっていなければ、止まったままかを決める（同じ秒なら決めない）
+    // GitHubを読み始めたあとに動いているcellが変わっていなければ、止まったままかを決める
     let judge_stopped = match (snapshot.read_started, snapshot.running_changed) {
         (Some(started), Some(changed)) => started > changed,
         _ => true,
@@ -248,7 +249,7 @@ mod tests {
         Snapshot {
             products: vec![("app".into(), report), ("web".into(), Report::default())],
             read_at: Some(1000),
-            read_started: Some(990),
+            read_started: Some(990_000),
             running_changed: None,
             error: None,
             runs: Vec::new(),
@@ -373,7 +374,7 @@ mod tests {
 
         // 読み始めたあとに、動いていたcellが終わった（GitHubの状態は古いまま）なら、作業中のまま
         let finished = Snapshot {
-            running_changed: Some(995),
+            running_changed: Some(995_000),
             ..snapshot()
         };
         let lines = render(&finished, None, &[], 60, 1065);
@@ -382,9 +383,9 @@ mod tests {
             "{lines:?}"
         );
         assert!(!lines.iter().any(|l| l.contains("ac:working")), "{lines:?}");
-        // 同じ秒でも決めない。読み直したあとなら決める
+        // 同じ時刻なら決めない。読み直したあとなら決める
         let same = Snapshot {
-            running_changed: Some(990),
+            running_changed: Some(990_000),
             ..snapshot()
         };
         assert!(
@@ -393,7 +394,7 @@ mod tests {
                 .any(|l| l.contains("止まったまま"))
         );
         let reread = Snapshot {
-            running_changed: Some(985),
+            running_changed: Some(989_999),
             ..snapshot()
         };
         assert!(

@@ -238,7 +238,10 @@ pub fn describe_running(running: &Running, alive: bool, now: u64, recent: usize)
     }
     let skip = events.len().saturating_sub(recent);
     lines.extend(events[skip..].iter().map(|e| format!("  {}", e.describe())));
-    lines.push(format!("  記録: {}", running.log.display()));
+    // 用意している間は、出力の場所を書いていない
+    if !running.log.as_os_str().is_empty() {
+        lines.push(format!("  記録: {}", running.log.display()));
+    }
     lines
 }
 
