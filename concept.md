@@ -4,6 +4,7 @@ agentcellsの最初の構想メモ。まだ作っていないことと、決ま�
 
 - 作ったものと決まったことの仕様は [docs/design.md](docs/design.md) に移す
 - 変更の履歴は [CHANGELOG.md](CHANGELOG.md) に書く
+- 目的を考えるために調べたこと（似た仕組み、人とAIのチームの動き）と、そこから考えたことは [docs/landscape.md](docs/landscape.md) にある
 
 ## 目的
 
