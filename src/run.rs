@@ -276,6 +276,31 @@ impl Runner<'_> {
         place: &mut Place,
     ) -> std::result::Result<Report, Failure> {
         let work_repo = place_repo(product)?;
+        // 動いている間、`agentcells status` で見えるようにする。用意（cloneなど）に時間がかかっても、
+        // ac:working が付いたものを「止まったまま」と見せないよう、用意の前から書く
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let running = |phase: Option<&str>| crate::running::Running {
+            cell: cell.name.clone(),
+            kind: match work.item {
+                Target::Issue => "Issue",
+                Target::PullRequest => "PR",
+            }
+            .to_string(),
+            repo: work.repo.to_string(),
+            number: work.number,
+            title: work.title.clone(),
+            started,
+            log: place.run.join(CLAUDE_LOG),
+            tick: current_process(),
+            phase: phase.map(str::to_string),
+        };
+        crate::running::start(self.home, &running(Some("用意しています")));
+        // 抜けるときに（見送りや失敗でも）消す。push や投稿の間も、動いているものとして見せる
+        let _running = crate::running::Guard(self.home);
+        let running = running(None);
         // claudeを動かす前に作ったトークンは、動かす前にすべて取り消す。
         // 読むリポジトリ（仕事のリポジトリ、作業するリポジトリ、Issueのリポジトリ）ごとに1つ作る
         let mut reads: Vec<(RepoName, Credentials)> = Vec::new();
@@ -321,31 +346,7 @@ impl Runner<'_> {
             Prepared::Ready(ready) => ready,
         };
 
-        // 動いている間、`agentcells status` で見えるようにする
-        let started = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or_default();
-        crate::running::start(
-            self.home,
-            &crate::running::Running {
-                cell: cell.name.clone(),
-                kind: match work.item {
-                    Target::Issue => "Issue",
-                    Target::PullRequest => "PR",
-                }
-                .to_string(),
-                repo: work.repo.to_string(),
-                number: work.number,
-                title: work.title.clone(),
-                started,
-                log: place.run.join(CLAUDE_LOG),
-                tick: current_process(),
-                phase: None,
-            },
-        );
-        // 抜けるときに（失敗でも）消す。push や投稿の間も、動いているものとして見せる
-        let _running = crate::running::Guard(self.home);
+        crate::running::start(self.home, &running);
         let finished = ready.claude(self, cell, place).run()?;
         crate::running::set_phase(self.home, "結果をGitHubに書いています");
 

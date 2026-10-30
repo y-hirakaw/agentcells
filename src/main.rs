@@ -374,12 +374,19 @@ fn run(command: Commands) -> Result<ExitCode> {
                 println!("  {}", run.describe(unix_now()));
             }
             println!();
+            // GitHubを読んでいる間にcellが終わることがあるので、動いているcellは読む前と後に見る
+            let before = agentcells::running::load(&home);
             let mut reports = read_reports(&home)?;
             let now = unix_now();
-            let running = agentcells::running::load(&home);
+            let after = agentcells::running::load(&home);
+            let running: Vec<_> = [&before, &after]
+                .into_iter()
+                .flatten()
+                .map(|(r, alive)| (r, *alive))
+                .collect();
             let mut stopped = false;
             for line in reports.iter_mut().flat_map(|(_, r)| r.lines.iter_mut()) {
-                line.check_stopped(running.as_ref().map(|(r, alive)| (r, *alive)), now);
+                line.check_stopped(&running, now);
                 stopped |= matches!(line.state, status::State::Stopped { .. });
             }
             if reports.is_empty() {
@@ -434,6 +441,7 @@ fn run(command: Commands) -> Result<ExitCode> {
                 let home = home.clone();
                 std::thread::spawn(move || {
                     loop {
+                        let read_started = unix_now();
                         let read = read_reports(&home);
                         let runs = agentcells::recent::read(&home);
                         {
@@ -443,6 +451,7 @@ fn run(command: Commands) -> Result<ExitCode> {
                                 Ok(products) => {
                                     s.products = products;
                                     s.read_at = Some(unix_now());
+                                    s.read_started = Some(read_started);
                                     s.error = None;
                                 }
                                 Err(e) => s.error = Some(e.message),
@@ -461,6 +470,10 @@ fn run(command: Commands) -> Result<ExitCode> {
                     .as_ref()
                     .map(|(r, _)| (r.repo.clone(), r.number, r.started));
                 if last_running.as_ref().is_some_and(|last| *last != current) {
+                    snapshot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .running_changed = Some(now);
                     let _ = wake.send(());
                 }
                 last_running = Some(current);

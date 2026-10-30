@@ -15,6 +15,11 @@ pub struct Snapshot {
     pub products: Vec<(String, Report)>,
     /// 最後に読めた時刻（UNIXの秒）。まだ読めていなければ `None`
     pub read_at: Option<u64>,
+    /// 最後に読めたものを、読み始めた時刻（UNIXの秒）
+    pub read_started: Option<u64>,
+    /// 動いているcellが最後に変わった時刻（UNIXの秒）。これより前に読み始めたGitHubの状態は、終わったcellの
+    /// `ac:working` が残って見えることがあるので、止まったままかどうかを決めない
+    pub running_changed: Option<u64>,
     /// 最後に読もうとして、設定などが読めなかったときのエラー
     pub error: Option<String>,
     /// 最近の実行（古い順。手元の記録から、GitHubを読み直すときと、動いているcellが変わったときに読む）
@@ -52,6 +57,11 @@ pub fn render(
     }
 
     let detail = running.map(|(r, alive)| (r, running::describe_running(r, alive, now, RECENT)));
+    // GitHubを読み始めたあとに動いているcellが変わっていなければ、止まったままかを決める（同じ秒なら決めない）
+    let judge_stopped = match (snapshot.read_started, snapshot.running_changed) {
+        (Some(started), Some(changed)) => started > changed,
+        _ => true,
+    };
     // 動いているcellの行が、どこかのproductにあれば、その下に広げる。なければ上にまとめて出す
     let expand_at = detail
         .as_ref()
@@ -84,7 +94,9 @@ pub fn render(
             .iter()
             .cloned()
             .map(|mut l| {
-                l.check_stopped(running, now);
+                if judge_stopped {
+                    l.check_stopped(&Vec::from_iter(running), now);
+                }
                 l
             })
             .collect();
@@ -236,6 +248,8 @@ mod tests {
         Snapshot {
             products: vec![("app".into(), report), ("web".into(), Report::default())],
             read_at: Some(1000),
+            read_started: Some(990),
+            running_changed: None,
             error: None,
             runs: Vec::new(),
         }
@@ -355,6 +369,37 @@ mod tests {
         assert_eq!(
             lines[at + 3],
             "  止まったまま implement  octo/issues#7「両方」 → PR octo/app#14"
+        );
+
+        // 読み始めたあとに、動いていたcellが終わった（GitHubの状態は古いまま）なら、作業中のまま
+        let finished = Snapshot {
+            running_changed: Some(995),
+            ..snapshot()
+        };
+        let lines = render(&finished, None, &[], 60, 1065);
+        assert!(
+            lines.contains(&"■ app  作業中 1 / 返事待ち 2".to_string()),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("ac:working")), "{lines:?}");
+        // 同じ秒でも決めない。読み直したあとなら決める
+        let same = Snapshot {
+            running_changed: Some(990),
+            ..snapshot()
+        };
+        assert!(
+            !render(&same, None, &[], 60, 1065)
+                .iter()
+                .any(|l| l.contains("止まったまま"))
+        );
+        let reread = Snapshot {
+            running_changed: Some(985),
+            ..snapshot()
+        };
+        assert!(
+            render(&reread, None, &[], 60, 1065)
+                .iter()
+                .any(|l| l.contains("止まったまま"))
         );
     }
 

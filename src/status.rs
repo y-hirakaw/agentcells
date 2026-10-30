@@ -91,7 +91,7 @@ pub struct Report {
 }
 
 /// 止まったままの行があるときに、添える説明。
-pub const STOPPED_HINT: &str = "止まったまま: tickが途中で止まり、`ac:working` が残っています（ほかのマシンでagentcellsを動かしていなければ）。tickは拾わないので、`ac:working` を外し、cellのラベルを付け直してください";
+pub const STOPPED_HINT: &str = "止まったまま: tickが途中で止まり、`ac:working` が残っています（ほかのマシンでagentcellsを動かしていなければ）。tickは拾わないので、残ったプロセスがあれば（上の※）先に止め、`ac:working` を外して、cellのラベルを付け直してください";
 
 /// 1回に読む件数。これより多ければ、更新の新しい順にこれだけ見る。[`QUERY`] の `first` も同じ数にする。
 const LIMIT: usize = 100;
@@ -509,14 +509,16 @@ impl Line {
 
     /// 作業中の行のうち、そのIssue/PRでcellが動いていないもの（動かしているtickがもういないものも）を、
     /// 止まったままにする。`running` は、動いているcellと、それを動かしているtickがまだ動いているか。
+    /// GitHubを読む前と後に読んだものを渡す（読んでいる間にcellが終わると、読んだラベルは
+    /// `ac:working` のままで、後の印はもうないため。どちらかで動いていれば、作業中のままにする）。
     /// ラベルが付いてから [`Self::STOPPED_AFTER`] たつまでは、動き始めたところかもしれないので、作業中のままにする
     /// （付いた時刻が読めなければ、止まったとみなす）。ほかのマシンで動かしているagentcellsのcellは見えないので、
     /// それも止まったままに見える
-    pub fn check_stopped(&mut self, running: Option<(&Running, bool)>, now: u64) {
+    pub fn check_stopped(&mut self, running: &[(&Running, bool)], now: u64) {
         let State::Working { cell } = &self.state else {
             return;
         };
-        if running.is_some_and(|(r, alive)| alive && self.runs(r)) {
+        if running.iter().any(|(r, alive)| *alive && self.runs(r)) {
             return;
         }
         let recent = self
@@ -890,7 +892,7 @@ next = ["done"]
         let now = unix_seconds("2026-10-25T04:30:00Z").unwrap();
         let old = Some("2026-10-25T04:00:00Z");
         let check = |mut l: Line, r: Option<(&Running, bool)>| {
-            l.check_stopped(r, now);
+            l.check_stopped(&Vec::from_iter(r), now);
             matches!(l.state, State::Stopped { .. })
         };
         // そのPR（IssueでもPRでも）でcellが動いていれば、作業中のまま
@@ -909,7 +911,7 @@ next = ["done"]
         waiting.state = State::NeedsHuman;
         assert!(!check(waiting, None));
         let mut stopped = line(old);
-        stopped.check_stopped(None, now);
+        stopped.check_stopped(&[], now);
         assert_eq!(
             stopped.describe(now),
             "止まったまま implement  octo/issues#7「t」 → PR octo/app#14（30分前から）"
