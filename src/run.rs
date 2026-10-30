@@ -543,7 +543,7 @@ impl Runner<'_> {
         let replied_in = transition::replied_in(work.waiting, work.conflict);
         Ok(Prepared::Ready(Box::new(Ready {
             user: prompt::user_prompt(cell, extra.as_deref(), Some(&task)),
-            system: prompt::system_prompt(cell, replied_in, asked),
+            system: prompt::system_prompt(self.config, cell, replied_in, asked),
             schema: transition::output_schema(cell, replied_in, asked),
             settings_path,
             tools: settings::cell_tools(cell),

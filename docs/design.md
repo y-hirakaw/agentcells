@@ -14,7 +14,7 @@ agentcellsで、作ったものと決まったことの仕様。ひと通り整�
 +++
 on = "pull_request"          # issue か pull_request（両方なら ["issue", "pull_request"]）
 label = "ac:review"          # 拾うラベル
-description = "PRをレビューする"  # 何をするcellか（config view の機械の電光掲示板に流す。省略できる）
+description = "PRをレビューする"  # 何をするcellか（200字まで。config view に流し、このcellへ進めるcellのAIに進め先の説明として渡す。省略できる）
 next = ["implement", "done"] # 進めてよい先（cellの名前、done、stop）
 review = true                # PRへのレビューとして、指摘を行ごとに投稿する（on は pull_request だけ）
 max_rounds = 3               # 往復の上限（無限ループを防ぐ。1〜3、省略すると3）
@@ -93,6 +93,7 @@ cellが終わったら、AIは「次はどこか」と、Issue/PRに残すコメ
 
 - 進めてよい先は、cellごとに `next` で決める。`needs-human`（人間に回す）は、迷ったら止まれるように、どのcellからでも選べる
 - `next` の先のcellは、同じproductの `cells` に入っていないと設定の確認でエラーになる
+- システムプロンプトの「進め先」に、選べる先ごとの意味を書く。標準のcellには標準の説明（遷移の決まりと合わせてある）を付け、先のcellに `description` があれば、それを添える（標準のcellなら標準の説明に足す）。自分で足したcellは、名前だけでは何をするかが分からず、AIが選び間違えるため。そのため、`description` を書き換えると、そのcellへ進めるcellの選び方が変わる
 - 選べる先は何重にも縛る
   - B（`claude -p`）は `--json-schema` で `next` を選べる先の `enum` にする。許されていない先は出せない（出そうとすると結果が空になる）
   - A（ルーティン）はAIが `agentcells finish --next <先>` を実行し、CLIが確かめる（予定）

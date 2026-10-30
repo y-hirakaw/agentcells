@@ -847,7 +847,7 @@ fn hazard(html: &mut String, x: i64, y: i64, w: i64) {
     );
 }
 
-/// cellの説明を右から左へ流す電光掲示板。説明がなければ、灯っていない板だけを描く。
+/// cellの説明（空白を1つにまとめたもの）を右から左へ流す電光掲示板。説明がなければ、灯っていない板だけを描く。
 /// 字は、点の並びの穴（`#led`）から透けて見せる。字の幅は、`textLength` で見積もった幅にそろえ、
 /// 流す距離と合わせる（JSを使わないので、描いた幅を測れないため）
 fn render_ticker(html: &mut String, description: Option<&str>, x: i64, y: i64, w: i64) {
@@ -858,21 +858,18 @@ fn render_ticker(html: &mut String, description: Option<&str>, x: i64, y: i64, w
         y + 3,
         w - 6
     );
-    let text = description
-        .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
-        .unwrap_or_default();
-    if !text.is_empty() {
+    if let Some(text) = description {
         let inner = w - 6;
-        let len = text_width(&text);
+        let len = text_width(text);
         let distance = inner + len;
         let _ = write!(
             html,
             "<title>{}</title><g class=\"glow\"><g mask=\"url(#led)\"><text x=\"{inner}\" y=\"14\" textLength=\"{len}\" style=\"--d:-{distance}px;--s:-{}px;animation-duration:{:.1}s;animation-delay:-{:.1}s\">{}</text></g></g>",
-            escape(&text),
+            escape(text),
             inner - 6,
             distance as f64 / TICKER_SPEED,
             (inner - 6) as f64 / TICKER_SPEED,
-            escape(&text)
+            escape(text)
         );
     }
     html.push_str("</svg>");
@@ -1001,7 +998,7 @@ fn render_machine(html: &mut String, s: &Station, p: Place, color: &str) {
             escape(value)
         );
     }
-    render_ticker(html, cell.description.as_deref(), x + 13, y + 184, w - 26);
+    render_ticker(html, cell.description().as_deref(), x + 13, y + 184, w - 26);
     hazard(html, x + 16, y + h - 19, w - 32);
     if s.entry {
         let _ = write!(

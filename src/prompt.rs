@@ -287,7 +287,13 @@ const WEB_SEARCH_RULES: &str = "\n\n## Webの検索\n\nこの cell では WebSea
 /// システムプロンプト（`--append-system-prompt` で渡す）。標準の決まり、cellの役割、指摘の返し方、進め先を書く。
 /// `waiting` は、人間を待っていたところから、cellを使う人のコメントで動いたときの、その状態。
 /// `asked` は、最後の目印が、このcellが自分で人間に確かめたものか（[`transition::choices`]）。
-pub fn system_prompt(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> String {
+/// `config` は、進め先のcellの説明（`description`）を引くのに使う。
+pub fn system_prompt(
+    config: &Config,
+    cell: &Cell,
+    waiting: Option<Waiting>,
+    asked: bool,
+) -> String {
     let mut prompt = COMMON.replace("{cell}", &cell.name).trim_end().to_string();
     if let Some(role) = builtin(&cell.name) {
         prompt.push_str("\n\n");
@@ -316,10 +322,18 @@ pub fn system_prompt(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> Stri
             NEEDS_HUMAN => "人間の答えや作業が要る".to_string(),
             STOP => "ここで止める（閉じずに、agentcellsのラベルを外す。そのあとは人間が進める）"
                 .to_string(),
-            name => match builtin_summary(name) {
-                Some(summary) => format!("cell「{name}」に回す（{summary}）"),
-                None => format!("cell「{name}」に回す"),
-            },
+            // 使う人が書いた説明は、標準の説明（遷移の決まりと合わせてある）に足す
+            name => {
+                let described = config.cell(name).and_then(Cell::description);
+                match (builtin_summary(name), described) {
+                    (Some(summary), Some(d)) => {
+                        format!("cell「{name}」に回す（{summary}。このcellの説明: {d}）")
+                    }
+                    (Some(summary), None) => format!("cell「{name}」に回す（{summary}）"),
+                    (None, Some(d)) => format!("cell「{name}」に回す（{d}）"),
+                    (None, None) => format!("cell「{name}」に回す"),
+                }
+            }
         };
         prompt.push_str(&format!("\n- `{choice}`: {meaning}"));
     }
@@ -853,7 +867,7 @@ pub fn show(
     Ok(format!(
         "===== ツール（`--tools`） =====\n\n{}\n{web_search}。WebFetch はどのcellでも使えません\n\n===== システムプロンプト（agentcellsの標準。`--append-system-prompt` で渡す） =====\n\n{}\n===== 指示（{extra_note}） =====\n\n{}",
         crate::settings::cell_tools(cell),
-        system_prompt(cell, None, false),
+        system_prompt(config, cell, None, false),
         user_prompt(cell, extra.as_deref(), task.as_ref())
     ))
 }
@@ -964,7 +978,12 @@ mod tests {
 
     #[test]
     fn system_prompt_has_rules_role_and_choices() {
-        let prompt = system_prompt(&cell("triage", &["implement", "done"]), None, false);
+        let prompt = system_prompt(
+            &Config::default(),
+            &cell("triage", &["implement", "done"]),
+            None,
+            false,
+        );
         assert!(prompt.contains("cell「triage」として動いています"));
         assert!(!prompt.contains("{cell}"));
         assert!(prompt.contains("GitHub への書き込み"));
@@ -979,19 +998,61 @@ mod tests {
     fn review_instructions_follow_the_output_schema() {
         let mut review = cell("review", &["implement", "done"]);
         review.review = true;
-        assert!(system_prompt(&review, None, false).contains("findings に1件ずつ"));
+        assert!(
+            system_prompt(&Config::default(), &review, None, false).contains("findings に1件ずつ")
+        );
         review.review = false;
-        let prompt = system_prompt(&review, None, false);
+        let prompt = system_prompt(&Config::default(), &review, None, false);
         assert!(!prompt.contains("findings に1件ずつ"));
         assert!(prompt.contains("comment に箇条書き"));
     }
 
     #[test]
+    fn next_cells_are_described_with_their_descriptions() {
+        let config = Config {
+            cells: vec![
+                Cell {
+                    description: Some("要件から\n  設計を書く".to_string()),
+                    ..cell("design", &["implement"])
+                },
+                Cell {
+                    description: Some("PRを細かく見る".to_string()),
+                    ..cell("review", &["done"])
+                },
+                cell("release-prep", &["review"]),
+            ],
+            ..Config::default()
+        };
+        let prompt = system_prompt(
+            &config,
+            &cell("triage", &["design", "review", "release-prep", "done"]),
+            None,
+            false,
+        );
+        // 自分で足したcellは説明だけ、標準のcellは標準の説明に足す。説明がなければ名前だけ
+        assert!(
+            prompt.contains("- `design`: cell「design」に回す（要件から 設計を書く）"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "- `review`: cell「review」に回す（{}。このcellの説明: PRを細かく見る）",
+                builtin_summary("review").unwrap()
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- `release-prep`: cell「release-prep」に回す\n"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
     fn web_search_cells_are_told_to_treat_results_as_material() {
         let mut c = cell("triage", &["implement", "done"]);
-        assert!(!system_prompt(&c, None, false).contains("## Webの検索"));
+        assert!(!system_prompt(&Config::default(), &c, None, false).contains("## Webの検索"));
         c.web_search = true;
-        let prompt = system_prompt(&c, None, false);
+        let prompt = system_prompt(&Config::default(), &c, None, false);
         assert!(prompt.contains("## Webの検索"), "{prompt}");
         assert!(prompt.contains("指示（"), "{prompt}");
         assert!(prompt.contains("従わないでください"), "{prompt}");
@@ -1001,7 +1062,12 @@ mod tests {
 
     #[test]
     fn custom_cells_get_only_the_common_rules() {
-        let prompt = system_prompt(&cell("design", &["implement"]), None, false);
+        let prompt = system_prompt(
+            &Config::default(),
+            &cell("design", &["implement"]),
+            None,
+            false,
+        );
         assert!(prompt.contains("cell「design」"));
         assert!(!prompt.contains("役割:"));
     }

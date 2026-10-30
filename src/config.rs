@@ -53,7 +53,7 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 #   +++
 #   on = "issue"                     # issue か pull_request（両方なら ["issue", "pull_request"]）
 #   label = "ac:triage"              # 拾うラベル（ac: で始める）
-#   description = "Issueを仕分ける"   # 何をするcellか（config view の機械の電光掲示板に流す。省略できる）
+#   description = "Issueを仕分ける"   # 何をするcellか（200字まで。config view に流し、このcellへ進めるcellのAIに進め先の説明として渡す。省略できる）
 #   next = ["implement", "done"]     # 進めてよい先（cellの名前、done、stop）。needs-human はいつでも選べる
 #   review = false                   # true にすると、PRへのレビューとして指摘を行ごとに投稿する（on は pull_request だけ）
 #   max_rounds = 3                   # 往復の上限（1〜3。省略すると3）
@@ -94,6 +94,9 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 
 /// ファイルの全体にかかる項目（見出しの外に書くもの）。
 const TOP_LEVEL_KEYS: &[&str] = &["operator"];
+
+/// cellの説明（`description`）の長さの上限（字数）。電光掲示板に流し、ほかのcellのプロンプトに添えるので、短くする。
+pub const DESCRIPTION_LIMIT: usize = 200;
 
 /// 往復の上限。これより多く往復させず、人間に回す。
 pub const MAX_ROUNDS_LIMIT: u32 = 3;
@@ -278,7 +281,8 @@ pub struct Cell {
     pub on: Vec<Target>,
     /// 拾うラベル
     pub label: String,
-    /// 何をするcellか。`config view` で、機械の電光掲示板に流す（動きには使わない）
+    /// 何をするcellか。`config view` で機械の電光掲示板に流し、このcellへ進めるcellのプロンプトの
+    /// 進め先の説明に添える（AIが進め先を選ぶ材料になる）。読むときは [`Cell::description`] を使う
     #[serde(default)]
     pub description: Option<String>,
     /// 標準のプロンプトに足す、追加の指示のファイル。読み込んだあとは絶対パスになっている。
@@ -326,6 +330,17 @@ impl Cell {
             Ok(Some((_, body))) => body.to_string(),
             _ => text,
         }))
+    }
+
+    /// 何をするcellか。改行や続いた空白は1つの空白にまとめる。書いていないか空なら `None`。
+    pub fn description(&self) -> Option<String> {
+        let text = self
+            .description
+            .as_deref()?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!text.is_empty()).then_some(text)
     }
 
     /// 次のcellに進む前に、人間に確かめるか。
@@ -733,6 +748,14 @@ impl Config {
                     c.name
                 ));
             }
+            if c.description()
+                .is_some_and(|d| d.chars().count() > DESCRIPTION_LIMIT)
+            {
+                problems.push(format!(
+                    "cell「{}」の description は{DESCRIPTION_LIMIT}字までにしてください",
+                    c.name
+                ));
+            }
             if !(1..=MAX_ROUNDS_LIMIT).contains(&c.max_rounds) {
                 problems.push(format!(
                     "cell「{}」の max_rounds は1から{MAX_ROUNDS_LIMIT}までにしてください",
@@ -1035,6 +1058,31 @@ timeout_minutes = 10
         let bad = VALID.replace("max_rounds = 2", "max_rounds = 2\nweb_search = \"yes\"");
         let err = Config::parse(&bad, dir.path()).unwrap_err();
         assert!(err.message.contains("web_search"), "{}", err.message);
+    }
+
+    #[test]
+    fn descriptions_are_one_line_and_limited() {
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let with = |d: &str| {
+            VALID.replace(
+                "max_rounds = 2",
+                &format!(
+                    "max_rounds = 2\ndescription = {}",
+                    toml::Value::String(d.to_string())
+                ),
+            )
+        };
+        let config = Config::parse(&with(" 直す\n\tテストを足す "), dir.path()).unwrap();
+        assert_eq!(
+            config.cell("review").unwrap().description().as_deref(),
+            Some("直す テストを足す")
+        );
+        assert_eq!(config.cell("triage").unwrap().description(), None);
+        let blank = Config::parse(&with("  \n "), dir.path()).unwrap();
+        assert_eq!(blank.cell("review").unwrap().description(), None);
+        let limit = "あ".repeat(DESCRIPTION_LIMIT);
+        assert!(Config::parse(&with(&limit), dir.path()).is_ok());
+        assert!(problems_of(&with(&format!("{limit}い"))).contains("description は200字まで"));
     }
 
     #[test]
