@@ -4,6 +4,7 @@
 //! 動いているcellの様子は手元のファイル（[`crate::running`]）から読むので、2秒ごとに読み直す。
 //! GitHubは、読む回数を抑えるため、決めた間隔ごとに読み直す（[`crate::status`] と同じものを読む）。
 
+use crate::recent::{self, Run};
 use crate::running::{self, Running};
 use crate::status::{Line, Report, State};
 
@@ -16,10 +17,15 @@ pub struct Snapshot {
     pub read_at: Option<u64>,
     /// 最後に読もうとして、設定などが読めなかったときのエラー
     pub error: Option<String>,
+    /// 最近の実行（古い順。手元の記録から、GitHubを読み直すときと、動いているcellが変わったときに読む）
+    pub runs: Vec<Run>,
 }
 
 /// 動いているcellの、最近のしたことを何件出すか。
 const RECENT: usize = 10;
+
+/// 最近の実行を何件出すか。
+const RECENT_RUNS: usize = 3;
 
 /// 画面に出す行。`running` は、動いているcellと、それを動かしているtickがまだ動いているか。
 /// `notices` は、tickが動かない理由など。`interval` はGitHubを読み直す間隔（秒）、`now` はUNIXの秒。
@@ -59,6 +65,14 @@ pub fn render(
         }
     }
 
+    if !snapshot.runs.is_empty() {
+        out.push(String::new());
+        out.push("最近の実行".to_string());
+        out.extend(
+            recent::latest(&snapshot.runs, RECENT_RUNS).map(|r| format!("  {}", r.describe(now))),
+        );
+    }
+
     if snapshot.read_at.is_some() && snapshot.products.is_empty() {
         out.push(String::new());
         out.push("productがないので、扱っているIssueはありません".to_string());
@@ -95,6 +109,10 @@ pub fn render(
                 && expand_at == Some((p, i))
             {
                 out.extend(lines.iter().map(|l| format!("      {l}")));
+            } else if !matches!(line.state, State::Working { .. })
+                && let Some(run) = recent::last_for(&snapshot.runs, line)
+            {
+                out.push(format!("      {}", run.describe_last(now)));
             }
         }
     }
@@ -219,6 +237,7 @@ mod tests {
             products: vec![("app".into(), report), ("web".into(), Report::default())],
             read_at: Some(1000),
             error: None,
+            runs: Vec::new(),
         }
     }
 
@@ -336,6 +355,74 @@ mod tests {
         assert_eq!(
             lines[at + 3],
             "  止まったまま implement  octo/issues#7「両方」 → PR octo/app#14"
+        );
+    }
+
+    #[test]
+    fn shows_recent_runs_and_the_last_run_under_each_line() {
+        let run = |at, cell: &str, kind: &str, repo: &str, number, outcome| Run {
+            at,
+            subject: crate::record::Subject {
+                product: "app".into(),
+                cell: cell.into(),
+                kind: kind.into(),
+                repo: repo.into(),
+                number,
+                reply: None,
+            },
+            seconds: 70,
+            outcome,
+        };
+        let snapshot = Snapshot {
+            runs: vec![
+                run(
+                    500,
+                    "triage",
+                    "issue",
+                    "octo/issues",
+                    2,
+                    recent::Outcome::Human {
+                        requested: Some("needs-human".into()),
+                        reason: None,
+                        failure: None,
+                    },
+                ),
+                run(
+                    900,
+                    "review",
+                    "pull_request",
+                    "octo/app",
+                    14,
+                    recent::Outcome::Moved {
+                        destination: "implement".into(),
+                    },
+                ),
+            ],
+            ..snapshot()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let running = running(dir.path(), "octo/app", 14);
+        let lines = render(&snapshot, Some((&running, true)), &[], 60, 1065);
+        let at = lines.iter().position(|l| l == "最近の実行").unwrap();
+        assert_eq!(
+            lines[at + 1..at + 3],
+            [
+                "  2分前  PR octo/app#14  review → implement（1分10秒）",
+                "  9分前  octo/issues#2  triage → 人間に回した（AIが選んだ。理由はコメントに）（1分10秒）",
+            ]
+        );
+        // 返事待ちの行の下に前回の結果。作業中の行（動いているcellを広げる）には付けない
+        let waiting = lines
+            .iter()
+            .position(|l| l == "  返事待ち  octo/issues#2「質問した」")
+            .unwrap();
+        assert_eq!(
+            lines[waiting + 1],
+            "      前回（9分前）: triage → 人間に回した（AIが選んだ。理由はコメントに）"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("前回（2分前）")),
+            "{lines:?}"
         );
     }
 

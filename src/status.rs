@@ -560,7 +560,7 @@ impl Line {
             .since
             .as_deref()
             .and_then(unix_seconds)
-            .map(|at| elapsed(now.saturating_sub(at)))
+            .map(|at| rough_elapsed(now.saturating_sub(at)))
         {
             text.push_str(&format!("（{elapsed}前から）"));
         }
@@ -572,7 +572,7 @@ impl Line {
 }
 
 /// 経過した長さを、おおまかに書く。
-fn elapsed(seconds: u64) -> String {
+pub fn rough_elapsed(seconds: u64) -> String {
     match seconds {
         s if s < 60 => "1分足らず".to_string(),
         s if s < 60 * 60 => format!("{}分", s / 60),
@@ -856,8 +856,8 @@ next = ["done"]
         assert_eq!(unix_seconds("2026-10-25T03:05:00Z"), Some(1_792_897_500));
         assert_eq!(unix_seconds("2024-02-29T12:00:00Z"), Some(1_709_208_000));
         assert_eq!(unix_seconds("2026-10-25"), None);
-        assert_eq!(elapsed(30), "1分足らず");
-        assert_eq!(elapsed(3 * 86400 + 5), "3日");
+        assert_eq!(rough_elapsed(30), "1分足らず");
+        assert_eq!(rough_elapsed(3 * 86400 + 5), "3日");
     }
 
     #[test]

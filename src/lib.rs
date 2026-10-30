@@ -23,6 +23,7 @@ pub mod notes;
 pub mod pr;
 pub mod probe;
 pub mod prompt;
+pub mod recent;
 pub mod record;
 pub mod review;
 pub mod run;

@@ -365,6 +365,14 @@ fn run(command: Commands) -> Result<ExitCode> {
             for notice in tick_notices(&home, unix_now()) {
                 println!("  ※{notice}");
             }
+            let runs = agentcells::recent::read(&home);
+            println!("\n最近の実行（新しい順）");
+            if runs.is_empty() {
+                println!("  まだありません");
+            }
+            for run in agentcells::recent::latest(&runs, 5) {
+                println!("  {}", run.describe(unix_now()));
+            }
             println!();
             let mut reports = read_reports(&home)?;
             let now = unix_now();
@@ -395,6 +403,12 @@ fn run(command: Commands) -> Result<ExitCode> {
                 }
                 for line in &report.lines {
                     println!("  {}", line.describe(now));
+                    // 動いているものは、前回の結果より今の様子（上の「動いているcell」）を見る
+                    if !matches!(line.state, status::State::Working { .. })
+                        && let Some(run) = agentcells::recent::last_for(&runs, line)
+                    {
+                        println!("      {}", run.describe_last(now));
+                    }
                 }
             }
             if stopped {
@@ -421,8 +435,10 @@ fn run(command: Commands) -> Result<ExitCode> {
                 std::thread::spawn(move || {
                     loop {
                         let read = read_reports(&home);
+                        let runs = agentcells::recent::read(&home);
                         {
                             let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                            s.runs = runs;
                             match read {
                                 Ok(products) => {
                                     s.products = products;
