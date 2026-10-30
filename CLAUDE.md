@@ -46,6 +46,9 @@ PR（cellのものも）では、版と `CHANGELOG.md` を変えない。PRご�
 
 - PRをマージしたら、続けてmainで版を上げ、タグを付ける（リリースの準備のPRなら、版はもう上がっているので、タグだけを付ける。その前に `changes/` が空かを見る。準備のPRを開いている間にほかのPRがマージされて残っていれば、そのまま付けずに、準備のPRに取り込み直すか次の版に回すかを決める）。するのは、mainを扱うこの開発のエージェント（ユーザーがマージを伝えたときか、次に作業を始めたときに `changes/` を見て気づく）。版にしないままにすると、動いているagentcellsが、古い版の番号のまま新しい変更を含むことになる（inspectorは、その版のタグのソースを読む）
 - 版を上げるときは、`changes/` のファイルをすべて、その版の節にまとめてから消す。足したことが1つでもあればマイナー、直しだけならパッチを上げる
+- これは `scripts/release.sh` がする（`changes/` をまとめ、`Cargo.toml` と `Cargo.lock` の版をそろえ、`changes/` を消す。コミットとタグはしない）。先に `scripts/release.sh --dry-run` で、上げる版と書き足す節を見る。まとめたあと、CHANGELOGの節を読み、なぜやったかが足りなければ書き足す。cellとして動くときは、使う人の設定の `commands` に入っていれば、`agentcells cell run` で使う（なければ、同じ手順を手でする）
+- mainで直接作業したときも、`changes/` に書いてから `scripts/release.sh` で上げてよい
+- `scripts/release.sh --check` は、`Cargo.toml`、`Cargo.lock`、CHANGELOGの最新の版がそろっているかを確かめる。`cargo test` も同じことを確かめる（`tests/release_script.rs`）
 
 ## レビュー
 
