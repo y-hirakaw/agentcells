@@ -26,8 +26,8 @@ pub(super) struct Branch {
 pub(super) enum Pushed {
     /// 新しいコミットがない（か、pushしないcell）
     Nothing,
-    /// 確かめで止めた。人間に回す理由
-    Refused(String),
+    /// 確かめで止めた。人間に回す理由と、betterleaksが当てたものを通すときに書く項目（手元にだけ出す）
+    Refused(String, Vec<crate::config::AllowSecret>),
     /// pushした。IssueからならPRの番号
     Done(Option<u64>),
     /// 人間に回すので、PRは作らずに、ブランチだけをpushした（次の実行は、そこから続ける）。
@@ -336,6 +336,7 @@ impl Runner<'_> {
             &branch.name,
             &ready.placed_blobs,
             self.scanner,
+            &ready.allow_secrets,
         )? {
             // pushしない作業も、人が読んだり取り出したりできるように、手元に残す（作業場所は消えるため）
             let text = format!(
@@ -344,7 +345,7 @@ impl Runner<'_> {
                 refusal.next,
                 self.keep_work(place, staging.path(), branch)
             );
-            return Ok(Pushed::Refused(text));
+            return Ok(Pushed::Refused(text, refusal.allow));
         }
         crate::pr::push_staged(self.probe, write, staging.path(), &work.repo, &branch.name)?;
         if work.item == Target::PullRequest {
@@ -379,11 +380,14 @@ impl Runner<'_> {
                 );
                 let found = actions::scan_text(self.scanner, &body)?;
                 if !found.is_empty() {
-                    return Ok(Pushed::Refused(format!(
-                        "PRの本文に秘密らしいものがあったので、PRを作りませんでした（ブランチ {} はpushしました）。agentcellsを動かしている人は、手元の記録（{}）を確かめてください",
-                        branch.name,
-                        place.run_name()
-                    )));
+                    return Ok(Pushed::Refused(
+                        format!(
+                            "PRの本文に秘密らしいものがあったので、PRを作りませんでした（ブランチ {} はpushしました）。agentcellsを動かしている人は、手元の記録（{}）を確かめてください",
+                            branch.name,
+                            place.run_name()
+                        ),
+                        Vec::new(),
+                    ));
                 }
                 let args = crate::pr::create_args(
                     &work.repo,

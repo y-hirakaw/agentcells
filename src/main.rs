@@ -738,6 +738,9 @@ fn run(command: Commands) -> Result<ExitCode> {
                     if let Some(note) = agentcells::blocked::note(&report.blocked) {
                         println!("{note}");
                     }
+                    if let Some(note) = agentcells::allowed::note(&report.allow_secrets) {
+                        println!("{note}");
+                    }
                     session.ran(next, skipped);
                     runs = session.runs();
                     // 使用量が設定を超えたら、上限に当たる前に止まる（使う人が自分で使う分を残すため）

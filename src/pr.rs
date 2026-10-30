@@ -7,6 +7,7 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
+use crate::config::AllowSecret;
 use crate::error::{Error, Result};
 use crate::github::{Credentials, ISOLATED_GIT_ENV};
 use crate::home::RepoName;
@@ -165,17 +166,24 @@ pub fn autorun(path: &str) -> Option<&'static str> {
 pub struct Refusal {
     pub reason: String,
     pub next: &'static str,
+    /// betterleaksが当てたものを通すときに `allow_secrets` に書く項目。中身のハッシュが入るので、
+    /// 公開のコメントには書かず、手元にだけ出す（[`crate::allowed`]）
+    pub allow: Vec<AllowSecret>,
 }
 
 impl Refusal {
     fn new(reason: String, next: &'static str) -> Self {
-        Refusal { reason, next }
+        Refusal {
+            reason,
+            next,
+            allow: Vec::new(),
+        }
     }
 }
 
 const NEXT_MERGE: &str = "agentcellsは、ベースのブランチ（mainなど）を取り込むマージだけをpushします。ほかのブランチを取り込んだマージは、中身を確かめきれないためです。ぶつかりを手で解消してPRのブランチ（PRがまだなければ ac/ で始まるブランチ）にpushしてから、ここにコメントしてください。AIの作業は、下の作業から読めます";
 const NEXT_GUARDED: &str = "この変更が本当に要るなら、人が中身を確かめて、手で入れてください。要らないなら、それを入れずに進めるよう、ここにコメントで頼んでください";
-const NEXT_SECRET: &str = "秘密が入らないように直すよう、ここにコメントで頼んでください。秘密ではない（見誤り）なら、agentcellsを動かしている人が中身を確かめてから、手で入れてください";
+const NEXT_SECRET: &str = "秘密が入らないように直すよう、ここにコメントで頼んでください。秘密ではない（見誤り）なら、agentcellsを動かしている人が中身を確かめてから、設定（config.toml）のproductの allow_secrets に、手元（tickの出力）に出した項目を書くと、次からは通ります（今回の変更は、手で入れるか、cellにもう一度頼んでください）";
 
 /// pushする前に、ブランチに足したコミット（`base` から `branch` まで。ベースのブランチ `upstream` から
 /// 取り込んだものは除く）をすべて確かめる。
@@ -191,6 +199,7 @@ const NEXT_SECRET: &str = "秘密が入らないように直すよう、ここ�
 /// 両方の親を自動でマージした結果からの差分（`--remerge-diff`）で確かめる。ぶつかりの直しと、マージに
 /// 紛れ込ませた変更は、そこに出る。ベースのブランチのコミットは確かめない（書き込みの権限を持つ人が
 /// pushしたもので、AIが足したものではないため）
+#[allow(clippy::too_many_arguments)]
 pub fn verify(
     probe: &dyn Probe,
     staging: &Path,
@@ -199,6 +208,7 @@ pub fn verify(
     branch: &str,
     placed_blobs: &[String],
     scanner: &Path,
+    allow_secrets: &[AllowSecret],
 ) -> Result<Option<Refusal>> {
     let staging_path = path_str(staging)?;
     let tip = format!("refs/heads/{branch}");
@@ -345,16 +355,20 @@ pub fn verify(
     let lines = crate::actions::added_lines(&patches);
     if !lines.is_empty() {
         let input: String = lines.iter().map(|l| format!("{}\n", l.text)).collect();
-        let found = crate::actions::scan_text(scanner, &input)?;
-        if let Some((line, rule)) = found.first() {
-            let place = lines
-                .get(line.wrapping_sub(1))
-                .map(|l| format!("{}:{}", l.path, l.line))
-                .unwrap_or_else(|| "場所不明".to_string());
-            return Ok(Some(Refusal::new(
-                format!("コミットに秘密らしいもの（{rule}、{place}）が入っています"),
+        let hits = crate::actions::scan_hits(scanner, &input)?;
+        let refused = crate::actions::not_allowed(hits, &lines, allow_secrets);
+        if !refused.is_empty() {
+            // 公開のコメントに出るので、場所と種類だけを書く（項目は手元に）
+            let places: Vec<String> = refused.iter().map(|r| r.place()).collect();
+            let mut refusal = Refusal::new(
+                format!(
+                    "コミットに秘密らしいものが入っています: {}",
+                    places.join("、")
+                ),
                 NEXT_SECRET,
-            )));
+            );
+            refusal.allow = refused.into_iter().filter_map(|r| r.allow).collect();
+            return Ok(Some(refusal));
         }
     }
     Ok(None)
@@ -564,13 +578,21 @@ mod tests {
             Credentials::new(crate::github::Source::App, "ghs_test".to_string()).unwrap()
         }
 
-        /// 偽のbetterleaks。「FAKE-SECRET」を含む行を見つけたことにする。
+        /// 偽のbetterleaks。「FAKE-SECRET」を含む行を、すべて見つけたことにする。
         fn fake_scanner(dir: &Path) -> std::path::PathBuf {
             use std::os::unix::fs::PermissionsExt;
             let path = dir.join("fake-betterleaks");
             std::fs::write(
                 &path,
-                "#!/bin/sh\nn=$(grep -n FAKE-SECRET | head -1 | cut -d: -f1)\nif [ -n \"$n\" ]; then echo \"[{\\\"RuleID\\\":\\\"fake\\\",\\\"StartLine\\\":$n}]\"; exit 1; fi\necho '[]'\n",
+                r#"#!/bin/sh
+n=$(grep -n FAKE-SECRET | cut -d: -f1)
+if [ -n "$n" ]; then
+  printf '['; sep=''
+  for i in $n; do printf '%s{"RuleID":"fake","StartLine":%s}' "$sep" "$i"; sep=','; done
+  echo ']'; exit 1
+fi
+echo '[]'
+"#,
             )
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -646,6 +668,7 @@ mod tests {
                 "ac/x",
                 &[],
                 &scanner,
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -670,6 +693,7 @@ mod tests {
                 "ac/x",
                 &[],
                 &scanner,
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -727,6 +751,7 @@ mod tests {
                 "ac/x",
                 &[],
                 &scanner,
+                &[],
             );
             assert_eq!(found.unwrap(), None);
 
@@ -746,6 +771,7 @@ mod tests {
                     "ac/x",
                     &[],
                     &scanner,
+                    &[],
                 )
                 .unwrap()
                 .unwrap();
@@ -766,6 +792,7 @@ mod tests {
                 "ac/x",
                 &[],
                 &scanner,
+                &[],
             )
             .unwrap();
             assert_eq!(found, None);
@@ -799,6 +826,7 @@ mod tests {
                 "ac/x",
                 &[hash],
                 &scanner,
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -822,11 +850,77 @@ mod tests {
                     "ac/x",
                     &[],
                     &scanner,
+                    &[],
                 )
                 .unwrap()
                 .unwrap();
                 assert!(reason.reason.contains(expect), "{path}: {reason:?}");
             }
+
+            // 人が通したもの（種類、ファイル、中身）は通す
+            let dir = tempfile::tempdir().unwrap();
+            let scanner = fake_scanner(dir.path());
+            let (staging, base) = staged(dir.path(), &[("testdata/key.txt", "FAKE-SECRET")]);
+            let check = |allow: &[AllowSecret]| {
+                verify(
+                    &SystemProbe,
+                    staging.path(),
+                    &base,
+                    MAIN,
+                    "ac/x",
+                    &[],
+                    &scanner,
+                    allow,
+                )
+                .unwrap()
+            };
+            let allow = |rule: &str, path: &str, sha256: &str| AllowSecret {
+                rule: rule.to_string(),
+                path: path.to_string(),
+                sha256: sha256.to_string(),
+            };
+            // 中身は「FAKE-SECRET」
+            let digest = "2e7ebf112d677b99";
+            assert!(check(&[allow("fake", "testdata/key.txt", digest)]).is_none());
+            let refused = check(&[
+                allow("fake", "TestData/key.txt", digest),
+                allow("other", "testdata/key.txt", digest),
+                allow("fake", "testdata/key.txt", "0000000000000000"),
+            ])
+            .unwrap();
+            // 公開のコメントに出る理由には、場所と種類だけを書き、項目（ハッシュ）は手元に出す分に入れる
+            assert_eq!(
+                refused.reason,
+                "コミットに秘密らしいものが入っています: testdata/key.txt:1（fake）"
+            );
+            assert!(!refused.reason.contains(digest) && !refused.next.contains(digest));
+            assert_eq!(refused.allow, [allow("fake", "testdata/key.txt", digest)]);
+            assert!(refused.next.contains("allow_secrets"), "{refused:?}");
+
+            // 当たったものは、すべて出す
+            let dir = tempfile::tempdir().unwrap();
+            let scanner = fake_scanner(dir.path());
+            let (staging, base) = staged(
+                dir.path(),
+                &[("a.txt", "FAKE-SECRET"), ("b.txt", "FAKE-SECRET")],
+            );
+            let refused = verify(
+                &SystemProbe,
+                staging.path(),
+                &base,
+                MAIN,
+                "ac/x",
+                &[],
+                &scanner,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                refused.reason.contains("a.txt:1（fake）、b.txt:1（fake）"),
+                "{refused:?}"
+            );
+            assert_eq!(refused.allow.len(), 2);
         }
 
         /// トークンを環境変数から書き出すスクリプト。これが動いたら漏れたことになる。

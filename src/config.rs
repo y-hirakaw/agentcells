@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::home::RepoName;
@@ -34,6 +34,7 @@ pub const TEMPLATE: &str = r#"# agentcellsの設定。書き方は https://githu
 # test = "npm test"
 # build = "npm run build"
 #
+# allow_secrets = [{ rule = "private-key", path = "testdata/key.pem", sha256 = "0123456789abcdef" }]  # betterleaksが当てても、秘密でないと確かめたもの。断ったときに出る行を、中身を確かめてから写す。コミットに足す行にだけ効く
 # protected = ["src/hook.rs", "prompts/"]  # 守るファイル（リポジトリからの相対パス。ディレクトリならその下すべて）。変えたPRは、レビューのcellに特に確かめさせ、検品に回すときにそう書き足す
 #
 # [product.next]                     # このproductでだけ、cellの進め先を替える（cellはファイル全体で1つずつ定義するため）
@@ -200,6 +201,79 @@ pub struct Product {
     /// 守るファイル（hookや権限、CIの設定など、AIの守りそのもの）。リポジトリからの相対パスで、その下すべても含む。変えたPRは、レビューのcellに特に確かめさせ、検品に回すときにCLIがそう書き足す
     #[serde(default)]
     pub protected: Vec<String>,
+    /// betterleaksが当てても、人が秘密でないと確かめたもの（種類とパス）。コミットに足す行にだけ効く
+    #[serde(default)]
+    pub allow_secrets: Vec<AllowSecret>,
+}
+
+/// betterleaksが当てても通すもの（`allow_secrets`）。テストのためのダミーの鍵など、見誤りでコミットできず、
+/// 毎回人間に回るのを避けるため。AIが書けない `config.toml` にだけ書ける（リポジトリの `.betterleaks.toml` は、
+/// AIが書けるので読まない）。
+///
+/// 人が確かめた中身だけを通すよう、当たった行の中身のハッシュに結びつける。種類と場所だけで通すと、
+/// その場所に、置いた秘密の値などを書き写せば通ってしまうため。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowSecret {
+    /// betterleaksの種類（`generic-api-key` など）
+    pub rule: String,
+    /// 当たったファイル（リポジトリからの相対パス。gitが出す綴りのまま。大文字と小文字も区別する）
+    pub path: String,
+    /// 当たった行（複数行なら、始めから終わりまでを改行でつないだもの）の中身の SHA-256 の、頭の16字（16進数）。
+    /// 断ったときに、CLIがこの項目の書き方ごと出す
+    pub sha256: String,
+}
+
+/// [`AllowSecret::sha256`] の長さ（16進数の字数）。
+pub const SECRET_DIGEST_LEN: usize = 16;
+
+impl AllowSecret {
+    /// `path` の、中身のハッシュが `digest` の行に、`rule` が当たったものを通すか。
+    pub fn allows(&self, rule: &str, path: &str, digest: &str) -> bool {
+        self.rule == rule && self.path == path && self.sha256.eq_ignore_ascii_case(digest)
+    }
+
+    /// 行の中身のハッシュ（[`AllowSecret::sha256`] に書くもの）。
+    pub fn digest(text: &str) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .take(SECRET_DIGEST_LEN / 2)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// `config.toml` に書く形（`{ rule = "...", path = "...", sha256 = "..." }`）。
+    pub fn to_toml(&self) -> String {
+        format!(
+            "{{ rule = {}, path = {}, sha256 = {} }}",
+            toml::Value::String(self.rule.clone()),
+            toml::Value::String(self.path.clone()),
+            toml::Value::String(self.sha256.clone())
+        )
+    }
+}
+
+/// `path`（リポジトリからの相対パス）が、`entry` そのものか、その下か。
+/// `/` で終えるかどうかによらない（ディレクトリをsubmoduleやファイルに置き換えたときも当たるように）。
+/// 大文字と小文字は区別しない（macOSでは同じファイルになる）。
+fn under(entry: &str, path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    let entry = entry
+        .strip_suffix('/')
+        .unwrap_or(entry)
+        .to_ascii_lowercase();
+    path.strip_prefix(&entry)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// gitのパスと同じ形（リポジトリからの相対パス。`.` や `..`、`\`、ワイルドカードがない）か。
+/// 違えば、何にも当たらないまま、守った（通した）つもりになる。
+fn is_repo_path(entry: &str) -> bool {
+    let path = entry.strip_suffix('/').unwrap_or(entry);
+    !path
+        .split('/')
+        .any(|part| matches!(part, "" | "." | "..") || part.contains(['\\', '*', '?', '[']))
 }
 
 impl Product {
@@ -220,15 +294,7 @@ impl Product {
     /// 書いたパスそのものと、その下すべてに当たる（`/` で終えるかどうかによらない。ディレクトリを
     /// submoduleやファイルに置き換えたときも当たるように）。大文字と小文字は区別しない（macOSでは同じファイルになる）。
     pub fn protects(&self, path: &str) -> bool {
-        let path = path.to_ascii_lowercase();
-        self.protected.iter().any(|entry| {
-            let entry = entry
-                .strip_suffix('/')
-                .unwrap_or(entry)
-                .to_ascii_lowercase();
-            path.strip_prefix(&entry)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        })
+        self.protected.iter().any(|entry| under(entry, path))
     }
 }
 
@@ -597,14 +663,32 @@ impl Config {
                 }
             }
             for entry in &p.protected {
-                // gitのパスと同じ形でないと、何にも当たらないまま守ったつもりになる
-                let path = entry.strip_suffix('/').unwrap_or(entry);
-                if path.split('/').any(|part| {
-                    matches!(part, "" | "." | "..") || part.contains(['\\', '*', '?', '['])
-                }) {
+                if !is_repo_path(entry) {
                     problems.push(format!(
                         "product「{}」の protected の「{entry}」は、リポジトリからの相対パスで書いてください（例: src/hook.rs、prompts/。`.` や `..`、`\\`、`*` などのワイルドカードは使えません）",
                         p.name
+                    ));
+                }
+            }
+            for allow in &p.allow_secrets {
+                if allow.rule.trim().is_empty() || allow.rule.contains(['*', '?', '[']) {
+                    problems.push(format!(
+                        "product「{}」の allow_secrets の rule は、betterleaksが出した種類の名前をそのまま書いてください（例: generic-api-key。ワイルドカードは使えません）",
+                        p.name
+                    ));
+                }
+                if !is_repo_path(&allow.path) || allow.path.ends_with('/') {
+                    problems.push(format!(
+                        "product「{}」の allow_secrets の path「{}」は、当たったファイルの、リポジトリからの相対パスで書いてください（例: testdata/key.pem。ディレクトリや、`.` や `..`、`\\`、`*` などのワイルドカードは使えません）",
+                        p.name, allow.path
+                    ));
+                }
+                if allow.sha256.len() != SECRET_DIGEST_LEN
+                    || !allow.sha256.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    problems.push(format!(
+                        "product「{}」の allow_secrets の sha256「{}」は、断ったときに出た{SECRET_DIGEST_LEN}字の16進数をそのまま書いてください",
+                        p.name, allow.sha256
                     ));
                 }
             }
@@ -1083,6 +1167,81 @@ timeout_minutes = 10
         let limit = "あ".repeat(DESCRIPTION_LIMIT);
         assert!(Config::parse(&with(&limit), dir.path()).is_ok());
         assert!(problems_of(&with(&format!("{limit}い"))).contains("description は200字まで"));
+    }
+
+    #[test]
+    fn allow_secrets_name_a_rule_a_file_and_the_content() {
+        let with = |entry: &str| {
+            VALID.replacen(
+                "[[cell]]",
+                &format!("allow_secrets = [{entry}]\n\n[[cell]]"),
+                1,
+            )
+        };
+        let dir = base_with_prompts(&["triage.md", "review.md"]);
+        let entry =
+            r#"{ rule = "private-key", path = "testdata/a.pem", sha256 = "2E7EBF112D677B99" }"#;
+        let config = Config::parse(&with(entry), dir.path()).unwrap();
+        let allow = &config.products[0].allow_secrets[0];
+        // 中身は「FAKE-SECRET」。ハッシュの大文字と小文字は問わない
+        let digest = AllowSecret::digest("FAKE-SECRET");
+        assert_eq!(digest, "2e7ebf112d677b99");
+        assert!(allow.allows("private-key", "testdata/a.pem", &digest));
+        // ファイルは、綴りのとおり（ディレクトリの下や、大文字と小文字の違うものは別）
+        assert!(!allow.allows("private-key", "testdata", &digest));
+        assert!(!allow.allows("private-key", "TestData/a.pem", &digest));
+        assert!(!allow.allows("aws-access-token", "testdata/a.pem", &digest));
+        assert!(!allow.allows("private-key", "testdata/a.pem", &AllowSecret::digest("x")));
+        assert_eq!(AllowSecret::digest("a\"b").len(), SECRET_DIGEST_LEN);
+        let quoted = AllowSecret {
+            rule: "r".to_string(),
+            path: "a \"b\".txt".to_string(),
+            sha256: digest.clone(),
+        };
+        // 書く項目は、そのまま config.toml に写せる（読み戻すと同じ）
+        #[derive(Deserialize)]
+        struct Entry {
+            x: AllowSecret,
+        }
+        let back: Entry = toml::from_str(&format!("x = {}", quoted.to_toml())).unwrap();
+        assert_eq!(back.x, quoted);
+        let ok = r#"sha256 = "2e7ebf112d677b99""#;
+        for (entry, expect) in [
+            (format!(r#"{{ rule = "", path = "a", {ok} }}"#), "rule"),
+            (format!(r#"{{ rule = "*", path = "a", {ok} }}"#), "rule"),
+            (
+                format!(r#"{{ rule = "x", path = "../x", {ok} }}"#),
+                "path「../x」",
+            ),
+            (
+                format!(r#"{{ rule = "x", path = "test*/a", {ok} }}"#),
+                "path「test*/a」",
+            ),
+            (
+                format!(r#"{{ rule = "x", path = "testdata/", {ok} }}"#),
+                "path「testdata/」",
+            ),
+            (format!(r#"{{ rule = "x", path = "", {ok} }}"#), "path「」"),
+            (
+                r#"{ rule = "x", path = "a", sha256 = "2e7e" }"#.to_string(),
+                "sha256「2e7e」",
+            ),
+            (
+                r#"{ rule = "x", path = "a", sha256 = "zz7ebf112d677b99" }"#.to_string(),
+                "sha256「zz7ebf112d677b99」",
+            ),
+        ] {
+            assert!(problems_of(&with(&entry)).contains(expect), "{entry}");
+        }
+        // 書き間違えたキーや、足りないキーは断る
+        assert!(
+            Config::parse(
+                &with(r#"{ rule = "x", paths = "a", sha256 = "2e7ebf112d677b99" }"#),
+                dir.path()
+            )
+            .is_err()
+        );
+        assert!(Config::parse(&with(r#"{ rule = "x", path = "a" }"#), dir.path()).is_err());
     }
 
     #[test]

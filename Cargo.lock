@@ -4,12 +4,13 @@ version = 4
 
 [[package]]
 name = "agentcells"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "clap",
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
 ]

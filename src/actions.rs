@@ -14,6 +14,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::AllowSecret;
 use crate::error::{Error, Result};
 use crate::github::ISOLATED_GIT_ENV;
 
@@ -54,6 +55,9 @@ pub struct Context {
     /// cellの `commands` で、使えるコマンドを絞っているか（使えないときに、どこで絞っているかを伝えるため）
     #[serde(default)]
     pub commands_limited: bool,
+    /// betterleaksが当てても通すもの（productの `allow_secrets`）
+    #[serde(default)]
+    pub allow_secrets: Vec<AllowSecret>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +616,36 @@ struct Finding {
     rule: String,
     #[serde(rename = "StartLine")]
     line: usize,
+    /// 複数行にわたるもの（鍵など）の終わりの行。なければ始めの行
+    #[serde(rename = "EndLine", default)]
+    end: usize,
+}
+
+/// betterleaksが当てたもの。行は、渡した文章の行（1から）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub rule: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// コミットに足す行で当たり、通さないもの。
+pub(crate) struct Refused<'a> {
+    pub(crate) rule: String,
+    /// 当たった始めの行（行が分からなければ `None`）
+    pub(crate) line: Option<&'a AddedLine>,
+    /// 人が確かめて通すときに、`allow_secrets` に書く項目。1つのファイルの中で当たったものだけ
+    pub(crate) allow: Option<AllowSecret>,
+}
+
+impl Refused<'_> {
+    /// 場所と種類（`a.txt:3（private-key）`）。
+    pub(crate) fn place(&self) -> String {
+        match self.line {
+            Some(l) => format!("{}:{}（{}）", l.path, l.line, self.rule),
+            None => format!("場所不明（{}）", self.rule),
+        }
+    }
 }
 
 /// コミットに足す行を、betterleaksで調べる。秘密らしいものがあれば断る（入れたものはステージに残す）。
@@ -648,15 +682,21 @@ fn scan_secrets(context: &Context, against: Option<&str>) -> Result<()> {
     }
     let input: String = lines.iter().map(|l| format!("{}\n", l.text)).collect();
     let hint = "コミットできません。人間に回してください（needs-human）";
-    let found = scan_text(&context.scanner, &input).map_err(|e| e.with_hint(hint))?;
-    if found.is_empty() {
+    let hits = scan_hits(&context.scanner, &input).map_err(|e| e.with_hint(hint))?;
+    let refused = not_allowed(hits, &lines, &context.allow_secrets);
+    if refused.is_empty() {
         return Ok(());
     }
-    let list: Vec<String> = found
+    let list: Vec<String> = refused
         .iter()
-        .map(|(line, rule)| match lines.get(line.wrapping_sub(1)) {
-            Some(l) => format!("  - {}:{}（{rule}）", l.path, l.line),
-            None => format!("  - 場所不明（{rule}）"),
+        .map(|r| match &r.allow {
+            Some(allow) => format!(
+                "  - {}。{}{}",
+                r.place(),
+                crate::allowed::MARK,
+                allow.to_toml()
+            ),
+            None => format!("  - {}", r.place()),
         })
         .collect();
     Err(Error::new(format!(
@@ -664,8 +704,45 @@ fn scan_secrets(context: &Context, against: Option<&str>) -> Result<()> {
         list.join("\n")
     ))
     .with_hint(
-        "秘密を消してから、もう一度コミットしてください。秘密でないなら、人間に回してください（needs-human）",
+        "秘密を消してから、もう一度コミットしてください。秘密でないなら、人間に回し（needs-human）、場所と種類をコメントに書いてください。allow_secrets に書く項目は、中身のハッシュが入るので、コメントには書かないでください（CLIが手元に出し、人が中身を確かめて設定に書けば通ります）",
     ))
+}
+
+/// betterleaksが当てたもの（足した行の番号）のうち、`allow` で通さないもの。
+/// 通すのは、当たった行がすべて1つのファイルにあり、種類とファイルと中身のハッシュが `allow` のどれかと
+/// 合うものだけ（ファイルの境目をまたいで当たったものや、行が分からないものは通さない）。
+pub(crate) fn not_allowed<'a>(
+    hits: Vec<Hit>,
+    lines: &'a [AddedLine],
+    allow: &[AllowSecret],
+) -> Vec<Refused<'a>> {
+    hits.into_iter()
+        .filter_map(|hit| {
+            let first = lines.get(hit.start.wrapping_sub(1));
+            let span = lines.get(hit.start.wrapping_sub(1)..hit.end.max(hit.start));
+            let item = span
+                .filter(|span| span.iter().all(|l| Some(&l.path) == first.map(|f| &f.path)))
+                .zip(first)
+                .map(|(span, first)| {
+                    let text: Vec<&str> = span.iter().map(|l| l.text.as_str()).collect();
+                    AllowSecret {
+                        rule: hit.rule.clone(),
+                        path: first.path.clone(),
+                        sha256: AllowSecret::digest(&text.join("\n")),
+                    }
+                });
+            let allowed = item.as_ref().is_some_and(|item| {
+                allow
+                    .iter()
+                    .any(|a| a.allows(&item.rule, &item.path, &item.sha256))
+            });
+            (!allowed).then_some(Refused {
+                rule: hit.rule,
+                line: first,
+                allow: item,
+            })
+        })
+        .collect()
 }
 
 /// 文章を、betterleaksの既定の決まりだけで調べる。見つかったものの行（1から）と種類を返す。
@@ -675,6 +752,14 @@ fn scan_secrets(context: &Context, against: Option<&str>) -> Result<()> {
 /// どれもAIが書けるので、AIが書けない `/` で動かし、設定を選ぶ環境変数を消し、allowのコメントを無視させる。
 /// 動かないときや、結果が読めないときはエラーにする（調べられなかったものを通さない）。
 pub fn scan_text(scanner: &Path, text: &str) -> Result<Vec<(usize, String)>> {
+    Ok(scan_hits(scanner, text)?
+        .into_iter()
+        .map(|hit| (hit.start, hit.rule))
+        .collect())
+}
+
+/// [`scan_text`] と同じく調べ、当たったものを、終わりの行も含めて返す。
+pub fn scan_hits(scanner: &Path, text: &str) -> Result<Vec<Hit>> {
     let mut command = Command::new(scanner);
     command
         .args([
@@ -724,7 +809,14 @@ pub fn scan_text(scanner: &Path, text: &str) -> Result<Vec<(usize, String)>> {
         Some(1) => {
             let findings: Vec<Finding> = serde_json::from_slice(&out.stdout)
                 .map_err(|e| Error::new(format!("betterleaksの結果を読めません: {e}")))?;
-            Ok(findings.into_iter().map(|f| (f.line, f.rule)).collect())
+            Ok(findings
+                .into_iter()
+                .map(|f| Hit {
+                    end: f.end.max(f.line),
+                    start: f.line,
+                    rule: f.rule,
+                })
+                .collect())
         }
         _ => Err(Error::new(format!(
             "betterleaksが失敗しました: {}",
@@ -1086,6 +1178,7 @@ mod tests {
             base: Some("main".to_string()),
             network: Vec::new(),
             commands_limited: false,
+            allow_secrets: Vec::new(),
         };
         (dir, context)
     }
@@ -1605,6 +1698,90 @@ echo "[]"
 
         std::fs::write(wt.join("a.txt"), "a\nok\n").unwrap();
         commit(&ctx, "fine").unwrap();
+    }
+
+    #[test]
+    fn commit_lets_through_findings_people_allowed() {
+        let (_dir, mut ctx) = setup();
+        let wt = ctx.worktree.clone();
+        ctx.allow_secrets = vec![AllowSecret {
+            rule: "fake".to_string(),
+            path: "testdata/key.txt".to_string(),
+            sha256: AllowSecret::digest("FAKE-SECRET"),
+        }];
+        std::fs::create_dir_all(wt.join("testdata")).unwrap();
+        std::fs::write(wt.join("testdata/key.txt"), "FAKE-SECRET\n").unwrap();
+        commit(&ctx, "fixture").unwrap();
+        // 通すのは、書いたファイルの、確かめた中身だけ（同じ場所に別の値を書いても通さない）
+        std::fs::write(
+            wt.join("testdata/key.txt"),
+            "FAKE-SECRET\nx = FAKE-SECRET-2\n",
+        )
+        .unwrap();
+        let err = commit(&ctx, "copy").unwrap_err();
+        assert!(
+            err.message.contains("testdata/key.txt:2（fake）"),
+            "{}",
+            err.message
+        );
+        std::fs::write(wt.join("testdata/key.txt"), "FAKE-SECRET\n").unwrap();
+        std::fs::write(wt.join("a.txt"), "FAKE-SECRET\n").unwrap();
+        let err = commit(&ctx, "leak").unwrap_err();
+        // 人が通すときに書く項目を、印を付けて出す（tickがclaudeの出力から拾い、手元にだけ出す）
+        assert!(
+            err.message.contains(&format!(
+                "a.txt:1（fake）。{}{{ rule = \"fake\", path = \"a.txt\", sha256 = \"{}\" }}",
+                crate::allowed::MARK,
+                AllowSecret::digest("FAKE-SECRET")
+            )),
+            "{}",
+            err.message
+        );
+        // AIには、項目（ハッシュ）をコメントに書かせない
+        assert!(err.hint.unwrap().contains("コメントには書かないで"));
+    }
+
+    #[test]
+    fn findings_across_files_or_unknown_lines_are_never_allowed() {
+        let line = |path: &str, text: &str| AddedLine {
+            path: path.to_string(),
+            line: 1,
+            text: text.to_string(),
+        };
+        let lines = [
+            line("testdata/k.pem", "a"),
+            line("testdata/k.pem", "b"),
+            line("z.txt", "c"),
+        ];
+        let hit = |start, end| Hit {
+            rule: "private-key".to_string(),
+            start,
+            end,
+        };
+        let allow = |sha256: String| AllowSecret {
+            rule: "private-key".to_string(),
+            path: "testdata/k.pem".to_string(),
+            sha256,
+        };
+        // 1つのファイルの中で、当たった行すべての中身で比べる
+        let both = allow(AllowSecret::digest("a\nb"));
+        assert!(not_allowed(vec![hit(1, 2)], &lines, std::slice::from_ref(&both)).is_empty());
+        let first = allow(AllowSecret::digest("a"));
+        assert_eq!(
+            not_allowed(vec![hit(1, 2)], &lines, std::slice::from_ref(&first)).len(),
+            1
+        );
+        // 境目をまたいだものは、始めのファイルを許していても通さず、書く項目も出さない
+        let refused = not_allowed(
+            vec![hit(2, 3)],
+            &lines,
+            &[allow(AllowSecret::digest("b\nc"))],
+        );
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].allow.is_none());
+        // 行が分からないもの
+        let refused = not_allowed(vec![hit(9, 9)], &lines, &[first]);
+        assert_eq!(refused[0].place(), "場所不明（private-key）");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod allowed;
 pub mod blocked;
 pub mod caches;
 pub mod config;

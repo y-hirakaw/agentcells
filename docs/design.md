@@ -545,6 +545,7 @@ issues = "y-hirakaw/agentcells"    # Issueを置くリポジトリ
 repos = ["y-hirakaw/agentcells"]   # 作業するリポジトリ
 cells = ["triage", "implement", "review"]
 protected = ["src/hook.rs", "prompts/"]  # 守るファイル（下の「守るファイル」）
+allow_secrets = [{ rule = "private-key", path = "testdata/key.pem", sha256 = "0123456789abcdef" }]  # betterleaksが当てても通すもの（「秘密を探す」）
 
 [product.next]                     # このproductでだけ、cellの進め先を替える（書かなければ [[cell]] の next）
 assess = ["stop", "done"]
@@ -764,6 +765,14 @@ write = []                                            # ホームの下で書か
 - betterleaksは、調べる場所の `.betterleaks.toml`・`.gitleaks.toml`・`.betterleaksignore` と、行の `betterleaks:allow` のコメントで見逃すものを決められる。どれもAIが書けるので、既定の決まりだけで調べる。足した行を標準入力で渡し、AIが書けない `/` で動かし、設定を選ぶ環境変数を消し、`--ignore-gitleaks-allow` を付ける
 - betterleaksの場所は、`tick` がsandboxの外で探して今の仕事のファイルに書く。PATHで探すと、別のものを動かされうるため
 - betterleaksが動かないときや、結果が読めないときは、コミットしない（人間に回す）
+- 見誤り（テストのためのダミーの鍵など）は、人が中身を確かめてから、`config.toml` のproductの `allow_secrets` に `{ rule = "<種類>", path = "<ファイル>", sha256 = "<中身のハッシュ>" }` と書けば通る。今は見誤りが1つあるだけで、その仕事はコミットできず、毎回人間に回るため
+  - 通すのは、種類（betterleaksの `RuleID`）、ファイル（リポジトリからの相対パス。gitが出す綴りのまま、大文字と小文字も区別する）、当たった行の中身（複数行なら、始めから終わりまでを改行でつないだもの）の SHA-256 の頭16字が、すべて合うものだけ。種類と場所だけで通すと、その場所に置いた秘密の値などを書き写せば、pushまで通ってしまうため。ダミーの鍵を変えたら、人が確かめ直す
+  - 当たった行がファイルの境目をまたぐもの（足した行を、ファイルをまたいで1つの入力にして調べるため、鍵の前半と後半を別のファイルに書くと1つに当たる）と、行が分からないものは通さない
+  - 断ったときは、そのまま写せる項目を、手元（tickの出力）にだけ出す。公開のコメントと、pushの前の確かめの理由には、場所と種類だけを書く（当たったものはすべて）。betterleaksの種類には、パスワードのような短い値の行を当てるものもあり、行の形が分かれば、ハッシュから値を総当たりで確かめられるため（sandboxが止めた通信の先と同じ扱い）
+  - `agentcells cell commit` が断ったときは、AIへのエラーに、印（`allow_secrets に書く項目: `）を付けて項目を書き、tickがclaudeの出力（コマンドの結果）から拾って手元に出す。AIには、項目はコメントに書かず、場所と種類だけを書くよう伝える。AIも同じ形の文を印字できるので、拾った項目は、人が中身を確かめてから書く材料にすぎない
+  - 書けるのは、AIが読み書きできない `config.toml` だけ（リポジトリの設定のファイルや allow のコメントは、AIが書けるので読まない）。tickが今の仕事のファイルに写して `agentcells cell commit` に渡し、pushの前の確かめには、tickが持っているものを使う
+  - 効くのは、コミットに足す行だけ。AIが書いて投稿する文章（コメント、PRの本文など）は、ファイルがないので通さない
+  - `doctor` は、`allow_secrets` を書いたproductを、注意として知らせる（一度書くと、忘れられたまま効き続けるため）
 - `doctor` は、betterleaksがあるかを確かめる
 - このリポジトリの開発でも使う。`.githooks/pre-commit` で、コミットする変更を調べる（`git config core.hooksPath .githooks` で有効にする）。CIでも、履歴の全部を調べる。テストのための鍵（`testdata/github-app-test-key.pem`）は `.betterleaks.toml` で外す
 

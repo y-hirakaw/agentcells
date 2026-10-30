@@ -284,6 +284,7 @@ mod tests {
             limited_until: None,
             near_limit: None,
             blocked: Vec::new(),
+            allow_secrets: Vec::new(),
             pr: None,
             model: Some("sonnet".into()),
             usage: Usage {

@@ -616,6 +616,7 @@ mod tests {
             sandbox,
             next: Default::default(),
             protected: Vec::new(),
+            allow_secrets: Vec::new(),
         }
     }
 

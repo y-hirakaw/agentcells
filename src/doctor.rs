@@ -352,6 +352,16 @@ fn check_config(home: &Home) -> (Check, Option<Config>) {
     }
     let mut warnings = settings::sandbox_warnings(&config);
     warnings.extend(settings::web_search_warnings(&config));
+    // 一度書くと、忘れられたまま効き続けるので、通しているものがあると知らせる
+    for p in &config.products {
+        if !p.allow_secrets.is_empty() {
+            warnings.push(format!(
+                "product「{}」の allow_secrets で、betterleaksが当てても通すものが{}件あります（要らなくなったら消してください）",
+                p.name,
+                p.allow_secrets.len()
+            ));
+        }
+    }
     let check = match &config {
         config if config.products.is_empty() => Check::warn(
             NAME,

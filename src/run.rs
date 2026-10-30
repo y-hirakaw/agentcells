@@ -81,6 +81,8 @@ pub struct Report {
     pub near_limit: Option<crate::limit::Near>,
     /// sandboxが止めた通信の先（手元にだけ出す。[`crate::blocked`]）
     pub blocked: Vec<String>,
+    /// betterleaksが当てたものを、通すときに `allow_secrets` に書く項目（手元にだけ出す。[`crate::allowed`]）
+    pub allow_secrets: Vec<crate::config::AllowSecret>,
     /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
     pub pr: Option<u64>,
     /// 使ったモデル（指定しなかったら `None`）
@@ -340,6 +342,7 @@ impl Runner<'_> {
                     limited_until: None,
                     near_limit: None,
                     blocked: Vec::new(),
+                    allow_secrets: Vec::new(),
                     pr: None,
                     model: None,
                     usage: Usage::default(),
@@ -517,6 +520,7 @@ impl Runner<'_> {
             base: branch.as_ref().map(|b| b.base.clone()),
             network: product.sandbox.network.clone(),
             commands_limited: cell.commands.is_some(),
+            allow_secrets: product.allow_secrets.clone(),
         };
         let context_path = place.run.join("context.json");
         context.save(&context_path)?;
@@ -562,6 +566,7 @@ impl Runner<'_> {
             .collect(),
             branch,
             placed_blobs,
+            allow_secrets: product.allow_secrets.clone(),
             task,
         })))
     }
@@ -658,6 +663,7 @@ impl Runner<'_> {
                 limited_until: Some(crate::limit::until(limit.and_then(|l| l.resets_at), now)),
                 near_limit: None,
                 blocked: Vec::new(),
+                allow_secrets: Vec::new(),
                 pr: None,
                 model: self.model.or(cell.model.as_deref()).map(str::to_string),
                 usage,
@@ -670,6 +676,7 @@ impl Runner<'_> {
         // コミットを確かめてpushし、IssueからならPRを作る（レビューのcellと、着手を確かめるcellはpushしない）
         let mut pr_number: Option<u64> = None;
         let mut kept_branch: Option<(String, Option<u64>)> = None;
+        let mut refused_allow: Vec<crate::config::AllowSecret> = Vec::new();
         // CLIが人間に回すとき（時間切れ、ラベルの変化など）は、pushしない。それでも、AIの作業が作業場所ごと
         // 消えないように、コミットがあれば手元に残す
         if overridden.is_some()
@@ -701,7 +708,10 @@ impl Runner<'_> {
                         ));
                     }
                 }
-                Pushed::Refused(reason) => overridden = Some(reason),
+                Pushed::Refused(reason, allow) => {
+                    overridden = Some(reason);
+                    refused_allow = allow;
+                }
                 Pushed::Done(number) => pr_number = number,
                 Pushed::Branch(name, open) => kept_branch = Some((name, open)),
             }
@@ -756,6 +766,17 @@ impl Runner<'_> {
         if !blocked.is_empty() && plan.destination == transition::Destination::NeedsHuman {
             text.push_str("\n\n");
             text.push_str(crate::blocked::COMMENT);
+        }
+        // betterleaksが当てたものを通すときに書く項目も、手元にだけ出す（中身のハッシュが入るため）
+        let mut allow_secrets = refused_allow;
+        for entry in crate::allowed::entries(&place.run.join(CLAUDE_LOG)) {
+            if !allow_secrets.contains(&entry) {
+                allow_secrets.push(entry);
+            }
+        }
+        if !allow_secrets.is_empty() && plan.destination == transition::Destination::NeedsHuman {
+            text.push_str("\n\n");
+            text.push_str(crate::allowed::COMMENT);
         }
         if let Some(reason) = &reason {
             if !text.is_empty() {
@@ -856,6 +877,7 @@ impl Runner<'_> {
             failure,
             limited_until: None,
             blocked,
+            allow_secrets,
             near_limit: limit.as_ref().and_then(|l| {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1044,6 +1066,8 @@ struct Ready {
     branch: Option<Branch>,
     /// 置いた秘密のファイルの中身のハッシュ（pushの前の確かめに使う）
     placed_blobs: Vec<String>,
+    /// betterleaksが当てても通すもの（productの `allow_secrets`）。pushの前の確かめに使う
+    allow_secrets: Vec<crate::config::AllowSecret>,
 }
 
 impl Ready {
