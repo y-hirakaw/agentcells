@@ -366,8 +366,14 @@ fn run(command: Commands) -> Result<ExitCode> {
                 println!("  ※{notice}");
             }
             println!();
-            let reports = read_reports(&home)?;
+            let mut reports = read_reports(&home)?;
             let now = unix_now();
+            let running = agentcells::running::load(&home);
+            let mut stopped = false;
+            for line in reports.iter_mut().flat_map(|(_, r)| r.lines.iter_mut()) {
+                line.check_stopped(running.as_ref().map(|(r, alive)| (r, *alive)), now);
+                stopped |= matches!(line.state, status::State::Stopped { .. });
+            }
             if reports.is_empty() {
                 println!("productがないので、扱っているIssueはありません");
             }
@@ -390,6 +396,9 @@ fn run(command: Commands) -> Result<ExitCode> {
                 for line in &report.lines {
                     println!("  {}", line.describe(now));
                 }
+            }
+            if stopped {
+                println!("\n※{}", status::STOPPED_HINT);
             }
             // スクリプトから呼んだときに、読めなかったことに気づけるように
             Ok(if failed {

@@ -23,10 +23,15 @@ use crate::guard::Actors;
 use crate::home::RepoName;
 use crate::labels::{IN_REVIEW, NEEDS_HUMAN, WORKING};
 use crate::probe::Probe;
+use crate::running::Running;
 
 /// Issueの状態。並べる順に書く。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum State {
+    /// `ac:working` が付いているのに、そのIssue/PRでcellが動いていない。tickが途中で止まり
+    /// （ログアウト、Ctrl-Cなど）、ラベルが残ったもの。tickは拾わないので、人が片付けるまで止まったまま。
+    /// GitHubから読んだときは `Working` で、動いているcellと比べて [`Line::check_stopped`] が替える
+    Stopped { cell: Option<String> },
     /// cellが動いている（`ac:working`）
     Working { cell: Option<String> },
     /// 人間の回答や作業を待っている（`ac:needs-human`）
@@ -42,6 +47,8 @@ pub enum State {
 impl State {
     fn describe(&self) -> String {
         match self {
+            State::Stopped { cell: Some(cell) } => format!("止まったまま {cell}"),
+            State::Stopped { cell: None } => "止まったまま".to_string(),
             State::Working { cell: Some(cell) } => format!("作業中 {cell}"),
             State::Working { cell: None } => "作業中".to_string(),
             State::NeedsHuman => "返事待ち".to_string(),
@@ -82,6 +89,9 @@ pub struct Report {
     /// 多すぎて全部を見ていないことなど
     pub notes: Vec<String>,
 }
+
+/// 止まったままの行があるときに、添える説明。
+pub const STOPPED_HINT: &str = "止まったまま: tickが途中で止まり、`ac:working` が残っています（ほかのマシンでagentcellsを動かしていなければ）。tickは拾わないので、`ac:working` を外し、cellのラベルを付け直してください";
 
 /// 1回に読む件数。これより多ければ、更新の新しい順にこれだけ見る。[`QUERY`] の `first` も同じ数にする。
 const LIMIT: usize = 100;
@@ -485,6 +495,40 @@ fn labeler_note(state: &State, labeled: Option<&Labeled>, actors: &Actors) -> Op
 }
 
 impl Line {
+    /// `ac:working` が付いてから、tickが動いているcellの印（[`crate::running`]）を書くまでの間は、
+    /// 止まったとみなさない（秒）。
+    const STOPPED_AFTER: u64 = 120;
+
+    /// その行のIssueかPRで、cellが動いているか。IssueとPRは、同じリポジトリで番号を分け合うので、番号で見る。
+    pub fn runs(&self, running: &Running) -> bool {
+        [&self.issue, &self.pr].into_iter().flatten().any(|item| {
+            item.number == running.number
+                && item.repo.to_string().eq_ignore_ascii_case(&running.repo)
+        })
+    }
+
+    /// 作業中の行のうち、そのIssue/PRでcellが動いていないもの（動かしているtickがもういないものも）を、
+    /// 止まったままにする。`running` は、動いているcellと、それを動かしているtickがまだ動いているか。
+    /// ラベルが付いてから [`Self::STOPPED_AFTER`] たつまでは、動き始めたところかもしれないので、作業中のままにする
+    /// （付いた時刻が読めなければ、止まったとみなす）。ほかのマシンで動かしているagentcellsのcellは見えないので、
+    /// それも止まったままに見える
+    pub fn check_stopped(&mut self, running: Option<(&Running, bool)>, now: u64) {
+        let State::Working { cell } = &self.state else {
+            return;
+        };
+        if running.is_some_and(|(r, alive)| alive && self.runs(r)) {
+            return;
+        }
+        let recent = self
+            .since
+            .as_deref()
+            .and_then(unix_seconds)
+            .is_some_and(|at| now.saturating_sub(at) < Self::STOPPED_AFTER);
+        if !recent {
+            self.state = State::Stopped { cell: cell.clone() };
+        }
+    }
+
     /// 1行で書く。`now` は今の時刻（UNIXの秒）で、ラベルが付いてからの長さを出すのに使う。
     /// タイトルはほかの人が書けるので、制御文字を置き換える。
     pub fn describe(&self, now: u64) -> String {
@@ -814,5 +858,61 @@ next = ["done"]
         assert_eq!(unix_seconds("2026-10-25"), None);
         assert_eq!(elapsed(30), "1分足らず");
         assert_eq!(elapsed(3 * 86400 + 5), "3日");
+    }
+
+    #[test]
+    fn working_lines_without_a_running_cell_are_stopped() {
+        let item = |repo: &str, number| Item {
+            repo: RepoName::parse(repo).unwrap(),
+            number,
+            title: "t".to_string(),
+        };
+        let line = |since: Option<&str>| Line {
+            state: State::Working {
+                cell: Some("implement".to_string()),
+            },
+            issue: Some(item("octo/issues", 7)),
+            pr: Some(item("octo/app", 14)),
+            since: since.map(str::to_string),
+            note: None,
+        };
+        let running = |repo: &str, number| Running {
+            cell: "implement".to_string(),
+            kind: "PR".to_string(),
+            repo: repo.to_string(),
+            number,
+            title: "t".to_string(),
+            started: 0,
+            log: std::path::PathBuf::from("/l"),
+            tick: None,
+            phase: None,
+        };
+        let now = unix_seconds("2026-10-25T04:30:00Z").unwrap();
+        let old = Some("2026-10-25T04:00:00Z");
+        let check = |mut l: Line, r: Option<(&Running, bool)>| {
+            l.check_stopped(r, now);
+            matches!(l.state, State::Stopped { .. })
+        };
+        // そのPR（IssueでもPRでも）でcellが動いていれば、作業中のまま
+        assert!(!check(line(old), Some((&running("Octo/App", 14), true))));
+        assert!(!check(line(old), Some((&running("octo/issues", 7), true))));
+        // 動かしているtickがもういないか、ほかのものが動いていれば、止まったまま
+        assert!(check(line(old), Some((&running("octo/app", 14), false))));
+        assert!(check(line(old), Some((&running("octo/app", 15), true))));
+        assert!(check(line(old), None));
+        // 付いたばかりなら、動き始めたところかもしれない。付いた時刻が読めなければ、止まったとみなす
+        assert!(!check(line(Some("2026-10-25T04:29:00Z")), None));
+        assert!(check(line(Some("2026-10-25T04:28:00Z")), None));
+        assert!(check(line(None), None));
+        // 作業中でない行は替えない
+        let mut waiting = line(old);
+        waiting.state = State::NeedsHuman;
+        assert!(!check(waiting, None));
+        let mut stopped = line(old);
+        stopped.check_stopped(None, now);
+        assert_eq!(
+            stopped.describe(now),
+            "止まったまま implement  octo/issues#7「t」 → PR octo/app#14（30分前から）"
+        );
     }
 }

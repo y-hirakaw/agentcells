@@ -65,15 +65,30 @@ pub fn render(
     }
     for (p, (name, report)) in snapshot.products.iter().enumerate() {
         out.push(String::new());
-        out.push(format!("■ {name}  {}", summary(report)));
+        let lines: Vec<Line> = report
+            .lines
+            .iter()
+            .cloned()
+            .map(|mut l| {
+                l.check_stopped(running, now);
+                l
+            })
+            .collect();
+        out.push(format!("■ {name}  {}", summary(&lines)));
         for error in &report.errors {
             out.push(format!("  エラー: {error}"));
         }
         for note in &report.notes {
             out.push(format!("  注意: {note}"));
         }
-        for (i, line) in report.lines.iter().enumerate() {
-            let detail = detail.as_ref().filter(|(r, _)| runs_on(line, r));
+        if lines
+            .iter()
+            .any(|l| matches!(l.state, State::Stopped { .. }))
+        {
+            out.push(format!("  ※{}", crate::status::STOPPED_HINT));
+        }
+        for (i, line) in lines.iter().enumerate() {
+            let detail = detail.as_ref().filter(|(r, _)| line.runs(r));
             let mark = if detail.is_some() { "▶" } else { " " };
             out.push(format!(" {mark}{}", line.describe(now)));
             if let Some((_, lines)) = detail
@@ -97,7 +112,7 @@ fn expand_at(products: &[(String, Report)], running: &Running) -> Option<(usize,
                 .lines
                 .iter()
                 .enumerate()
-                .filter(|(_, l)| runs_on(l, running))
+                .filter(|(_, l)| l.runs(running))
                 .map(move |(i, l)| ((p, i), l))
         })
     };
@@ -108,12 +123,16 @@ fn expand_at(products: &[(String, Report)], running: &Running) -> Option<(usize,
 }
 
 /// 状態ごとの件数を、1行で書く。
-fn summary(report: &Report) -> String {
-    if report.lines.is_empty() {
+fn summary(lines: &[Line]) -> String {
+    if lines.is_empty() {
         return "扱っているIssue/PRはありません".to_string();
     }
-    let count = |f: fn(&State) -> bool| report.lines.iter().filter(|l| f(&l.state)).count();
+    let count = |f: fn(&State) -> bool| lines.iter().filter(|l| f(&l.state)).count();
     let counts = [
+        (
+            "止まったまま",
+            count(|s| matches!(s, State::Stopped { .. })),
+        ),
         ("作業中", count(|s| matches!(s, State::Working { .. }))),
         ("返事待ち", count(|s| matches!(s, State::NeedsHuman))),
         ("検品待ち", count(|s| matches!(s, State::InReview))),
@@ -126,13 +145,6 @@ fn summary(report: &Report) -> String {
         .map(|(name, n)| format!("{name} {n}"))
         .collect::<Vec<_>>()
         .join(" / ")
-}
-
-/// その行のIssueかPRで、cellが動いているか。IssueとPRは、同じリポジトリで番号を分け合うので、番号で見る。
-fn runs_on(line: &Line, running: &Running) -> bool {
-    [&line.issue, &line.pr].into_iter().flatten().any(|item| {
-        item.number == running.number && item.repo.to_string().eq_ignore_ascii_case(&running.repo)
-    })
 }
 
 #[cfg(test)]
@@ -311,6 +323,20 @@ mod tests {
             "{lines:?}"
         );
         assert!(!lines.iter().any(|l| l.starts_with(" ▶")), "{lines:?}");
+    }
+
+    #[test]
+    fn working_lines_with_no_running_cell_are_shown_as_stopped() {
+        let lines = render(&snapshot(), None, &[], 60, 1065);
+        let at = lines
+            .iter()
+            .position(|l| l == "■ app  止まったまま 1 / 返事待ち 2")
+            .unwrap();
+        assert!(lines[at + 2].contains("ac:working"), "{lines:?}");
+        assert_eq!(
+            lines[at + 3],
+            "  止まったまま implement  octo/issues#7「両方」 → PR octo/app#14"
+        );
     }
 
     #[test]
