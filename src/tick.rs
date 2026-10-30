@@ -148,18 +148,29 @@ impl Session {
 pub struct Lock(#[allow(dead_code)] File);
 
 /// ロックを取る。ほかのtickが持っていれば `None`。
+///
+/// 取れなければ、5ミリ秒おきに20回まで取り直す。同じプロセスのほかのスレッドが子を起こす間、
+/// 開いているファイル（このロックも）が子に一瞬受け継がれ、子がexecするまでロックが残るため
+/// （テストを並べて動かすと起きる。macOSで、20000回に2000回ほど取れなかった）。
 pub fn lock(home: &Home) -> Result<Option<Lock>> {
     let path = home.root().join("tick.lock");
     let file = File::create(&path)
         .map_err(|e| Error::new(format!("{} を作れません: {e}", path.display())))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(Lock(file))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(Error::new(format!(
-            "{} をロックできません: {e}",
-            path.display()
-        ))),
+    for _ in 0..20 {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(Lock(file))),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(Error::new(format!(
+                    "{} をロックできません: {e}",
+                    path.display()
+                )));
+            }
+        }
     }
+    Ok(None)
 }
 
 /// 見つかった仕事と、見送ったもの（理由つき）。

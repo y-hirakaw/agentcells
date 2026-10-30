@@ -362,7 +362,9 @@ mod tests {
     }
 
     fn alive_from_file(dir: &Path, name: &str) -> bool {
-        let pid = std::fs::read_to_string(dir.join(name)).unwrap();
+        let pid = std::fs::read_to_string(dir.join(name)).unwrap_or_else(|e| {
+            panic!("{name} を読めません（子を起こす前に止めたかもしれません）: {e}")
+        });
         is_alive(pid.trim().parse().unwrap())
     }
 
@@ -438,11 +440,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
-            r#"cat > /dev/null; sleep 60 & echo $! > child.pid; sleep 60"#,
+            // 子のPIDは、stdinを読む前に書く。書きかけのファイルを読まないように、写してから名前を変える
+            r#"sleep 60 & echo $! > child.tmp && mv child.tmp child.pid; cat > /dev/null; sleep 60"#,
         );
         let schema = serde_json::json!({});
         let started = Instant::now();
-        let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(2))
+        // テストを並べて動かすと、起動に2秒より長くかかることがあるので、5秒待つ（#12）
+        let end = claude_run(dir.path(), &program, &schema, Duration::from_secs(5))
             .run()
             .unwrap_or_else(|_| panic!("failed"));
         assert!(matches!(end, ClaudeEnd::TimedOut));
