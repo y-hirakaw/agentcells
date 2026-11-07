@@ -2,7 +2,9 @@
 
 [English](../README.md) | 日本語
 
-Issueを作ると、AIエージェントのcellが仕事を進めます。次の工程に回すか人間に回すかはdispatcherが振り分け、質問や検品の依頼はIssueとPRで人間に届きます。グラフエンジニアリング／ソフトウェアファクトリーのような仕組みです。
+Claude CodeでGitHubのIssueの処理を自動化する、手元で動くCLIです。GitHubのIssueに対してClaude Codeを動かし、トリアージ、実装、PR（プルリクエスト）の作成、AIによるレビューまでを進め、必要なときはIssueやPRのコメントで人間に確かめます。Issueを作れば、あとは手元のマシンが定期的に進めます。
+
+工程はそれぞれcell（1つの仕事を回すAIエージェントのループ）です。次の工程に回すか人間に回すかはdispatcherが振り分け、質問や検品の依頼はIssueとPRで人間に届きます。グラフエンジニアリング／ソフトウェアファクトリーのような仕組みです。
 
 > **実験的なプロジェクトで、作成中です。** 仕様は予告なく変わります。構想は [concept.md](../concept.md)、作ったものの仕様は [docs/design.md](design.md)、変更の履歴は [CHANGELOG.md](../CHANGELOG.md) にあります。
 
@@ -18,6 +20,14 @@ Issueを作ると、AIエージェントのcellが仕事を進めます。次の
 
 このリポジトリにIssueを作ると、PRが作られ、AIがレビューし、指摘を直します。内容に応じて自動でマージされるか、人間にレビューの依頼が来ます。
 
+## Claude Code GitHub Actionsとの違い
+
+Claude Code GitHub Actionsは、IssueやPRで呼びかけると、GitHubのCIの上でClaude Codeを動かします。agentcellsは次の点が違います。
+
+- **Actionsではなく、手元のマシンで定期実行する。** `agentcells schedule install` で、手元のマシンが決まった間隔で `tick` を動かします。手元のClaude Code、ツール、ビルドの環境をそのまま使います
+- **工程をcellごとに組み替えられる。** cell（triage、implement、reviewなど）は1つずつのファイルで、拾うラベル、プロンプト、次の工程を持つので、cellを足したり、外したり、つなぎ直したりできます
+- **inspectorがライン自体を直すIssueを起票する。** `agentcells inspect` が実行の記録を読み、ラインが詰まったり失敗したりしているところを見つけて、agentcellsや設定の直し方を提案するIssueを作ります
+
 ## 構成（予定）
 
 | 役割 | 何をするか |
@@ -30,7 +40,19 @@ Issueを作ると、AIエージェントのcellが仕事を進めます。次の
 
 ## インストール（作成中）
 
-今はソースからビルドします。Rustが入っていなければ、先に https://rustup.rs の手順で入れてください。gitは2.38以上が要ります（`agentcells doctor` が確かめます）。
+### 前提条件
+
+- macOS（`agentcells schedule` は、決まった間隔で動かすのにlaunchdを使います）
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)（ログインしておく）
+- [GitHub CLI（gh）](https://cli.github.com/)（ログインしておく）
+- git 2.38以上
+- Rust（ソースからビルドするため。https://rustup.rs の手順で入れてください）
+
+インストールのあと、`agentcells doctor` がこれらを確かめます。
+
+### ビルドとインストール
+
+今はソースからビルドします。
 
 ```sh
 git clone https://github.com/y-hirakaw/agentcells.git

@@ -2,7 +2,9 @@
 
 English | [日本語](docs/README.ja.md)
 
-Create an Issue, and cells of AI agents move the work forward. A dispatcher decides whether work goes to the next step or to a human, and questions and requests for human review reach people through Issues and PRs. Think of it as graph engineering, or a software factory.
+A local CLI for GitHub Issues automation with Claude Code: it runs Claude Code on your GitHub Issues to triage them, implement the change, open a pull request (PR), and review it with AI, and asks a human through Issue and PR comments when needed. You create an Issue; your own machine does the rest on a schedule.
+
+Each step is a cell, a loop of AI agents for one kind of work. A dispatcher decides whether work goes to the next step or to a human, and questions and requests for human review reach people through Issues and PRs. Think of it as graph engineering, or a software factory.
 
 > **This is an experimental project and a work in progress.** The specification may change without notice. The concept is in [concept.md](concept.md), the specification of what has been built is in [docs/design.md](docs/design.md), and the change history is in [CHANGELOG.md](CHANGELOG.md) (all in Japanese).
 
@@ -18,6 +20,14 @@ Create an Issue, and cells of AI agents move the work forward. A dispatcher deci
 
 Create an Issue in this repository, and a PR is opened, reviewed by AI, and updated to address the review comments. Depending on the change, it is merged automatically or a human is asked to review it.
 
+## How it differs from Claude Code GitHub Actions
+
+Claude Code GitHub Actions runs Claude Code in GitHub's CI when an Issue or PR mentions it. agentcells takes a different approach:
+
+- **Runs on your own machine, not in Actions.** `agentcells schedule install` runs `tick` at a fixed interval on your machine, using your local Claude Code, tools, and build environment
+- **The steps can be rearranged cell by cell.** Each cell (triage, implement, review, and so on) is a separate file with its own label, prompt, and next steps, so you can add, remove, or reconnect cells to fit your workflow
+- **The inspector opens Issues to fix the line itself.** `agentcells inspect` reads the records of each run, finds where the line gets stuck or fails, and opens Issues that propose fixes to agentcells and its settings
+
 ## Structure (planned)
 
 | Role | What it does |
@@ -30,7 +40,19 @@ Create an Issue in this repository, and a PR is opened, reviewed by AI, and upda
 
 ## Install (work in progress)
 
-For now, build from source. If Rust is not installed, install it first by following https://rustup.rs. agentcells also needs git 2.38 or later (`agentcells doctor` checks it).
+### Requirements
+
+- macOS (`agentcells schedule` uses launchd to run at a fixed interval)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code), logged in
+- [GitHub CLI (gh)](https://cli.github.com/), logged in
+- git 2.38 or later
+- Rust, to build from source (install it by following https://rustup.rs)
+
+`agentcells doctor` checks these after installing.
+
+### Build and install
+
+For now, build from source.
 
 ```sh
 git clone https://github.com/y-hirakaw/agentcells.git
