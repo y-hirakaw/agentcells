@@ -91,6 +91,9 @@ pub struct Outcome {
     /// 作業と関係のない、元からある問題。CLIが、別のIssueとして出す
     #[serde(default)]
     pub issues: Vec<NewIssue>,
+    /// 決めたか変えた仕様（[`crate::spec`]）。出せるのは、Issueで動く、PRを作らないcellだけ
+    #[serde(default)]
+    pub spec: Option<crate::spec::Spec>,
 }
 
 /// AIが見つけた、別のIssueにする問題。
@@ -124,8 +127,13 @@ impl Outcome {
 }
 
 /// `claude -p --json-schema` に渡すスキーマ。`next` は選べる先しか出せないようにする。
-/// レビューのcellには、コードへの指摘（`findings`）も返させる。
-pub fn output_schema(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> serde_json::Value {
+/// レビューのcellには、コードへの指摘（`findings`）も返させる。`spec` なら、仕様（[`crate::spec`]）も返せる。
+pub fn output_schema(
+    cell: &Cell,
+    waiting: Option<Waiting>,
+    asked: bool,
+    spec: bool,
+) -> serde_json::Value {
     let mut schema = json!({
         "type": "object",
         "properties": {
@@ -159,6 +167,9 @@ pub fn output_schema(cell: &Cell, waiting: Option<Waiting>, asked: bool) -> serd
     if cell.review {
         schema["properties"]["findings"] = review::findings_schema();
         schema["required"] = json!(["next", "comment", "findings"]);
+    }
+    if spec {
+        schema["properties"]["spec"] = crate::spec::schema();
     }
     schema
 }
@@ -527,7 +538,7 @@ max_rounds = 2
     #[test]
     fn schema_limits_next_to_choices() {
         let (_dir, config) = config();
-        let schema = output_schema(config.cell("review").unwrap(), None, false);
+        let schema = output_schema(config.cell("review").unwrap(), None, false, false);
         assert_eq!(
             schema["properties"]["next"]["enum"],
             json!(["implement", "done", NEEDS_HUMAN])
@@ -535,6 +546,28 @@ max_rounds = 2
         assert_eq!(schema["required"], json!(["next", "comment"]));
         assert_eq!(schema["additionalProperties"], json!(false));
         assert!(schema["properties"].get("findings").is_none());
+        assert!(schema["properties"].get("spec").is_none());
+    }
+
+    #[test]
+    fn cells_that_write_specs_may_return_one() {
+        let (_dir, config) = config();
+        let schema = output_schema(config.cell("triage").unwrap(), None, false, true);
+        assert_eq!(schema["properties"]["spec"]["type"], "object");
+        // 出さなくてもよい（前の仕様のままのとき）
+        assert_eq!(schema["required"], json!(["next", "comment"]));
+
+        let outcome = Outcome::from_result(&json!({
+            "structured_output": {
+                "next": "implement",
+                "comment": "c",
+                "spec": { "goal": "g", "criteria": [{ "text": "t", "check": "k" }] }
+            }
+        }))
+        .unwrap();
+        let spec = outcome.spec.unwrap();
+        assert_eq!(spec.criteria[0].check, "k");
+        assert!(spec.undecided.is_empty());
     }
 
     #[test]
@@ -542,7 +575,7 @@ max_rounds = 2
         let (_dir, config) = config();
         let mut cell = config.cell("review").unwrap().clone();
         cell.review = true;
-        let schema = output_schema(&cell, None, false);
+        let schema = output_schema(&cell, None, false, false);
         assert_eq!(schema["required"], json!(["next", "comment", "findings"]));
         assert_eq!(schema["properties"]["findings"]["type"], "array");
 
@@ -583,7 +616,7 @@ max_rounds = 2
             }]
         );
         let (_dir, config) = config();
-        let schema = output_schema(config.cell("implement").unwrap(), None, false);
+        let schema = output_schema(config.cell("implement").unwrap(), None, false, false);
         assert_eq!(schema["properties"]["issues"]["maxItems"], MAX_NEW_ISSUES);
         // 書かなくてもよい
         assert!(

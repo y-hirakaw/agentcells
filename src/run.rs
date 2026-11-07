@@ -572,10 +572,12 @@ impl Runner<'_> {
         let extra = cell.extra_prompt()?;
         let asked = crate::discussion::asked_by(&task.discussion.posts, &task.writer, &cell.name);
         let replied_in = transition::replied_in(work.waiting, work.conflict);
+        let writes_spec = crate::spec::writable(self.config, cell, work.item);
         Ok(Prepared::Ready(Box::new(Ready {
             user: prompt::user_prompt(cell, extra.as_deref(), Some(&task)),
-            system: prompt::system_prompt(self.config, cell, replied_in, asked),
-            schema: transition::output_schema(cell, replied_in, asked),
+            system: prompt::system_prompt(self.config, cell, replied_in, asked, writes_spec),
+            schema: transition::output_schema(cell, replied_in, asked, writes_spec),
+            writes_spec,
             settings_path,
             tools: settings::cell_tools(cell),
             context_path,
@@ -655,6 +657,7 @@ impl Runner<'_> {
                     comment: String::new(),
                     findings: Vec::new(),
                     issues: Vec::new(),
+                    spec: None,
                 }
             }
         };
@@ -697,6 +700,32 @@ impl Runner<'_> {
         }
         if let Some(changed) = transition::tampered(&ready.labels_before, &labels_after) {
             overridden = Some(changed);
+        }
+        // 仕様は、返せるcellのものだけを使う（スキーマで止めているが、念のため）
+        let mut outcome = outcome;
+        // Issueにある最新のものと同じなら、書き直さない（着手を確かめるときは書く）
+        let asks = cell.confirms() && outcome.next == transition::NEEDS_HUMAN;
+        let spec = outcome.spec.take().filter(|new| {
+            ready.writes_spec
+                && crate::spec::should_write(
+                    &task.discussion.posts,
+                    &task.writer,
+                    &task.operator,
+                    new,
+                    asks,
+                )
+        });
+        if crate::spec::reconfirm(
+            cell.confirms(),
+            asked,
+            transition::replied_in(work.waiting, work.conflict).is_some(),
+            &outcome.next,
+            spec.is_some(),
+        ) {
+            outcome.next = transition::NEEDS_HUMAN.to_string();
+            outcome.comment.push_str(
+                "\n\n仕様が、確かめてもらったものから変わったので、着手の前にもう一度確かめます。この仕様でよければ、返事をください。",
+            );
         }
 
         // コミットを確かめてpushし、IssueからならPRを作る（レビューのcellと、着手を確かめるcellはpushしない）
@@ -856,13 +885,15 @@ impl Runner<'_> {
                 payload["body"] = marker::with_read_until(body, &read_until, asking).into();
                 payload
             });
+        // 仕様は、コメントの最後（読んだところの行の前）に足す。CLIが人間に回すときは足さない
+        let mut body = marker::comment(&cell.name, round, &text);
+        if let Some(spec) = spec.as_ref().filter(|_| reason.is_none()) {
+            body.push_str("\n\n");
+            body.push_str(&spec.render());
+        }
         let posted = match &review {
             Some(payload) => payload.to_string(),
-            None => marker::with_read_until(
-                &marker::comment(&cell.name, round, &text),
-                &read_until,
-                asking,
-            ),
+            None => marker::with_read_until(&body, &read_until, asking),
         };
         // 投稿する本文の全体を、秘密らしいものがないか調べる。あれば、決まった文だけにして人間に回す
         let found = actions::scan_text(self.scanner, &posted)?;
@@ -1159,6 +1190,8 @@ struct Ready {
     placed_blobs: Vec<String>,
     /// betterleaksが当てても通すもの（productの `allow_secrets`）。pushの前の確かめに使う
     allow_secrets: Vec<crate::config::AllowSecret>,
+    /// 仕様（[`crate::spec`]）を返せるか
+    writes_spec: bool,
 }
 
 impl Ready {

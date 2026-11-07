@@ -33,6 +33,7 @@ pub mod running;
 pub mod schedule;
 pub mod settings;
 pub mod setup;
+pub mod spec;
 pub mod status;
 pub mod tick;
 pub mod tidy;

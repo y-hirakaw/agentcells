@@ -559,6 +559,15 @@ impl Config {
         self.cells.iter().find(|c| c.name == name)
     }
 
+    /// IssueからPRを作るcellか（`next` に、PRだけを扱うcellがある。implementなど）。
+    /// `cell` は、productの進め先を当てたもの（[`Config::cell_in`]）を渡す。
+    pub fn creates_pr(&self, cell: &Cell) -> bool {
+        cell.next.iter().any(|n| {
+            self.cell(n)
+                .is_some_and(|next| !next.on.contains(&Target::Issue))
+        })
+    }
+
     /// どのproductの `cells` にも入っていないcell（動かない）。定義した順で返す。
     /// `next` の先にあるだけでは、使っていると数えない。
     pub fn unused_cells(&self) -> Vec<&Cell> {

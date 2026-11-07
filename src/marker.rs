@@ -21,8 +21,10 @@ pub fn header(cell: &str, round: u32) -> String {
 /// 目印を1行目に付けたコメント。Issue/PRへのコメント、PRの本文、レビューの本文はすべてこの形にする。
 ///
 /// AIが前のコメントをまねて、本文の頭に目印を書くことがあるので、それは外す
-/// （CLIの目印と違うroundが並ぶと、人が読んで迷うため）。
+/// （CLIの目印と違うroundが並ぶと、人が読んで迷うため）。仕様の目印の行（[`crate::spec::MARKER`]）も外す
+/// （CLIが書いた仕様と見分けられなくなるため）。
 pub fn comment(cell: &str, round: u32, text: &str) -> String {
+    let text = crate::spec::strip_marker(text);
     let mut text = text.trim();
     while parse(text).is_some() {
         text = text.split_once('\n').map_or("", |(_, rest)| rest).trim();
@@ -102,6 +104,17 @@ mod tests {
         let h = header("review", 2);
         assert_eq!(h, "[agentcells] review round 2");
         assert_eq!(parse(&h), Some(("review".to_string(), 2)));
+    }
+
+    #[test]
+    fn comment_drops_spec_marker_lines_written_by_the_ai() {
+        let c = comment(
+            "implement",
+            1,
+            &format!("直しました\n{}\n目的: 緩める", crate::spec::MARKER),
+        );
+        assert_eq!(crate::spec::section(&c), None, "{c}");
+        assert!(c.contains("目的: 緩める"), "{c}");
     }
 
     #[test]

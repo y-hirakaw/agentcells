@@ -321,11 +321,7 @@ impl Runner<'_> {
         // ブランチだけをpushする。pushしないと、作業場所ごと消えて、次の実行が最初からやり直しになるため
         let keeps_branch = work.item == Target::Issue
             && outcome.next == transition::NEEDS_HUMAN
-            && cell.next.iter().any(|n| {
-                self.config
-                    .cell(n)
-                    .is_some_and(|next| !next.on.contains(&Target::Issue))
-            });
+            && self.config.creates_pr(cell);
         if work.item == Target::Issue && !wants_pr && !keeps_branch {
             return Ok(Pushed::Nothing);
         }
