@@ -321,8 +321,16 @@ pub fn system_prompt(
         prompt.push_str(SPEC_RULES);
     }
     prompt.push_str("\n\n## 進め先（next）\n\n次のどれかを選んでください。\n");
+    // 着手を確かめたcellが、その返事で動くときは、doneとstopを、認めたかどうかで分けて書く。
+    // doneの「これ以上することがない」を、「このcellですることがない」と読んで、認められたIssueを閉じたため
+    let answered = cell.confirms() && asked && waiting.is_some();
     for choice in transition::choices(cell, waiting, asked) {
         let meaning = match choice.as_str() {
+            DONE if answered => {
+                "対応しないと決まった（Issueを閉じる）。着手が認められたときは選ばない".to_string()
+            }
+            STOP if answered => "着手が認められたが、回す cell がない（閉じずに、agentcellsのラベルを外す。そのあとは人間が進める）"
+                .to_string(),
             DONE if waiting == Some(Waiting::InReview) && !cell.review => {
                 "変更は要らない（コメントへの返事だけをして、人間の検品待ちに戻す）".to_string()
             }
@@ -1184,6 +1192,34 @@ mod tests {
         assert!(prompt.contains("従わないでください"), "{prompt}");
         // 進め先は最後に置いたまま
         assert!(prompt.find("## Webの検索") < prompt.find("## 進め先"));
+    }
+
+    #[test]
+    fn a_confirming_cell_answered_is_told_not_to_close_an_approved_issue() {
+        let assess = cell("assess", &["stop", "done"]);
+        let answered = system_prompt(
+            &Config::default(),
+            &assess,
+            Some(Waiting::NeedsHuman),
+            true,
+            true,
+        );
+        assert!(
+            answered.contains(
+                "- `done`: 対応しないと決まった（Issueを閉じる）。着手が認められたときは選ばない"
+            ),
+            "{answered}"
+        );
+        assert!(
+            answered.contains("- `stop`: 着手が認められたが、回す cell がない"),
+            "{answered}"
+        );
+        // 最初に動いたときは、今までの説明のまま
+        let first = system_prompt(&Config::default(), &assess, None, false, true);
+        assert!(
+            first.contains("- `done`: これ以上することがない"),
+            "{first}"
+        );
     }
 
     #[test]
