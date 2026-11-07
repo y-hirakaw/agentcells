@@ -17,8 +17,14 @@ pub struct Run {
     /// 終わった時刻（UNIXの秒）
     pub at: u64,
     pub subject: Subject,
-    /// かかった秒
+    /// 始めた時刻（UNIXの秒）と、かかった秒
+    pub started: u64,
     pub seconds: u64,
+    /// 往復の回数（エラーで止まったものは0）
+    pub round: u32,
+    /// IssueからPRに進んだなら、PRの番号と、そのリポジトリ（0.37.0より前の記録にはない）
+    pub pr: Option<u64>,
+    pub pr_repo: Option<String>,
     pub outcome: Outcome,
 }
 
@@ -51,10 +57,14 @@ fn runs(lines: Vec<record::Line>) -> Vec<Run> {
     lines
         .into_iter()
         .filter_map(|line| {
-            let (subject, seconds, outcome) = match line.event {
+            let (subject, started, seconds, round, pr, pr_repo, outcome) = match line.event {
                 Event::Ran {
                     subject,
+                    started,
                     seconds,
+                    round,
+                    pr,
+                    pr_repo,
                     requested,
                     destination,
                     reason,
@@ -71,20 +81,32 @@ fn runs(lines: Vec<record::Line>) -> Vec<Run> {
                         "paused" => Outcome::Paused,
                         _ => Outcome::Moved { destination },
                     };
-                    (subject, seconds, outcome)
+                    (subject, started, seconds, round, pr, pr_repo, outcome)
                 }
                 Event::Failed {
                     subject,
+                    started,
                     seconds,
                     error,
-                    ..
-                } => (subject, seconds, Outcome::Failed { error }),
+                } => (
+                    subject,
+                    started,
+                    seconds,
+                    0,
+                    None,
+                    None,
+                    Outcome::Failed { error },
+                ),
                 _ => return None,
             };
             Some(Run {
                 at: line.at,
                 subject,
+                started,
                 seconds,
+                round,
+                pr,
+                pr_repo,
                 outcome,
             })
         })
@@ -199,6 +221,7 @@ mod tests {
             repo: repo.to_string(),
             number,
             reply: None,
+            conflict: false,
         }
     }
 
@@ -214,6 +237,7 @@ mod tests {
                 requested: Some(destination.to_string()),
                 destination: destination.to_string(),
                 pr: None,
+                pr_repo: None,
                 reason: None,
                 ai_failed: false,
                 failure: None,

@@ -4,6 +4,7 @@
 //! 動いているcellの様子は手元のファイル（[`crate::running`]）から読むので、2秒ごとに読み直す。
 //! GitHubは、読む回数を抑えるため、決めた間隔ごとに読み直す（[`crate::status`] と同じものを読む）。
 
+use crate::handoff;
 use crate::recent::{self, Run};
 use crate::running::{self, Running};
 use crate::status::{Line, Report, State};
@@ -82,6 +83,9 @@ pub fn render(
         out.extend(
             recent::latest(&snapshot.runs, RECENT_RUNS).map(|r| format!("  {}", r.describe(now))),
         );
+        if let Some(brief) = handoff::summarize(&snapshot.runs, now).brief() {
+            out.push(format!("  {brief}"));
+        }
     }
 
     if snapshot.read_at.is_some() && snapshot.products.is_empty() {
@@ -415,8 +419,13 @@ mod tests {
                 repo: repo.into(),
                 number,
                 reply: None,
+                conflict: false,
             },
+            started: at - 70,
             seconds: 70,
+            round: 1,
+            pr: None,
+            pr_repo: None,
             outcome,
         };
         let snapshot = Snapshot {
@@ -469,6 +478,27 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("前回（2分前）")),
             "{lines:?}"
+        );
+        // 終わった件がなければ、手離れの行は出さない
+        assert!(!lines.iter().any(|l| l.contains("手離れ")), "{lines:?}");
+        let finished = Snapshot {
+            runs: vec![run(
+                900,
+                "review",
+                "pull_request",
+                "octo/app",
+                14,
+                recent::Outcome::Moved {
+                    destination: "done".into(),
+                },
+            )],
+            ..self::snapshot()
+        };
+        let lines = render(&finished, None, &[], 60, 1065);
+        let at = lines.iter().position(|l| l == "最近の実行").unwrap();
+        assert_eq!(
+            lines[at + 2],
+            "  手離れ（直近30日に終わった1件）: 途中で人を呼ばずに 100%、1件あたり人に回した 0.0回"
         );
     }
 

@@ -8,6 +8,7 @@ use crate::actions;
 use crate::config::{Cell, Target};
 use crate::error::{Error, Result};
 use crate::github::{Credentials, ISOLATED_GIT_ENV};
+use crate::home::RepoName;
 use crate::probe::Probe;
 use crate::prompt;
 use crate::tick::Work;
@@ -28,8 +29,8 @@ pub(super) enum Pushed {
     Nothing,
     /// 確かめで止めた。人間に回す理由と、betterleaksが当てたものを通すときに書く項目（手元にだけ出す）
     Refused(String, Vec<crate::config::AllowSecret>),
-    /// pushした。IssueからならPRの番号
-    Done(Option<u64>),
+    /// pushした。IssueからならPRを作った（か、開いていた）リポジトリと番号
+    Done(Option<(RepoName, u64)>),
     /// 人間に回すので、PRは作らずに、ブランチだけをpushした（次の実行は、そこから続ける）。
     /// そのブランチのPRが開いていれば、その番号
     Branch(String, Option<u64>),
@@ -400,7 +401,7 @@ impl Runner<'_> {
                 crate::pr::create(self.probe, write, &args)?
             }
         };
-        Ok(Pushed::Done(Some(number)))
+        Ok(Pushed::Done(Some((work.repo.clone(), number))))
     }
 }
 

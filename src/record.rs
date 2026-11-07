@@ -56,6 +56,10 @@ pub struct Subject {
     /// 人間を待っていたところから、返事で動いたなら、待っていたラベル
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
+    /// 検品を待つPRが、ベースのブランチとぶつかったので、返事がなくても直しに動いた（`reply` は待っていたラベル）。
+    /// 人の返事で動いたものと分けて数えるため
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conflict: bool,
 }
 
 impl Subject {
@@ -67,6 +71,7 @@ impl Subject {
             repo: work.repo.to_string(),
             number: work.number,
             reply: work.waiting.map(|w| w.label().to_string()),
+            conflict: work.conflict,
         }
     }
 }
@@ -107,6 +112,9 @@ pub enum Event {
         /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pr: Option<u64>,
+        /// そのPRのリポジトリ（0.37.0から。手離れの物差しで、PRの実行をIssueの件につなぐため）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr_repo: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         ai_failed: bool,
@@ -169,6 +177,7 @@ impl Event {
             requested: report.requested.clone(),
             destination: report.destination.clone(),
             pr: report.pr,
+            pr_repo: report.pr_repo.clone(),
             reason: report.reason.clone(),
             ai_failed: report.ai_failed,
             failure: report.failure.clone(),
@@ -286,6 +295,7 @@ mod tests {
             blocked: Vec::new(),
             allow_secrets: Vec::new(),
             pr: None,
+            pr_repo: None,
             model: Some("sonnet".into()),
             usage: Usage {
                 turns: Some(12),
@@ -326,7 +336,17 @@ mod tests {
         assert_eq!(ran["requested"], "review");
         assert_eq!(ran["models"][0], "claude-sonnet-5-5");
         assert!(ran.get("pr").is_none());
+        assert!(ran.get("pr_repo").is_none());
         assert!(ran.get("reason").is_none());
+        // ぶつかりを直しに動いたときだけ書く（人の返事で動いたものと分けるため）
+        assert!(ran.get("conflict").is_none());
+        let conflicted = Work {
+            conflict: true,
+            ..work.clone()
+        };
+        let value = serde_json::to_value(Subject::of(&conflicted)).unwrap();
+        assert_eq!(value["conflict"], true);
+        assert_eq!(value["reply"], "ac:in-review");
 
         let lines = read(&home);
         assert_eq!(lines.len(), 3);
@@ -335,5 +355,14 @@ mod tests {
             std::fs::metadata(path(&home)).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        // PRに進んだときは、PRの番号とリポジトリを書く
+        let created = Report {
+            pr: Some(12),
+            pr_repo: Some("octo/app".into()),
+            ..report
+        };
+        let value = serde_json::to_value(Event::ran(&work, 100, 160, &created)).unwrap();
+        assert_eq!(value["pr"], 12);
+        assert_eq!(value["pr_repo"], "octo/app");
     }
 }

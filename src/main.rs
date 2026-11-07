@@ -374,6 +374,10 @@ fn run(command: Commands) -> Result<ExitCode> {
                 println!("  {}", run.describe(unix_now()));
             }
             println!();
+            for line in agentcells::handoff::summarize(&runs, unix_now()).describe() {
+                println!("{line}");
+            }
+            println!();
             // GitHubを読んでいる間にcellが終わることがあるので、動いているcellは読む前と後に見る
             let before = agentcells::running::load(&home);
             let mut reports = read_reports(&home)?;

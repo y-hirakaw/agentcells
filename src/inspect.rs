@@ -878,6 +878,7 @@ mod tests {
             repo: repo.into(),
             number,
             reply: reply.map(str::to_string),
+            conflict: false,
         }
     }
 
@@ -893,6 +894,7 @@ mod tests {
                 requested: Some(requested.into()),
                 destination: destination.into(),
                 pr: None,
+                pr_repo: None,
                 reason: Some("octo/secret-game のパス".into()),
                 ai_failed: false,
                 failure: None,

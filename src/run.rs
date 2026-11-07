@@ -83,8 +83,9 @@ pub struct Report {
     pub blocked: Vec<String>,
     /// betterleaksが当てたものを、通すときに `allow_secrets` に書く項目（手元にだけ出す。[`crate::allowed`]）
     pub allow_secrets: Vec<crate::config::AllowSecret>,
-    /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）
+    /// 実行の中で作ったか、使ったPRの番号（IssueからPRに進んだとき）と、そのリポジトリ
     pub pr: Option<u64>,
+    pub pr_repo: Option<String>,
     /// 使ったモデル（指定しなかったら `None`）
     pub model: Option<String>,
     pub usage: Usage,
@@ -344,6 +345,7 @@ impl Runner<'_> {
                     blocked: Vec::new(),
                     allow_secrets: Vec::new(),
                     pr: None,
+                    pr_repo: None,
                     model: None,
                     usage: Usage::default(),
                 });
@@ -665,6 +667,7 @@ impl Runner<'_> {
                 blocked: Vec::new(),
                 allow_secrets: Vec::new(),
                 pr: None,
+                pr_repo: None,
                 model: self.model.or(cell.model.as_deref()).map(str::to_string),
                 usage,
             });
@@ -675,6 +678,7 @@ impl Runner<'_> {
 
         // コミットを確かめてpushし、IssueからならPRを作る（レビューのcellと、着手を確かめるcellはpushしない）
         let mut pr_number: Option<u64> = None;
+        let mut pr_repo: Option<RepoName> = None;
         let mut kept_branch: Option<(String, Option<u64>)> = None;
         let mut refused_allow: Vec<crate::config::AllowSecret> = Vec::new();
         // CLIが人間に回すとき（時間切れ、ラベルの変化など）は、pushしない。それでも、AIの作業が作業場所ごと
@@ -712,7 +716,12 @@ impl Runner<'_> {
                     overridden = Some(reason);
                     refused_allow = allow;
                 }
-                Pushed::Done(number) => pr_number = number,
+                Pushed::Done(created) => {
+                    if let Some((repo, number)) = created {
+                        pr_repo = Some(repo);
+                        pr_number = Some(number);
+                    }
+                }
                 Pushed::Branch(name, open) => kept_branch = Some((name, open)),
             }
         }
@@ -886,6 +895,7 @@ impl Runner<'_> {
                 crate::limit::near(l, self.config.usage.pause_at, now)
             }),
             pr: pr_number,
+            pr_repo: pr_repo.map(|r| r.to_string()),
             model: self.model.or(cell.model.as_deref()).map(str::to_string),
             usage,
         })

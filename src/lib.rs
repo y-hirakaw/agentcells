@@ -14,6 +14,7 @@ pub mod flow;
 pub mod found;
 pub mod github;
 pub mod guard;
+pub mod handoff;
 pub mod home;
 pub mod hook;
 pub mod inspect;
