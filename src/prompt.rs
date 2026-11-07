@@ -327,7 +327,7 @@ pub fn system_prompt(
     for choice in transition::choices(cell, waiting, asked) {
         let meaning = match choice.as_str() {
             DONE if answered => {
-                "対応しないと決まった（Issueを閉じる）。着手が認められたときは選ばない".to_string()
+                "対応しないと決まった（Issueなら閉じる。PRなら人間に検品を頼む）。着手が認められたときは選ばない".to_string()
             }
             STOP if answered => "着手が認められたが、回す cell がない（閉じずに、agentcellsのラベルを外す。そのあとは人間が進める）"
                 .to_string(),
@@ -1206,7 +1206,7 @@ mod tests {
         );
         assert!(
             answered.contains(
-                "- `done`: 対応しないと決まった（Issueを閉じる）。着手が認められたときは選ばない"
+                "- `done`: 対応しないと決まった（Issueなら閉じる。PRなら人間に検品を頼む）。着手が認められたときは選ばない"
             ),
             "{answered}"
         );
