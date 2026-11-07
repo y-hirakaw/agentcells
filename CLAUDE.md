@@ -16,8 +16,9 @@ cellのsandboxでは、プロセスの一覧と手元のポートが使えない
 ## ドキュメント
 
 - [concept.md](concept.md): 最初の構想。まだ作っていないことと、決まっていないことを書く
+- [concept2.md](concept2.md): 要求が抽象的な仕事を手離れさせる構想（自律のレベル、合格条件、L4の自動マージ）。concept.md と同じく、まだ作っていないことを書く
 - [docs/design.md](docs/design.md): 作ったものと決まったことの仕様。ひと通り整うまでは、ここで管理する
-- 作ったら、concept.md からその部分を消して docs/design.md に移す
+- 作ったら、concept.md（concept2.md）からその部分を消して docs/design.md に移す
 
 ## 版とCHANGELOG
 
