@@ -278,7 +278,7 @@ impl Runner<'_> {
         issue: &Issue,
         place: &mut Place,
     ) -> std::result::Result<Report, Failure> {
-        let work_repo = place_repo(product)?;
+        let work_repo = place_repo(product, work)?;
         // 動いている間、`agentcells status` で見えるようにする。用意（cloneなど）に時間がかかっても、
         // ac:working が付いたものを「止まったまま」と見せないよう、用意の前から書く
         let started = std::time::SystemTime::now()
@@ -357,9 +357,31 @@ impl Runner<'_> {
         let finished = ready.claude(self, cell, place).run()?;
         crate::running::set_phase(self.home, "結果をGitHubに書いています");
 
-        // AIの動かしたものをすべて止めたあとで、書き込みのトークンを作る
+        // AIの動かしたものをすべて止めたあとで、書き込みのトークンを作る。
+        // 作業するリポジトリが仕事のリポジトリと違い、pushしうるなら、そこへの書き込みのトークンも別に作る
         let write = self.write_credentials(&work.repo)?;
-        let result = self.finish(work, product, cell, issue, place, &ready, finished, &write);
+        let pushes = may_push(cell) && ready.branch.is_some();
+        let other = match (pushes && work_repo != work.repo)
+            .then(|| self.write_credentials(&work_repo))
+            .transpose()
+        {
+            Ok(other) => other,
+            Err(e) => {
+                write.revoke(self.probe);
+                return Err(e.into());
+            }
+        };
+        let writes = Writes {
+            item: &write,
+            work: PushTo {
+                repo: &work_repo,
+                write: other.as_ref().unwrap_or(&write),
+            },
+        };
+        let result = self.finish(work, product, cell, issue, place, &ready, finished, &writes);
+        if let Some(other) = &other {
+            other.revoke(self.probe);
+        }
         write.revoke(self.probe);
         Ok(result?)
     }
@@ -374,7 +396,7 @@ impl Runner<'_> {
         reads: &[(RepoName, Credentials)],
         issue: &Issue,
     ) -> Result<Prepared> {
-        let work_repo = place_repo(product)?;
+        let work_repo = place_repo(product, work)?;
         let read_for = |repo: &RepoName| -> Result<&Credentials> {
             reads
                 .iter()
@@ -584,8 +606,9 @@ impl Runner<'_> {
         place: &Place,
         ready: &Ready,
         finished: ClaudeEnd,
-        write: &Credentials,
+        writes: &Writes,
     ) -> Result<Report> {
+        let write = writes.item;
         let labels_after = issue.labels(write)?;
         let task = &ready.task;
         let asked = crate::discussion::asked_by(&task.discussion.posts, &task.writer, &cell.name);
@@ -684,8 +707,7 @@ impl Runner<'_> {
         // CLIが人間に回すとき（時間切れ、ラベルの変化など）は、pushしない。それでも、AIの作業が作業場所ごと
         // 消えないように、コミットがあれば手元に残す
         if overridden.is_some()
-            && !cell.review
-            && !cell.confirms()
+            && may_push(cell)
             && let Some(branch) = &ready.branch
             && let Some(note) = self.keep_unpushed(place, branch)
             && let Some(reason) = &mut overridden
@@ -693,12 +715,19 @@ impl Runner<'_> {
             reason.push_str(&format!("\n\n{note}"));
         }
         if overridden.is_none()
-            && !cell.review
-            && !cell.confirms()
+            && may_push(cell)
             && let Some(branch) = &ready.branch
         {
             match self.push(
-                work, cell, task, place, ready, branch, &outcome, round, write,
+                work,
+                cell,
+                task,
+                place,
+                ready,
+                branch,
+                &outcome,
+                round,
+                &writes.work,
             )? {
                 Pushed::Nothing => {
                     if work.item == Target::PullRequest
@@ -753,14 +782,24 @@ impl Runner<'_> {
         if let Some(number) = pr_number
             && work.item == Target::Issue
         {
-            text.push_str(&format!("\n\nPR: #{number}"));
+            text.push_str(&format!(
+                "\n\nPR: {}",
+                pr_ref(&work.repo, writes.work.repo, number)
+            ));
         }
+        let branch_at = |name: &str| match writes.work.repo == &work.repo {
+            true => format!("ブランチ `{name}`"),
+            false => format!("{} のブランチ `{name}`", writes.work.repo),
+        };
         match &kept_branch {
             Some((name, Some(number))) => text.push_str(&format!(
-                "\n\nここまでの作業は、ブランチ `{name}`（PR #{number}）にpushしました。次に動くときは、そこから続けます"
+                "\n\nここまでの作業は、{}（PR {}）にpushしました。次に動くときは、そこから続けます",
+                branch_at(name),
+                pr_ref(&work.repo, writes.work.repo, *number)
             )),
             Some((name, None)) => text.push_str(&format!(
-                "\n\nここまでの作業は、ブランチ `{name}` にpushしました（PRはまだ作っていません）。次に動くときは、そこから続けます"
+                "\n\nここまでの作業は、{} にpushしました（PRはまだ作っていません）。次に動くときは、そこから続けます",
+                branch_at(name)
             )),
             None => {}
         }
@@ -855,12 +894,12 @@ impl Runner<'_> {
         {
             let created = Issue {
                 probe: self.probe,
-                repo: &work.repo,
+                repo: writes.work.repo,
                 number,
                 kind: Target::PullRequest,
             };
             let add: Vec<&str> = plan.add_to_created_pr.iter().map(String::as_str).collect();
-            created.edit_labels(write, &add, &[])?;
+            created.edit_labels(writes.work.write, &add, &[])?;
         }
         let add: Vec<&str> = plan.add.iter().map(String::as_str).collect();
         // 人間を待っていたラベルが残っていれば（cellのラベルを付け直して動かしたときなど）、それも外す
@@ -1045,13 +1084,55 @@ fn protected_note(files: &[String]) -> Option<String> {
     ))
 }
 
-/// 作業するリポジトリ（今は product の repos の最初）。
-fn place_repo(product: &Product) -> Result<RepoName> {
-    product
-        .repos
-        .first()
-        .cloned()
-        .ok_or_else(|| Error::new(format!("product「{}」に repos がありません", product.name)))
+/// 作業するリポジトリ。Issueからならproductの repos の最初、PRならそのPRのリポジトリ（reposにあるものだけ）。
+/// cloneも、pushも、PRを作るのも、ここにする（Issueのリポジトリが違っても、そこにはpushしない）。
+fn place_repo(product: &Product, work: &Work) -> Result<RepoName> {
+    match work.item {
+        Target::Issue => {
+            product.repos.first().cloned().ok_or_else(|| {
+                Error::new(format!("product「{}」に repos がありません", product.name))
+            })
+        }
+        Target::PullRequest => product
+            .repos
+            .iter()
+            .find(|repo| **repo == work.repo)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "{} は、product「{}」の repos にありません",
+                    work.repo, product.name
+                ))
+            }),
+    }
+}
+
+/// Issueのコメントに書くPRの参照。PRが別のリポジトリにあれば、リポジトリも書く
+/// （`#番号` だけだと、Issueのリポジトリの番号として読まれるため）。
+fn pr_ref(issue_repo: &RepoName, pr_repo: &RepoName, number: u64) -> String {
+    match issue_repo == pr_repo {
+        true => format!("#{number}"),
+        false => format!("{pr_repo}#{number}"),
+    }
+}
+
+/// 書き込みのトークン。`item` は仕事のIssue/PRのリポジトリ（コメントとラベル）、`work` は作業するリポジトリ
+/// （pushとPRの作成）。同じリポジトリなら、同じもの。
+struct Writes<'a> {
+    item: &'a Credentials,
+    work: PushTo<'a>,
+}
+
+/// pushとPRの作成の宛先と、そこへの書き込みのトークン。宛先とトークンを組にして、片方だけがずれないようにする
+/// （Appのトークンはリポジトリごとなので、ずれても、ほかのリポジトリには書けない側に倒れる）。
+pub(super) struct PushTo<'a> {
+    pub(super) repo: &'a RepoName,
+    pub(super) write: &'a Credentials,
+}
+
+/// pushしうるcellか（レビューのcellと、着手を確かめるcellはpushしない）。
+fn may_push(cell: &Cell) -> bool {
+    !cell.review && !cell.confirms()
 }
 
 enum Prepared {
@@ -1348,5 +1429,46 @@ mod tests {
         assert!(note.contains("`src/hook.rs`、`a"), "{note}");
         assert!(note.contains("人が差分を読んで"), "{note}");
         assert!(!note.contains('\u{1b}'), "{note}");
+    }
+
+    #[test]
+    fn work_happens_in_the_work_repo_even_if_issues_are_elsewhere() {
+        let product: Product = toml::from_str(
+            "name = \"app\"\nissues = \"octo/issues\"\nrepos = [\"octo/app\", \"octo/web\"]\ncells = []",
+        )
+        .unwrap();
+        let repo = |s: &str| RepoName::parse(s).unwrap();
+        let work = |item: Target, r: &str| Work {
+            product: "app".to_string(),
+            cell: "implement".to_string(),
+            item,
+            repo: repo(r),
+            number: 3,
+            title: "t".to_string(),
+            waiting: None,
+            conflict: false,
+        };
+        // Issueは、Issueのリポジトリではなく、reposの最初で作業し、そこにpushする
+        assert_eq!(
+            place_repo(&product, &work(Target::Issue, "octo/issues")).unwrap(),
+            repo("octo/app")
+        );
+        // PRは、そのPRのリポジトリで作業する（reposの2つ目でも）
+        assert_eq!(
+            place_repo(&product, &work(Target::PullRequest, "octo/web")).unwrap(),
+            repo("octo/web")
+        );
+        // reposにないリポジトリのPRは動かさない
+        assert!(place_repo(&product, &work(Target::PullRequest, "octo/issues")).is_err());
+    }
+
+    #[test]
+    fn a_pr_in_another_repo_is_referred_to_with_its_repo() {
+        let repo = |s: &str| RepoName::parse(s).unwrap();
+        assert_eq!(pr_ref(&repo("octo/app"), &repo("octo/app"), 5), "#5");
+        assert_eq!(
+            pr_ref(&repo("octo/issues"), &repo("octo/app"), 5),
+            "octo/app#5"
+        );
     }
 }

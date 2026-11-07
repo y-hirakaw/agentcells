@@ -3,11 +3,11 @@
 use std::path::Path;
 
 use super::place::Place;
-use super::{Ready, Runner, git, git_out, path_str};
+use super::{PushTo, Ready, Runner, git, git_out, path_str};
 use crate::actions;
 use crate::config::{Cell, Target};
 use crate::error::{Error, Result};
-use crate::github::{Credentials, ISOLATED_GIT_ENV};
+use crate::github::ISOLATED_GIT_ENV;
 use crate::home::RepoName;
 use crate::probe::Probe;
 use crate::prompt;
@@ -283,7 +283,7 @@ impl Runner<'_> {
         branch: &Branch,
         outcome: &Outcome,
         round: u32,
-        write: &Credentials,
+        to: &PushTo,
     ) -> Result<Pushed> {
         let staging = crate::pr::stage(self.probe, &place.worktree, &branch.name)?;
         let staging_path = path_str(staging.path())?;
@@ -348,25 +348,22 @@ impl Runner<'_> {
             );
             return Ok(Pushed::Refused(text, refusal.allow));
         }
-        crate::pr::push_staged(self.probe, write, staging.path(), &work.repo, &branch.name)?;
+        // pushもPRも、作業するリポジトリにする（cloneしたところ。Issueのリポジトリが違っても、そこへは送らない）
+        let (repo, write) = (to.repo, to.write);
+        crate::pr::push_staged(self.probe, write, staging.path(), repo, &branch.name)?;
         if work.item == Target::PullRequest {
             return Ok(Pushed::Done(None));
         }
         if keeps_branch {
             // 同じブランチのPRが開いていれば（人がPRのあるIssueに付け直したときなど）、そのPRに足したことになる
-            let open = crate::pr::find_open(
-                self.probe,
-                write,
-                &work.repo,
-                &branch.name,
-                &self.actors.writer,
-            )?;
+            let open =
+                crate::pr::find_open(self.probe, write, repo, &branch.name, &self.actors.writer)?;
             return Ok(Pushed::Branch(branch.name.clone(), open));
         }
         let number = match crate::pr::find_open(
             self.probe,
             write,
-            &work.repo,
+            repo,
             &branch.name,
             &self.actors.writer,
         )? {
@@ -391,7 +388,7 @@ impl Runner<'_> {
                     ));
                 }
                 let args = crate::pr::create_args(
-                    &work.repo,
+                    repo,
                     &branch.base,
                     &branch.name,
                     &task.discussion.title,
@@ -401,7 +398,7 @@ impl Runner<'_> {
                 crate::pr::create(self.probe, write, &args)?
             }
         };
-        Ok(Pushed::Done(Some((work.repo.clone(), number))))
+        Ok(Pushed::Done(Some((repo.clone(), number))))
     }
 }
 
