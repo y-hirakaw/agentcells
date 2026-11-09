@@ -12,3 +12,8 @@ serde_json = "1.0.154"
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 toml = "1.1.8"
+
+# 偽のGitHubと偽のclaudeで流れを通しで試す。同じバイナリが偽のclaudeにもなるので、自分で場面を回す
+[[test]]
+name = "flow"
+harness = false

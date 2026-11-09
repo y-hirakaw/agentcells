@@ -656,7 +656,7 @@ const LIST_LIMIT: u32 = 100;
 /// `gh issue list --label` などは、GitHubの検索を使う。検索は、ラベルを変えたり閉じたりしてから
 /// しばらくは、前のままで見つかる（cellが進めた直後に、同じtickで前のcellの仕事として拾い直し、
 /// 同じcellが2回動いた）。そのため、検索を使わずに、リポジトリのIssue/PRをラベルで絞って読む。
-fn list_query(item: Target) -> String {
+pub fn list_query(item: Target) -> String {
     let (connection, extra) = match item {
         Target::Issue => ("issues", ""),
         Target::PullRequest => ("pullRequests", PR_FIELDS),

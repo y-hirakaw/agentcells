@@ -42,7 +42,7 @@ impl Leftover {
 }
 
 /// 1回に見る件数。片付けたものは次から出てこないので、多ければ次のtickで続きを片付ける。
-pub(crate) const QUERY: &str = "query($owner: String!, $name: String!, $labels: [String!], $issues: Boolean!, $prs: Boolean!) { repository(owner: $owner, name: $name) { issues(states: CLOSED, labels: $labels, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $issues) { nodes { number labels(first: 20) { nodes { name } } } } pullRequests(states: [CLOSED, MERGED], labels: $labels, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $prs) { nodes { number labels(first: 20) { nodes { name } } } } } }";
+pub const QUERY: &str = "query($owner: String!, $name: String!, $labels: [String!], $issues: Boolean!, $prs: Boolean!) { repository(owner: $owner, name: $name) { issues(states: CLOSED, labels: $labels, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $issues) { nodes { number labels(first: 20) { nodes { name } } } } pullRequests(states: [CLOSED, MERGED], labels: $labels, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $prs) { nodes { number labels(first: 20) { nodes { name } } } } } }";
 
 #[derive(Deserialize)]
 struct Response {
