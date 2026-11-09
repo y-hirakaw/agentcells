@@ -24,6 +24,7 @@ pub mod marker;
 pub mod notes;
 pub mod pr;
 pub mod probe;
+pub mod programs;
 pub mod prompt;
 pub mod recent;
 pub mod record;

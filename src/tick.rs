@@ -24,6 +24,10 @@ use crate::labels::WORKING;
 use crate::probe::Probe;
 use crate::transition::Waiting;
 
+mod drive;
+
+pub use drive::{Ended, Options, drive};
+
 /// 1件の仕事。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Work {

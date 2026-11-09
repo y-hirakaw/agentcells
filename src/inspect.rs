@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::github::{self, Purpose};
 use crate::home::{Home, RepoName};
 use crate::probe::Probe;
+use crate::programs::Programs;
 use crate::record::{self, Event, Line};
 
 /// AIに渡す指示。
@@ -863,6 +864,109 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
         .open(path)
         .and_then(|mut f| f.write_all(text.as_bytes()))
         .map_err(|e| Error::new(format!("{} を書けません: {e}", path.display())))
+}
+
+/// 1段目と2段目を動かし、記録に残す（tickの最後と、`agentcells inspect`）。
+pub fn run_both(
+    home: &Home,
+    config: &Config,
+    inspector: &Inspector,
+    probe: &dyn Probe,
+    programs: &Programs,
+    note: &dyn Fn(Event),
+) -> Result<Summary> {
+    let result = (|| -> Result<Summary> {
+        let claude = programs.claude()?;
+        let scanner = programs.scanner()?;
+        let writer = crate::prompt::writer_login(config, probe)?;
+        let now = record::unix_now();
+        let mut summary = run(&Context {
+            home,
+            config,
+            inspector,
+            probe,
+            claude: &claude,
+            scanner: &scanner,
+            writer: &writer,
+            now,
+        })?;
+        // 2段目: 実行の中身まで読み、1段目で見つけたこと以外を、手元に残す
+        let reported: Vec<&str> = summary.fingerprints.iter().map(String::as_str).collect();
+        let context = crate::notes::Context {
+            home,
+            config,
+            inspector,
+            probe,
+            claude: &claude,
+            scanner: &scanner,
+            now,
+        };
+        match crate::notes::run(&context, &reported) {
+            Ok(Some((count, path))) => {
+                summary.observations = count;
+                summary.notes_path = Some(path);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                summary
+                    .notes
+                    .push(format!("2段目が動けませんでした: {}", e.message));
+                summary.notes_error = Some(e.message);
+            }
+        }
+        Ok(summary)
+    })();
+    note(match &result {
+        Ok(s) => Event::Inspected {
+            findings: s.findings,
+            created: s.created.clone(),
+            commented: s.commented.clone(),
+            kept: s.kept,
+            observations: s.observations,
+            notes_error: s.notes_error.clone(),
+            error: None,
+        },
+        Err(e) => Event::Inspected {
+            findings: 0,
+            created: Vec::new(),
+            commented: Vec::new(),
+            kept: 0,
+            observations: 0,
+            notes_error: None,
+            error: Some(e.message.clone()),
+        },
+    });
+    result
+}
+
+pub fn print(summary: &Summary) {
+    if summary.findings == 0 {
+        println!("1段目（記録の規則）: 気になることはありませんでした");
+    } else {
+        println!("1段目（記録の規則）: 気になること {}件", summary.findings);
+    }
+    for number in &summary.created {
+        println!("  Issueを作りました: #{number}");
+    }
+    for number in &summary.commented {
+        println!("  また起きたとコメントしました: #{number}");
+    }
+    if summary.kept > 0 {
+        println!("  出さずに手元に残した案: {}件", summary.kept);
+    }
+    if let Some(report) = &summary.report {
+        println!("  記録: {}", report.display());
+    }
+    if let Some(path) = &summary.notes_path {
+        println!(
+            "2段目（実行の中身）: 手元に残したメモ {}件（`agentcells inspect --notes` で見られます）",
+            summary.observations
+        );
+        println!("  メモ: {}", path.display());
+    }
+    for note in &summary.notes {
+        println!("注意: {note}");
+    }
 }
 
 #[cfg(test)]
