@@ -5,6 +5,7 @@
 //! - ラベル名は大文字・小文字を区別しない
 //! - 時刻は秒までのISO 8601（UTC）で、文字列の順が時刻の順になる
 //! - `userContentEdits` は新しい順、コメントとレビューは古い順に返る
+//! - eventsの `assigned` では、`actor` は割り当てられた人で、割り当てた人は `assigner`（#15で確かめた）
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -595,6 +596,13 @@ fn rest_list(state: &mut State, path: &str) -> Option<Output> {
                     "actor": { "login": e.actor },
                     "created_at": e.created_at,
                 });
+                // 本物の `assigned` は、`actor` が割り当てられた人で、割り当てた人は `assigner`
+                if e.event == "assigned"
+                    && let Some(assignee) = &e.assignee
+                {
+                    v["actor"] = json!({ "login": assignee });
+                    v["assigner"] = json!({ "login": e.actor });
+                }
                 if let Some(label) = &e.label {
                     v["label"] = json!({ "name": label });
                 }

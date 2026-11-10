@@ -12,7 +12,8 @@
 //! 見分けるので、付け替えが遅れても、承認とみなす側には倒れない。
 //!
 //! Issueの仕事:
-//! - Assigneesにoperatorがいて、operatorを最後に割り当てたのがoperator自身
+//! - Assigneesにoperatorがいて、operatorを最後に割り当てたのがoperator自身。割り当てた人はeventsの `assigner` で見る
+//!   （`assigned` の `actor` は割り当てられた人なので、誰が割り当ててもoperatorになる）
 //! - 今のcellのラベルを最後に付けたのが、operatorか、agentcells自身（書き込みのアカウント）
 //! - operatorが承認していて、そのあとにほかの人がタイトル・本文・operatorのコメントを書き換えていない
 //! - agentcellsのコメントやレビュー（目印）を、ほかの人が書き換えていない。どのcellを動かすか、どこまで読んだか、
@@ -127,6 +128,9 @@ struct Event {
     label: Option<Label>,
     #[serde(default)]
     assignee: Option<User>,
+    /// `assigned` で割り当てた人。`actor` は割り当てられた人になる（#15のeventsで確かめた）
+    #[serde(default)]
+    assigner: Option<User>,
     #[serde(default)]
     created_at: String,
 }
@@ -392,14 +396,20 @@ pub fn check(probe: &dyn Probe, request: &Request, actors: &Actors) -> Result<Op
                 actors.operator
             )));
         }
+        Some(Event { assigner: None, .. }) => {
+            return Ok(Some(format!(
+                "{} を割り当てた人が分かりません（自分で割り当てたものだけ動かします）",
+                actors.operator
+            )));
+        }
         Some(e)
-            if !(actors.is_operator(login(&e.actor))
-                || made_by_agentcells && actors.is_writer(login(&e.actor))) =>
+            if !(actors.is_operator(login(&e.assigner))
+                || made_by_agentcells && actors.is_writer(login(&e.assigner))) =>
         {
             return Ok(Some(format!(
                 "{} を割り当てたのが {} です（自分で割り当てたものだけ動かします）",
                 actors.operator,
-                login(&e.actor)
+                login(&e.assigner)
             )));
         }
         Some(_) => {}
@@ -461,7 +471,9 @@ pub fn check(probe: &dyn Probe, request: &Request, actors: &Actors) -> Result<Op
         let issue_since = if made_by_agentcells {
             // 元のIssueが、Issueの仕事と同じ確かめを通ること
             match original_history.last_assigned_operator(actors) {
-                Some(e) if actors.is_operator(login(&e.actor)) => {}
+                Some(Event {
+                    assigner: Some(a), ..
+                }) if actors.is_operator(&a.login) => {}
                 _ => {
                     return Ok(Some(format!(
                         "元のIssueに、{} が自分を割り当てた記録がありません",
@@ -561,9 +573,10 @@ pub(crate) mod fake {
         )
     }
 
-    pub fn assigned(actor: &str, assignee: &str, at: &str) -> String {
+    /// 本物と同じく、`actor` は割り当てられた人、`assigner` が割り当てた人。
+    pub fn assigned(assigner: &str, assignee: &str, at: &str) -> String {
         format!(
-            r#"{{"event":"assigned","actor":{{"login":"{actor}"}},"assignee":{{"login":"{assignee}"}},"created_at":"{at}"}}"#
+            r#"{{"event":"assigned","actor":{{"login":"{assignee}"}},"assignee":{{"login":"{assignee}"}},"assigner":{{"login":"{assigner}"}},"created_at":"{at}"}}"#
         )
     }
 
@@ -690,6 +703,16 @@ mod tests {
         ];
         let reason = issue(&events, NO_EDITS, "ac:triage").unwrap();
         assert!(reason.contains("割り当てたのが eager"), "{reason}");
+
+        // 割り当てた人が分からなければ、動かさない
+        let events = [
+            format!(
+                r#"{{"event":"assigned","actor":{{"login":"y-hirakaw"}},"assignee":{{"login":"y-hirakaw"}},"created_at":"{T1}"}}"#
+            ),
+            labeled("y-hirakaw", "ac:triage", T2),
+        ];
+        let reason = issue(&events, NO_EDITS, "ac:triage").unwrap();
+        assert!(reason.contains("割り当てた人が分かりません"), "{reason}");
 
         let events = [
             assigned("y-hirakaw", "y-hirakaw", T1),
@@ -859,6 +882,24 @@ mod tests {
         )
         .unwrap();
         assert!(reason.contains("元のIssueの本文を、eager"), "{reason}");
+
+        // 元のIssueにoperatorを割り当てたのが、ほかの人（operatorが自分を外して止めたのを、割り当て直した）
+        let reassigned = [
+            assigned("y-hirakaw", "y-hirakaw", T1),
+            labeled("y-hirakaw", "ac:triage", T2),
+            assigned("eager", "y-hirakaw", T3),
+        ];
+        let reason = pr(&pr_events, NO_EDITS, &reassigned, NO_EDITS).unwrap();
+        assert!(
+            reason.contains("元のIssueに、y-hirakaw が自分を割り当てた記録がありません"),
+            "{reason}"
+        );
+
+        // PRのoperatorを最後に割り当て直したのが、ほかの人
+        let mut reassigned_pr = pr_events.to_vec();
+        reassigned_pr.push(assigned("eager", "y-hirakaw", T3));
+        let reason = pr(&reassigned_pr, NO_EDITS, &approved_issue(), NO_EDITS).unwrap();
+        assert!(reason.contains("割り当てたのが eager"), "{reason}");
 
         // 元のIssueを、operatorが承認していない
         let unapproved = [assigned("y-hirakaw", "y-hirakaw", T1)];

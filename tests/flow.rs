@@ -181,6 +181,26 @@ fn a_label_put_back_by_someone_else_is_skipped() {
     );
 }
 
+/// operatorを割り当てたのがほかの人なら、operatorがラベルを付けていても見送る。
+/// eventsの `actor` は割り当てられた人（operator）になるので、`assigner` を見ていなければ動いてしまう。
+fn an_assignment_by_someone_else_is_skipped() {
+    let s = Scene::new(CONFIG);
+    let i = s.issue(OP, "READMEをわかりやすくしたい", "初めて見た人に伝わらない");
+    s.as_user(STRANGER).assign(i, OP);
+    s.as_user(OP).label(i, "ac:triage");
+    let ended = s.tick();
+    assert_eq!((ended.why, ended.runs), ("no_work", 0));
+    assert_eq!(s.runs_of("triage"), 0);
+    s.expect(i).labels(&["ac:triage"]).comments_by(WRITER, 0);
+    let skipped = s.skipped();
+    assert!(
+        skipped
+            .iter()
+            .any(|r| r.contains("割り当てたのが") && r.contains(STRANGER)),
+        "{skipped:?}"
+    );
+}
+
 /// リポジトリのラベルが大文字を交ぜて作られていても、設定の書き方（小文字）で付け外しでき、
 /// リポジトリの書き方のまま残る。
 fn labels_keep_the_spelling_of_the_repository() {
@@ -259,6 +279,10 @@ const SCENES: &[(&str, fn())] = &[
     (
         "a_label_put_back_by_someone_else_is_skipped",
         a_label_put_back_by_someone_else_is_skipped,
+    ),
+    (
+        "an_assignment_by_someone_else_is_skipped",
+        an_assignment_by_someone_else_is_skipped,
     ),
     (
         "labels_keep_the_spelling_of_the_repository",
