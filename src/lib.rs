@@ -40,4 +40,5 @@ pub mod tick;
 pub mod tidy;
 pub mod transition;
 pub mod view;
+pub mod watched;
 pub mod workflows;

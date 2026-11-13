@@ -136,6 +136,7 @@ pub const AUTORUN_PATHS: &[&str] = &[
     ".devcontainer",
     ".envrc",
     ".husky",
+    ".githooks",
     ".gitattributes",
     ".gitmodules",
     ".devcontainer.json",
@@ -836,6 +837,7 @@ echo '[]'
                 (".claude/settings.json", "{}", ".claude"),
                 (".vscode/tasks.json", "{}", ".vscode"),
                 ("app/sub/.envrc", "export X=1", ".envrc"),
+                (".githooks/pre-commit", "#!/bin/sh", ".githooks"),
                 (".github/workflows/ci.yml", "on: push", ".github/workflows"),
                 ("src/config.rs", "token = FAKE-SECRET", "fake"),
             ] {

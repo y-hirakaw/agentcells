@@ -39,6 +39,7 @@ use crate::prompt;
 use crate::settings::{self, RunPaths};
 use crate::tick::Work;
 use crate::transition::{self, Destination, Finished, Outcome};
+use crate::watched;
 
 mod branch;
 mod claude;
@@ -504,18 +505,31 @@ impl Runner<'_> {
             git_out(self.probe, &all).ok()
         };
         task.guides = Some(prompt::read_guides(&git, &base));
-        // 使うのはレビューのcellだけ。読めなければ止める（守るファイルを見落としたまま進まないように）
-        if cell.review && work.item == Target::PullRequest && !product.protected.is_empty() {
+        // 使うのはレビューのcellだけ。読めなければ止める（守るファイルや依存の変更を見落としたまま進まないように）
+        if cell.review && work.item == Target::PullRequest {
             let Some(branch) = &branch else {
                 return Err(Error::new("PRのブランチを読めません"));
             };
-            task.protected = protected_changes(
+            let changed = changed_files(
                 self.probe,
                 &place.cache,
                 &format!("refs/heads/{}", branch.base),
                 &branch.start,
-                product,
             )?;
+            task.protected = changed
+                .iter()
+                .filter(|path| product.protects(path))
+                .cloned()
+                .collect();
+            task.build_files = changed
+                .iter()
+                .filter(|path| watched::is_build_file(path))
+                .cloned()
+                .collect();
+            task.agent_files = changed
+                .into_iter()
+                .filter(|path| watched::is_agent_file(path))
+                .collect();
         }
         let commands = product.commands_for(cell);
         task.commands = Some(commands.keys().cloned().collect());
@@ -779,6 +793,14 @@ impl Runner<'_> {
                         pr_repo = Some(repo);
                         pr_number = Some(number);
                     }
+                    let review_next = cell.next.iter().any(|n| {
+                        self.config
+                            .cell(n)
+                            .is_some_and(|c| c.review && c.on.contains(&Target::PullRequest))
+                    });
+                    if let Some(why) = unreviewed_push(work.item, &outcome.next, review_next) {
+                        overridden = Some(why.to_string());
+                    }
                 }
                 Pushed::Branch(name, open) => kept_branch = Some((name, open)),
             }
@@ -861,14 +883,26 @@ impl Runner<'_> {
             }
             text.push_str(&format!("人間に回しました: {reason}"));
         }
-        // 守るファイルを変えたPRを検品に回すときは、AIのレビューだけで済ませないよう、CLIが書き足す
+        // 守るファイル、依存とビルドの設定、エージェントへの指示を変えたPRを、検品に回すか人間に回すときは、
+        // AIのレビューだけで済ませないよう、CLIが書き足す（人間に回したPRも、人はそのままマージできるため）。
+        // CLIが人間に回したとき（往復の上限など）も書く。こじれたPRが最後に行き着く所なので
         if cell.review
-            && reason.is_none()
-            && plan.destination == Destination::Done
-            && let Some(note) = protected_note(&task.protected)
+            && matches!(
+                plan.destination,
+                Destination::Done | Destination::NeedsHuman
+            )
         {
-            text.push_str("\n\n");
-            text.push_str(&note);
+            for note in [
+                protected_note(&task.protected),
+                build_files_note(&task.build_files),
+                agent_files_note(&task.agent_files),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                text.push_str("\n\n");
+                text.push_str(&note);
+            }
         }
 
         // 着手を確かめるcellが、自分で人間に確かめたなら、そう印を付ける（このあとの返事でだけ先へ進める）
@@ -1070,15 +1104,18 @@ impl Runner<'_> {
     }
 }
 
-/// PRが変えた（足した、消した、名前を変えた）ファイルのうち、守るもの。差分は、CLIだけが書くbareのキャッシュで、
+/// 新しいコミットをpushしたあと、人間に回す理由。PRで、進め先にレビューのcellがある（`review_next`）のに、
+/// `done`（検品待ちに戻す）を選んだときに返す。直したのに検品待ちに戻すと、人には「AIのレビューが済んだPR」に
+/// 見えるため（レビューのcellはpushしない）。レビューのcellを置かないproductは、決めた流れのまま検品に回す。
+fn unreviewed_push(item: Target, next: &str, review_next: bool) -> Option<&'static str> {
+    (item == Target::PullRequest && next == transition::DONE && review_next).then_some(
+        "新しいコミットをpushしたので、検品待ちには戻しません（このコミットは、AIのレビューを通っていません）。レビューのcellのラベルを付けるか、差分を読んでから検品してください",
+    )
+}
+
+/// PRが変えた（足した、消した、名前を変えた）ファイル。差分は、CLIだけが書くbareのキャッシュで、
 /// ベースと、worktreeに取り出したコミット（`head`。AIが見るもの）の間で読む。
-fn protected_changes(
-    probe: &dyn Probe,
-    cache: &Path,
-    base: &str,
-    head: &str,
-    product: &Product,
-) -> Result<Vec<String>> {
+fn changed_files(probe: &dyn Probe, cache: &Path, base: &str, head: &str) -> Result<Vec<String>> {
     let range = format!("{base}...{head}");
     // 名前を変えたときに、元の名前も出す（守るファイルを動かして外すのも、変えたうちに入れる）
     let out = git_out(
@@ -1095,23 +1132,41 @@ fn protected_changes(
     )?;
     Ok(out
         .split('\0')
-        .filter(|path| !path.is_empty() && product.protects(path))
+        .filter(|path| !path.is_empty())
         .map(str::to_string)
         .collect())
 }
 
-/// 守るファイルを変えたPRを検品に回すときに、CLIが書き足す文。変えていなければ `None`。
+/// 守るファイルを変えたPRを人に回すときに、CLIが書き足す文。変えていなければ `None`。
 fn protected_note(files: &[String]) -> Option<String> {
     if files.is_empty() {
         return None;
     }
-    let listed: Vec<String> = files
-        .iter()
-        .map(|f| format!("`{}`", crate::display::printable(f).replace('`', "'")))
-        .collect();
     Some(format!(
         "このPRは、守るファイル（agentcellsの設定の protected）を変えています: {}。AIのレビューだけで済ませず、マージの前に人が差分を読んでください",
-        listed.join("、")
+        prompt::file_list(files)
+    ))
+}
+
+/// エージェントへの指示を変えたPRを人に回すときに、CLIが書き足す文。変えていなければ `None`。
+fn agent_files_note(files: &[String]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "このPRは、エージェントへの指示を変えています: {}。マージしたあとに、開発のエージェント（sandboxの外で動く）とcellが指示として読みます。マージの前に人が差分を読んでください",
+        prompt::file_list(files)
+    ))
+}
+
+/// 依存とビルドの設定を変えたPRを人に回すときに、CLIが書き足す文。変えていなければ `None`。
+fn build_files_note(files: &[String]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "このPRは、依存とビルドの設定を変えています: {}。マージしたあとに、CIや手元で、sandboxの外で動きます。足した依存とその取得元、ビルドやインストールのときに動くコードを、マージの前に人が差分で確かめてください",
+        prompt::file_list(files)
     ))
 }
 
@@ -1399,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_files_a_pr_changes_are_found() {
+    fn files_a_pr_changes_are_found() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         let cache = dir.path().join("cache.git");
@@ -1419,6 +1474,7 @@ mod tests {
             "src/main.rs",
             "prompts/common.md",
             "prompts.md",
+            "Cargo.lock",
         ] {
             std::fs::write(work.join(f), "a\n").unwrap();
         }
@@ -1431,6 +1487,7 @@ mod tests {
         std::fs::write(work.join("prompts/common.md"), "b\n").unwrap();
         std::fs::write(work.join("prompts.md"), "b\n").unwrap();
         std::fs::write(work.join("src/main.rs"), "b\n").unwrap();
+        std::fs::write(work.join("Cargo.lock"), "b\n").unwrap();
         run(&work, &["commit", "-qam", "change"]);
         run(dir.path(), &["clone", "-q", "--bare", "work", "cache.git"]);
 
@@ -1438,21 +1495,74 @@ mod tests {
             "name = \"app\"\nissues = \"octo/app\"\nrepos = [\"octo/app\"]\ncells = []\nprotected = [\"src/hook.rs\", \"prompts/\"]",
         )
         .unwrap();
-        let probe = crate::probe::SystemProbe;
+        let changed = changed_files(
+            &crate::probe::SystemProbe,
+            &cache,
+            "refs/heads/main",
+            "refs/heads/ac/1",
+        )
+        .unwrap();
+        // 名前を変えたものは、元の名前も出る
+        assert_eq!(
+            changed,
+            vec![
+                "Cargo.lock",
+                "prompts.md",
+                "prompts/common.md",
+                "src/hook.rs",
+                "src/hook_old.rs",
+                "src/main.rs"
+            ]
+        );
         let changes = |product: &Product| {
-            protected_changes(
-                &probe,
-                &cache,
-                "refs/heads/main",
-                "refs/heads/ac/1",
-                product,
-            )
-            .unwrap()
+            changed
+                .iter()
+                .filter(|path| product.protects(path))
+                .cloned()
+                .collect::<Vec<_>>()
         };
         assert_eq!(changes(&product), vec!["prompts/common.md", "src/hook.rs"]);
         // 大文字と小文字は区別しない（macOSでは同じファイルになる）。/ がなくてもディレクトリに当たる
         product.protected = vec!["SRC/Main.rs/".to_string(), "Prompts".to_string()];
         assert_eq!(changes(&product), vec!["prompts/common.md", "src/main.rs"]);
+    }
+
+    #[test]
+    fn a_pushed_pr_is_not_put_back_to_inspection() {
+        assert!(unreviewed_push(Target::PullRequest, transition::DONE, true).is_some());
+        assert_eq!(unreviewed_push(Target::PullRequest, "review", true), None);
+        assert_eq!(
+            unreviewed_push(Target::PullRequest, transition::NEEDS_HUMAN, true),
+            None
+        );
+        // レビューのcellを置かないproductは、決めた流れのまま検品に回す
+        assert_eq!(
+            unreviewed_push(Target::PullRequest, transition::DONE, false),
+            None
+        );
+        // Issueの done は閉じるだけ（pushしたなら、PRを作るcellへ進んでいる）
+        assert_eq!(unreviewed_push(Target::Issue, transition::DONE, true), None);
+    }
+
+    #[test]
+    fn the_note_lists_agent_files() {
+        assert_eq!(agent_files_note(&[]), None);
+        let note = agent_files_note(&["AGENTS.md".to_string()]).unwrap();
+        assert!(
+            note.contains("エージェントへの指示を変えています: `AGENTS.md`"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn the_note_lists_build_files() {
+        assert_eq!(build_files_note(&[]), None);
+        let note = build_files_note(&["Cargo.lock".to_string()]).unwrap();
+        assert!(
+            note.contains("依存とビルドの設定を変えています: `Cargo.lock`"),
+            "{note}"
+        );
+        assert!(note.contains("人が差分で確かめて"), "{note}");
     }
 
     #[test]
